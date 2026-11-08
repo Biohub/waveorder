@@ -23,7 +23,7 @@ distribution            module                     config block
 ``p(H)`` parameter prior :class:`ParameterPrior`    ``imaging_system`` tolerances
 ``p(f)`` object prior   :class:`Tikhonov`           ``object.prior: tikhonov``
 ``p(f)`` object prior   :class:`TikhonovSpectral`   ``object.prior.tikhonov_spectral``
-``p(f)`` object prior   :class:`FittedSpectrum`     (TODO) ``object.prior`` fitted
+``p(f)`` object prior   :class:`FittedSpectrum`     ``object.prior`` fitted (iso-Whittle)
 ``p(n)`` noise          :class:`Gaussian`           ``noise.gaussian``
 ``p(n)`` noise          :class:`Poisson`            ``noise.poisson``
 ======================  =========================  ================================
@@ -125,6 +125,43 @@ class Sampling:
     def axial_nyquist(self, na_detection: float, wavelength: float, index_of_refraction_media: float) -> float:
         """Axial Nyquist spacing (see :func:`waveorder.sampling.axial_nyquist`)."""
         return sampling.axial_nyquist(wavelength, na_detection, index_of_refraction_media)
+
+    def shell_index(self, n_shells: int, device=None) -> tuple[Tensor, Tensor]:
+        """Isotropic ``|k|`` shell index per voxel, on the transfer-function grid.
+
+        Builds the physical radial frequency ``|k|`` (cycles/um) over the
+        padded ``(Z, Y, X)`` grid in FFT order and bins it into ``n_shells``
+        equal-width shells. Used by :class:`FittedSpectrum` to profile the
+        object spectrum per shell.
+
+        Parameters
+        ----------
+        n_shells : int
+            Number of equal-width ``|k|`` shells.
+        device : torch.device, optional
+            Device for the returned tensors.
+
+        Returns
+        -------
+        idx : Tensor
+            Integer shell index per voxel, shape ``padded_shape``, in ``[0,
+            n_shells)``.
+        centers : Tensor
+            Shell center frequencies (cycles/um), shape ``(n_shells,)``.
+        """
+        zz, yy, xx = self.padded_shape
+        fz = np.fft.fftfreq(zz, d=self.z_pixel_size)
+        fy = np.fft.fftfreq(yy, d=self.yx_pixel_size)
+        fx = np.fft.fftfreq(xx, d=self.yx_pixel_size)
+        fr = np.sqrt(fz[:, None, None] ** 2 + fy[None, :, None] ** 2 + fx[None, None, :] ** 2)
+        kmax = float(fr.max()) * 1.0001 + 1e-12
+        edges = np.linspace(0.0, kmax, n_shells + 1)
+        idx = np.clip(np.digitize(fr.ravel(), edges) - 1, 0, n_shells - 1).reshape(fr.shape)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        return (
+            torch.as_tensor(idx, dtype=torch.long, device=device),
+            torch.as_tensor(centers, dtype=torch.float64, device=device),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -438,9 +475,28 @@ class ParameterPrior:
 
 
 class ObjectPrior(nn.Module):
-    """Base class for ``p(f)``: returns the object power spectrum ``S_k``."""
+    """Base class for ``p(f)``: returns the object power spectrum ``S_k``.
 
-    def spectrum(self, s: Sampling, noise: "Noise") -> Tensor | None:  # pragma: no cover - abstract
+    Priors come in two flavours. A *fixed* prior (``Tikhonov``,
+    ``TikhonovSpectral``) ignores the data and returns ``S_k`` from stored
+    parameters. A *data-profiled* (empirical-Bayes) prior (``FittedSpectrum``,
+    the winning iso-Whittle method) estimates ``S_k`` from the data
+    periodogram and the current transfer function; :func:`evidence` passes
+    ``data_fft`` and ``otf`` through for those. The optional keywords keep the
+    fixed priors' call sites unchanged.
+    """
+
+    #: True for priors whose ``spectrum`` consumes ``data_fft``/``otf``.
+    data_profiled: bool = False
+
+    def spectrum(
+        self,
+        s: Sampling,
+        noise: "Noise",
+        *,
+        data_fft: Tensor | None = None,
+        otf: Tensor | None = None,
+    ) -> Tensor | None:  # pragma: no cover - abstract
         """Object power spectrum ``S_k`` (same shape as ``H_k``), or ``None``."""
         raise NotImplementedError
 
@@ -458,7 +514,7 @@ class Tikhonov(ObjectPrior):
         super().__init__()
         self.register_buffer("weight", torch.as_tensor(float(weight), dtype=torch.float64))
 
-    def spectrum(self, s: Sampling, noise: "Noise") -> Tensor:
+    def spectrum(self, s: Sampling, noise: "Noise", **_: Tensor) -> Tensor:
         """``S_k = sigma^2 / lambda`` (a scalar; broadcast against ``H_k``)."""
         return noise.variance() / self.weight
 
@@ -476,7 +532,7 @@ class TikhonovSpectral(ObjectPrior):
         super().__init__()
         self.register_buffer("spectrum_buffer", torch.as_tensor(spectrum, dtype=torch.float64))
 
-    def spectrum(self, s: Sampling, noise: "Noise") -> Tensor:
+    def spectrum(self, s: Sampling, noise: "Noise", **_: Tensor) -> Tensor:
         """Return the stored ``S_k``."""
         return self.spectrum_buffer
 
@@ -484,32 +540,83 @@ class TikhonovSpectral(ObjectPrior):
 class FittedSpectrum(ObjectPrior):
     """Isotropic shell-fit object spectrum ``S(|k|)`` estimated from the data.
 
-    TODO (next pass): the winning iso-Whittle strategy of the 2026-10-30
-    sprint. Fit an isotropic object power spectrum ``S(|k|)`` by a
-    weighted-least-squares shell fit of the data periodogram with ridge
-    shrinkage, then broadcast it onto the full ``H_k`` grid. See
-    ``winning_method_spec.md``. The interface is fixed:
+    This is the winning "iso-Whittle" object prior of the 2026-10-30 blind
+    sprint, ported onto the module interface. It is a data-profiled
+    (empirical-Bayes) prior: instead of a fixed ``S_k``, it estimates the
+    object power spectrum per isotropic frequency shell directly from the
+    data periodogram and the current transfer function, which is what beat a
+    flat Tikhonov prior on real blind data (see the theory page and
+    ``winning_method_spec.md``).
 
-        def spectrum(self, s: Sampling, noise: Noise) -> Tensor:
-            # 1. periodogram P_k = |FFT(g)|^2 (ortho) of the prepared data,
-            # 2. bin by |k| shells on the Sampling grid,
-            # 3. WLS fit S(|k|) = (P_shell - sigma^2) / |H_shell|^2 with
-            #    ridge shrinkage toward a smooth power law,
-            # 4. scatter S(|k|) back to every frequency -> S_k.
+    Per shell of ``|k|``, with periodogram ``P_k = |FFT(g)|^2`` (ortho),
+    transfer magnitude ``|H_k|^2`` and noise floor ``sigma^2``, the fit is the
+    threshold-free, ``|H|^2``-weighted least squares estimate
 
-    This flat-prior-beats-nothing placeholder is intentionally inert so that
-    the interface exists and the config builder can reference it before the
-    numeric fit lands.
+        S_shell = sum_k |H_k|^2 (P_k - sigma^2) / sum_k |H_k|^4   (clamped >= 0)
+
+    (``whittle3d._wls_shell_S``). The weighting by ``|H|^2`` is what makes it
+    threshold-free: a fixed ``|H|^2`` cutoff would turn the evidence into an
+    OTF-support indicator (the round-1 failure). The shell profile is then
+    broadcast back to every frequency. Being a positive, radially-binned
+    spectrum, ``S_k`` keeps the Gaussian evidence exact.
+
+    Parameters
+    ----------
+    n_shells : int
+        Number of isotropic ``|k|`` shells.
+    min_power : float
+        Floor on the per-shell spectrum (keeps ``S_k > 0`` so ``log v_k`` and
+        the Wiener inverse stay finite).
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    data_profiled = True
 
-    def spectrum(self, s: Sampling, noise: "Noise") -> Tensor | None:
-        """Not implemented yet; see the class docstring for the planned fit."""
-        raise NotImplementedError(
-            "FittedSpectrum (iso-Whittle shell fit) lands in the next pass; use Tikhonov or TikhonovSpectral for now."
-        )
+    def __init__(self, n_shells: int = 64, min_power: float = 1e-10) -> None:
+        super().__init__()
+        self.n_shells = int(n_shells)
+        self.min_power = float(min_power)
+
+    def spectrum(
+        self,
+        s: Sampling,
+        noise: "Noise",
+        *,
+        data_fft: Tensor | None = None,
+        otf: Tensor | None = None,
+    ) -> Tensor:
+        """Data-profiled ``S_k`` via an ``|H|^2``-weighted shell fit.
+
+        Parameters
+        ----------
+        s : Sampling
+            Grid geometry (supplies the physical ``|k|`` grid).
+        noise : Noise
+            Supplies ``sigma^2``.
+        data_fft : Tensor
+            ``fftn(g, norm="ortho")`` of the prepared data (``evidence`` passes
+            this). Required.
+        otf : Tensor
+            Current transfer function ``H_k`` (``evidence`` passes this).
+            Required.
+        """
+        if data_fft is None or otf is None:
+            raise ValueError(
+                "FittedSpectrum needs data_fft and otf; call it through distributions.evidence (which passes both)."
+            )
+        sigma2 = noise.variance().to(torch.float64)
+        power = (data_fft.abs() ** 2).to(torch.float64)
+        h2 = (otf.abs() ** 2).to(torch.float64)
+
+        shell, _centers = s.shell_index(self.n_shells, device=power.device)
+        shell = shell.reshape(-1)
+        p = power.reshape(-1)
+        h = h2.reshape(-1)
+        num = torch.zeros(self.n_shells, dtype=torch.float64, device=p.device)
+        den = torch.zeros(self.n_shells, dtype=torch.float64, device=p.device)
+        num.scatter_add_(0, shell, h * torch.clamp(p - sigma2, min=0.0))
+        den.scatter_add_(0, shell, h * h)
+        s_shell = (num / den.clamp_min(1e-30)).clamp_min(self.min_power)
+        return s_shell[shell].reshape(power.shape)
 
 
 # --------------------------------------------------------------------------- #
@@ -645,7 +752,11 @@ def evidence(
         Scalar negative log evidence.
     """
     otf = system.transfer(s)
-    s_k = obj.spectrum(s, noise)
+    # data-profiled priors (FittedSpectrum) need the periodogram and H_k; fixed
+    # priors (Tikhonov, TikhonovSpectral) ignore these kwargs.
+    if getattr(obj, "data_profiled", False) and data_fft is None:
+        data_fft = torch.fft.fftn(g, norm="ortho")
+    s_k = obj.spectrum(s, noise, data_fft=data_fft, otf=otf)
     sigma = torch.sqrt(noise.variance())
     return whittle_evidence(
         data=None if data_fft is not None else g,

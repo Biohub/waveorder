@@ -337,12 +337,74 @@ noise: {gaussian: {sigma: 1.0}}
 # --- stubs / Poisson / FittedSpectrum -------------------------------------- #
 
 
-def test_fitted_spectrum_is_a_todo_stub():
+def test_fitted_spectrum_requires_data_and_otf():
     import pytest
 
     s = _sampling()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         D.FittedSpectrum().spectrum(s, D.Gaussian(0.1))
+
+
+def test_fitted_spectrum_matches_reference_shell_fit():
+    """The |H|^2-weighted shell fit matches a direct scatter-add reference."""
+    s = _sampling()
+    system = _fluorescence_system({"astigmatism_0": 0.1})
+    otf = system.transfer(s)
+    g = torch.randn(ZYX, dtype=torch.float64)
+    noise = D.Gaussian(0.1)
+    prior = D.FittedSpectrum(n_shells=24)
+
+    data_fft = torch.fft.fftn(g, norm="ortho")
+    s_k = prior.spectrum(s, noise, data_fft=data_fft, otf=otf)
+
+    # direct reference: S_shell = sum h2 (P - sigma^2) / sum h2^2, clamped
+    shell, _ = s.shell_index(24)
+    shell = shell.reshape(-1)
+    power = (data_fft.abs() ** 2).reshape(-1).to(torch.float64)
+    h2 = (otf.abs() ** 2).reshape(-1).to(torch.float64)
+    sigma2 = noise.variance().to(torch.float64)
+    num = torch.zeros(24, dtype=torch.float64)
+    den = torch.zeros(24, dtype=torch.float64)
+    num.scatter_add_(0, shell, h2 * torch.clamp(power - sigma2, min=0.0))
+    den.scatter_add_(0, shell, h2 * h2)
+    ref_shell = (num / den.clamp_min(1e-30)).clamp_min(1e-10)
+    assert torch.allclose(s_k.reshape(-1), ref_shell[shell], atol=0, rtol=0)
+    # S_k is positive everywhere (keeps the Gaussian evidence / Wiener finite)
+    assert (s_k > 0).all()
+
+
+def test_evidence_runs_with_fitted_spectrum():
+    """evidence() auto-profiles the data for a data-profiled prior."""
+    s = _sampling()
+    system = _fluorescence_system({"astigmatism_0": 0.1})
+    g = torch.randn(ZYX, dtype=torch.float64)
+    value = D.evidence(g, system, D.FittedSpectrum(n_shells=24), D.Gaussian(0.1), s)
+    assert torch.isfinite(value)
+
+
+def test_fitted_spectrum_beats_flat_tikhonov_on_structured_object():
+    """On an object with a non-flat (power-law) spectrum, the data-profiled
+    FittedSpectrum gives a higher evidence (lower NLL) at the true system than
+    a mis-specified flat Tikhonov prior, i.e. it fits the object spectrum the
+    flat prior gets wrong. This is the winning-strategy property."""
+    s = _sampling()
+    system = _fluorescence_system({"astigmatism_0": 0.15, "coma_x": 0.1})
+    otf = system.transfer(s)
+
+    # simulate g = H f + n with a STRUCTURED (power-law) object spectrum
+    gen = torch.Generator().manual_seed(3)
+    fz = np.fft.fftfreq(ZYX[0])
+    fy = np.fft.fftfreq(ZYX[1])
+    fx = np.fft.fftfreq(ZYX[2])
+    kr = np.sqrt(fz[:, None, None] ** 2 + fy[None, :, None] ** 2 + fx[None, None, :] ** 2)
+    s_true = torch.as_tensor(1.0 / (kr**2 + 1e-2), dtype=torch.float64)  # red spectrum
+    f = torch.randn(ZYX, dtype=torch.float64, generator=gen) * s_true.sqrt()
+    g = torch.real(torch.fft.ifftn(torch.fft.fftn(f) * otf))
+    g = g + torch.randn(ZYX, dtype=torch.float64, generator=gen) * 0.05
+
+    nll_flat = D.evidence(g, system, D.Tikhonov(1e-2), D.Gaussian(0.05), s)
+    nll_fit = D.evidence(g, system, D.FittedSpectrum(n_shells=32), D.Gaussian(0.05), s)
+    assert nll_fit < nll_flat  # data-profiled spectrum explains the data better
 
 
 def test_gaussian_noise_sample_and_variance():
