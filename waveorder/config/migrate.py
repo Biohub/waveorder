@@ -82,8 +82,16 @@ def migrate_3x_dict(raw: dict) -> schema.V4Config:
     Raises
     ------
     MigrationError
-        For birefringence configurations, which stay 3.x in this release.
+        For birefringence and tile-stitch configurations, which stay 3.x in
+        this release.
     """
+    if "recon" in raw and ("tile" in raw or "blend" in raw):
+        raise MigrationError(
+            "tile-stitch configurations (tile/blend/recon) run through 'wo tile-stitch' in "
+            "the 3.x format; there is no 4.0 tile-stitch execution path yet, so they stay 3.x "
+            "this release (as birefringence configurations do). Migrate the inner 'recon' "
+            "block on its own if you want a 4.0 reconstruction config."
+        )
     settings = ReconstructionSettings(**raw)
     return migrate_3x_settings(settings)
 

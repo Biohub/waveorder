@@ -87,6 +87,19 @@ def test_birefringence_not_migratable(config_path):
         migrate_3x_dict(_load(config_path))
 
 
+@pytest.mark.parametrize("config_path", TILE_STITCH_CONFIG_PATHS, ids=lambda p: p.name)
+def test_tile_stitch_not_migratable(config_path):
+    """Tile-stitch configs (tile/blend/recon) raise a clear MigrationError.
+
+    ``wo tile-stitch`` reads the 3.x TileStitchSettings; there is no 4.0
+    tile-stitch execution path, so the whole-config migration must refuse
+    with MigrationError (which the benchmark runner catches to run the case
+    unmigrated) instead of a raw pydantic ValidationError.
+    """
+    with pytest.raises(MigrationError):
+        migrate_3x_dict(_load(config_path))
+
+
 def test_block_regrouping():
     """Spot-check the field map of design document section 2."""
     raw = {
