@@ -274,8 +274,12 @@ class ImagingSystem(V4BaseModel):
 
 
 class TikhonovSpectralPrior(V4BaseModel):
-    exponent: Optional[float] = Field(default=None, description="power-law exponent of the object spectrum")
-    fit_from: Optional[str] = Field(default=None, description="path to fit the spectrum from")
+    n_shells: PositiveInt = Field(
+        default=64,
+        description="number of isotropic |k| shells for the data-profiled iso-Whittle object "
+        "spectrum; the per-shell |H|^2-weighted fit (FittedSpectrum) replaces the flat Tikhonov "
+        "prior S_k = sigma^2 / lambda and is re-fit as the imaging system is calibrated",
+    )
 
 
 class BeadsPrior(V4BaseModel):

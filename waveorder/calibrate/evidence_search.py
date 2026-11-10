@@ -28,9 +28,11 @@ from waveorder.calibrate.scores import whittle_evidence
 from waveorder.calibrate.synthesis import fluorescence_otf
 from waveorder.calibrate.tfzarr import TransferFunctionStore
 from waveorder.calibrate.zernike_names import name_to_noll, noll_indices_up_to_order, noll_to_name
+from waveorder.distributions import FittedSpectrum, Gaussian, Sampling
 from waveorder.config.schema import (
     FreeParameter,
     GaussianNoise,
+    PriorTikhonovSpectral,
     SearchGradient,
     SearchGrid,
     SearchRandom,
@@ -311,19 +313,49 @@ def run_evidence_calibration(
     else:
         raise ValueError(f"object.weight: {cfg.object.weight} is not usable on the evidence path")
 
+    # Object prior spectrum S_k. The default flat Tikhonov prior (S_k =
+    # sigma^2 / lambda) is formed inside whittle_evidence. object.prior =
+    # tikhonov_spectral instead profiles S(|k|) from the data per isotropic
+    # |k| shell with an |H|^2-weighted fit (the FittedSpectrum iso-Whittle
+    # prior), re-fit at every evaluation so it co-optimizes with the aberrations.
+    use_fitted_spectrum = isinstance(cfg.object.prior, PriorTikhonovSpectral)
+    if use_fitted_spectrum:
+        fitted_spectrum = FittedSpectrum(n_shells=cfg.object.prior.tikhonov_spectral.n_shells)
+        spectrum_sampling = Sampling(
+            zyx_shape=tuple(zyx_data.shape),
+            yx_pixel_size=optics_kwargs["yx_pixel_size"],
+            z_pixel_size=float(cfg.data.pixel_size.z),
+            z_padding=0,
+        )
+
     def total_score(values: torch.Tensor, log_sigma: torch.Tensor, log_weight: torch.Tensor) -> torch.Tensor:
         coefficients: dict[int, float | torch.Tensor] = dict(fixed_coefficients)
         for spec, value in zip(specs, values):
             coefficients[name_to_noll(spec.name)] = value
         otf = fluorescence_otf(zernike_coefficients=coefficients, **optics_kwargs)
         if score_name == "evidence":
-            data_term = whittle_evidence(
-                data_fft=data_fft,
-                otf=otf,
-                noise_sigma=torch.exp(log_sigma),
-                regularization_strength=torch.exp(log_weight),
-                exclude_dc=True,
-            )
+            if use_fitted_spectrum:
+                object_spectrum = fitted_spectrum.spectrum(
+                    spectrum_sampling,
+                    Gaussian(float(torch.exp(log_sigma))),
+                    data_fft=data_fft,
+                    otf=otf,
+                )
+                data_term = whittle_evidence(
+                    data_fft=data_fft,
+                    otf=otf,
+                    noise_sigma=torch.exp(log_sigma),
+                    object_spectrum=object_spectrum,
+                    exclude_dc=True,
+                )
+            else:
+                data_term = whittle_evidence(
+                    data_fft=data_fft,
+                    otf=otf,
+                    noise_sigma=torch.exp(log_sigma),
+                    regularization_strength=torch.exp(log_weight),
+                    exclude_dc=True,
+                )
         else:
             data_term = gcv_score(data_fft, otf, torch.exp(log_weight))
         penalty = torch.zeros((), dtype=torch.float64)
@@ -476,5 +508,8 @@ def run_evidence_calibration(
         noise_sigma=float(torch.exp(log_sigma)),
         weight=float(torch.exp(log_weight)),
         best_score=best_score,
-        extras={"score": score_name},
+        extras={
+            "score": score_name,
+            "object_prior": "tikhonov_spectral" if use_fitted_spectrum else "tikhonov",
+        },
     )

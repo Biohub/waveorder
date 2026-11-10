@@ -1068,9 +1068,11 @@ def build_system_from_config(cfg):
     # Object prior.
     prior_spec = cfg.object.prior
     weight = cfg.object.weight if isinstance(cfg.object.weight, (int, float)) else 1e-3
-    if isinstance(prior_spec, PriorTikhonovSpectral) or isinstance(prior_spec, TikhonovSpectralPrior):
-        # A fitted / explicit spectrum: deferred to FittedSpectrum (TODO).
-        obj: ObjectPrior = FittedSpectrum()
+    if isinstance(prior_spec, PriorTikhonovSpectral):
+        # Data-profiled iso-Whittle spectrum (same prior the evidence path uses).
+        obj: ObjectPrior = FittedSpectrum(n_shells=prior_spec.tikhonov_spectral.n_shells)
+    elif isinstance(prior_spec, TikhonovSpectralPrior):
+        obj = FittedSpectrum(n_shells=prior_spec.n_shells)
     elif prior_spec in ("tikhonov", "tv", "none") or prior_spec is None:
         obj = Tikhonov(float(weight))
     else:
