@@ -25,6 +25,7 @@ ALL_CONFIG_PATHS = sorted(path for config_dir in CONFIG_DIRS for path in config_
 #: Birefringence stays 3.x this release (design document section 2).
 BIREFRINGENCE_CONFIG_PATHS = [p for p in ALL_CONFIG_PATHS if "birefringence" in p.name]
 
+
 def _is_tile_stitch_config(path: Path) -> bool:
     """Whether a configuration is a ``wo tile-stitch`` configuration.
 

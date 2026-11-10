@@ -97,9 +97,7 @@ def test_fitted_spectrum_prior_is_wired(synthetic_data):
     # Fitted-vs-flat accuracy is data-dependent -- the fitted prior wins on
     # structured real data, not on this white-spectrum phantom -- so recovery
     # accuracy is not asserted here.
-    fitted = run_evidence_calibration(
-        _config(prior={"tikhonov_spectral": {"n_shells": 8}}), synthetic_data
-    )
+    fitted = run_evidence_calibration(_config(prior={"tikhonov_spectral": {"n_shells": 8}}), synthetic_data)
     flat = run_evidence_calibration(_config(), synthetic_data)
     assert fitted.extras["object_prior"] == "tikhonov_spectral"
     assert flat.extras["object_prior"] == "tikhonov"

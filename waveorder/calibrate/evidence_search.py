@@ -28,7 +28,6 @@ from waveorder.calibrate.scores import whittle_evidence
 from waveorder.calibrate.synthesis import fluorescence_otf
 from waveorder.calibrate.tfzarr import TransferFunctionStore
 from waveorder.calibrate.zernike_names import name_to_noll, noll_indices_up_to_order, noll_to_name
-from waveorder.distributions import FittedSpectrum, Gaussian, Sampling
 from waveorder.config.schema import (
     FreeParameter,
     GaussianNoise,
@@ -39,6 +38,7 @@ from waveorder.config.schema import (
     V4Config,
     free_parameters,
 )
+from waveorder.distributions import FittedSpectrum, Gaussian, Sampling
 
 
 @dataclass
