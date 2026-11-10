@@ -133,7 +133,7 @@ def build_recovery_settings(cfg: V4Config, yx_shape: tuple[int, int]) -> tuple[R
     calibration = cfg.solver.calibration
     score = calibration.score if calibration is not None else "sharpness"
     if score != "sharpness":
-        raise _not_yet(f"score: {score} (evidence/gcv/sure land with design step 4; use sharpness)")
+        raise _not_yet(f"score: {score} on the sharpness path (evidence and gcv run through the evidence calibrator)")
 
     max_iter = 250
     if calibration is not None:

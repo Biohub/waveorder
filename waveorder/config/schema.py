@@ -551,7 +551,7 @@ class CalibrationAdvanced(V4BaseModel):
 class Calibration(V4BaseModel):
     """How H is estimated; read only when something has a tolerance."""
 
-    score: Literal["evidence", "gcv", "sure", "sharpness"] = "evidence"
+    score: Literal["evidence", "gcv", "sharpness"] = "evidence"
     search: list[SearchStage] = Field(default_factory=lambda: [SearchGradient(gradient=GradientStage())])
     final_estimate: Literal["best_H", "average_near_best_H"] = "best_H"
     advanced: Optional[CalibrationAdvanced] = None
@@ -686,9 +686,9 @@ class V4Config(V4BaseModel):
 
         if self.object.weight == "auto":
             score = calibration.score if calibration is not None else None
-            if anything_estimated and score not in ("gcv", "evidence", "sure"):
+            if anything_estimated and score not in ("gcv", "evidence"):
                 raise ValueError(
-                    "weight: auto requires solver.calibration.score in {gcv, evidence, sure} "
+                    "weight: auto requires solver.calibration.score in {gcv, evidence} "
                     "when imaging-system parameters are estimated"
                 )
 
