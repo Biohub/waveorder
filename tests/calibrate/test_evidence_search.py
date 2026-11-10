@@ -25,7 +25,7 @@ TRUTH = {"astigmatism_0": 0.12, "coma_x": 0.06}
 SIGMA, LAM = 0.05, 1e-2
 
 
-def _config(score: str = "evidence", search=None, weight=LAM, sigma=SIGMA, prior="tikhonov") -> V4Config:
+def _config(score: str = "evidence", search=None, weight=LAM, sigma=SIGMA) -> V4Config:
     return V4Config(
         **{
             "version": 4,
@@ -42,7 +42,7 @@ def _config(score: str = "evidence", search=None, weight=LAM, sigma=SIGMA, prior
                     },
                 },
             },
-            "object": {"prior": prior, "weight": weight},
+            "object": {"prior": "tikhonov", "weight": weight},
             "noise": {"gaussian": {"sigma": sigma}},
             "solver": {
                 "calibration": {
@@ -86,25 +86,6 @@ def test_evidence_gradient_recovers_truth(synthetic_data):
     variances = np.diag(result.parameters_covariance[0])
     assert np.all(np.isfinite(variances)) and np.all(variances > 0)
     assert np.sqrt(variances).max() < 0.1  # tight posterior at this SNR
-
-
-def test_fitted_spectrum_prior_is_wired(synthetic_data):
-    # object.prior: tikhonov_spectral routes the evidence through the
-    # FittedSpectrum iso-Whittle prior (S(|k|) profiled per isotropic |k|
-    # shell) instead of the flat Tikhonov S_k = sigma^2 / lambda. Assert the
-    # prior is selectable from a config, takes the fitted path end to end, and
-    # is actually in the loop (it moves the estimate relative to the flat run).
-    # Fitted-vs-flat accuracy is data-dependent -- the fitted prior wins on
-    # structured real data, not on this white-spectrum phantom -- so recovery
-    # accuracy is not asserted here.
-    fitted = run_evidence_calibration(_config(prior={"tikhonov_spectral": {"n_shells": 8}}), synthetic_data)
-    flat = run_evidence_calibration(_config(), synthetic_data)
-    assert fitted.extras["object_prior"] == "tikhonov_spectral"
-    assert flat.extras["object_prior"] == "tikhonov"
-    assert np.isfinite(fitted.best_score)
-    assert not np.allclose(fitted.parameters, flat.parameters)  # the fitted spectrum is active
-    assert np.abs(fitted.parameters).max() < 0.5  # a sane calibration, not blown up
-    assert np.all(np.isfinite(fitted.parameters_covariance))
 
 
 def test_evidence_grid_then_gradient(synthetic_data):

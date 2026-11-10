@@ -59,8 +59,8 @@ def whittle_evidence(
         Tikhonov weight ``lambda``; the object prior spectrum is
         ``S_k = sigma^2 / lambda``. Ignored when ``object_spectrum`` is given.
     object_spectrum : Tensor, optional
-        Explicit object power spectrum ``S_k`` (same shape as ``otf``),
-        for ``tikhonov_spectral`` priors.
+        Explicit object power spectrum ``S_k`` (same shape as ``otf``). When
+        given it overrides the flat Tikhonov ``S_k = sigma^2 / lambda``.
     data_fft : Tensor, optional
         Precomputed ``torch.fft.fftn(data, norm="ortho")``; pass this when
         scoring many candidate systems against the same data.

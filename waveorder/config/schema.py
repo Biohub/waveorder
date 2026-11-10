@@ -273,15 +273,6 @@ class ImagingSystem(V4BaseModel):
 # --- object ----------------------------------------------------------------
 
 
-class TikhonovSpectralPrior(V4BaseModel):
-    n_shells: PositiveInt = Field(
-        default=64,
-        description="number of isotropic |k| shells for the data-profiled iso-Whittle object "
-        "spectrum; the per-shell |H|^2-weighted fit (FittedSpectrum) replaces the flat Tikhonov "
-        "prior S_k = sigma^2 / lambda and is re-fit as the imaging system is calibrated",
-    )
-
-
 class BeadsPrior(V4BaseModel):
     diameter: PositiveFloat = Field(description="bead diameter in um; sparse spheres at unknown positions")
     snr_threshold: PositiveFloat = Field(
@@ -297,10 +288,6 @@ class DenoiserPrior(V4BaseModel):
     checkpoint: str
 
 
-class PriorTikhonovSpectral(V4BaseModel):
-    tikhonov_spectral: TikhonovSpectralPrior
-
-
 class PriorBeads(V4BaseModel):
     beads: BeadsPrior
 
@@ -311,7 +298,6 @@ class PriorDenoiser(V4BaseModel):
 
 Prior = Union[
     Literal["tikhonov", "tv", "none"],
-    PriorTikhonovSpectral,
     PriorBeads,
     PriorDenoiser,
 ]
@@ -641,11 +627,9 @@ class V4Config(V4BaseModel):
                     UserWarning,
                 )
             if calibration.score == "evidence":
-                prior_ok = self.object.prior in ("tikhonov",) or isinstance(
-                    self.object.prior, (PriorTikhonovSpectral, PriorBeads)
-                )
+                prior_ok = self.object.prior in ("tikhonov",) or isinstance(self.object.prior, PriorBeads)
                 if not prior_ok:
-                    raise ValueError("score: evidence requires object.prior in {tikhonov, tikhonov_spectral, beads}")
+                    raise ValueError("score: evidence requires object.prior in {tikhonov, beads}")
                 if self.noise.kind == "poisson":
                     raise ValueError("score: evidence requires Gaussian-family noise")
             for stage in calibration.search:
