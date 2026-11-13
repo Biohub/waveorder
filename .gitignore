@@ -151,6 +151,8 @@ waveorder/_version.py
 *.npz
 *.tif[f]
 *.pdf
+# the screening tutorial ships its vector figures and whitepaper PDF
+!docs/guide/labelfree-screening/**/*.pdf
 
 # example data
 /examples/data_temp/*
