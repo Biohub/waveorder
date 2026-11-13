@@ -547,10 +547,15 @@ def reconstruct(
         tilt_angle_azimuth=tilt_angle_azimuth,
         pupil_steepness=pupil_steepness,
     )
-    # Use norm-based decomposition when gradients are needed (optimization),
-    # full SVD otherwise (better accuracy for final reconstruction)
+    # The SVD and the norm-based decomposition are different reconstructions
+    # (the norm-based one drops the absorption/phase coupling), so an
+    # optimization must differentiate the same decomposition as the final
+    # output or it optimizes the wrong objective. Complex SVD backward is
+    # only unreliable on CUDA (singular-vector phase ambiguity), so fall
+    # back to the norm-based decomposition there alone.
     needs_grad = absorption_tf.requires_grad or phase_tf.requires_grad
-    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=not needs_grad)
+    use_svd = not (needs_grad and absorption_tf.is_cuda)
+    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=use_svd)
     return apply_inverse_transfer_function(
         zyx_data,
         singular_system,

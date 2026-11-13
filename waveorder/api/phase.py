@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from typing import Literal, Union
 
@@ -28,6 +29,7 @@ from waveorder.api._utils import (
     _wrap_output_tensor,
 )
 from waveorder.device import resolve_device
+from waveorder.focus import compute_midband_power
 from waveorder.models import isotropic_thin_3d, phase_thick_3d
 from waveorder.optim import (
     NullLogger,
@@ -36,6 +38,7 @@ from waveorder.optim import (
     optimize_reconstruction,
 )
 from waveorder.optim._types import OptimizableFloat
+from waveorder.optim.autoreg import select_crop
 from waveorder.optim.losses import MidbandPowerLossSettings, build_loss_fn
 
 # --- Settings ---
@@ -45,6 +48,15 @@ class TransferFunctionSettings(
     OptimizableFourierTransferFunctionSettings,
     WavelengthIllumination,
 ):
+    z_focus_offset: Union[Literal["auto"], float, OptimizableFloat] = Field(
+        default=0,
+        description=(
+            "(optimizable) offset from center slice in slice units; 'auto' finds the "
+            "in-focus slice from the data with a per-slice search over a 3D "
+            "reconstruction; '{init: auto, lr: 0.05}' refines the searched slice to "
+            "sub-slice precision with the gradient optimizer"
+        ),
+    )
     numerical_aperture_illumination: Union[NonNegativeFloat, OptimizableFloat] = Field(
         default=0.9, description="(optimizable) condenser numerical aperture"
     )
@@ -72,6 +84,141 @@ class Settings(MyBaseModel):
 
 
 # --- Functions ---
+
+
+def _z_focus_offset_is_auto(transfer_function: TransferFunctionSettings) -> bool:
+    """Whether ``z_focus_offset`` asks to be estimated from the data."""
+    v = transfer_function.z_focus_offset
+    return v == "auto" or (isinstance(v, OptimizableFloat) and v.initial_value == "auto")
+
+
+def _drop_auto_z_focus_offset(settings: Settings, reason: str) -> Settings:
+    """Warn and replace an unused ``z_focus_offset: "auto"`` with 0."""
+    warnings.warn(f"ignoring z_focus_offset: 'auto': {reason}", UserWarning)
+    return Settings(
+        transfer_function=settings.transfer_function.model_copy(update={"z_focus_offset": 0.0}),
+        apply_inverse=settings.apply_inverse,
+    )
+
+
+def _select_scoring_crops(zyx: torch.Tensor, crop_size: int = 512) -> list[tuple[int, int, int]]:
+    """Spatially spread crops for focus scoring: one per quadrant plus center.
+
+    A single most-structured crop is fragile: bright floating debris
+    dominates a variance score while sitting in a different focal plane
+    than the sample. Several spread-out crops, each the most structured
+    within its region, let the median focus index reject local outliers.
+    """
+    _, Y, X = zyx.shape
+    regions = [
+        (0, Y // 2, 0, X // 2),
+        (0, Y // 2, X // 2, X),
+        (Y // 2, Y, 0, X // 2),
+        (Y // 2, Y, X // 2, X),
+        (Y // 4, Y // 4 + Y // 2, X // 4, X // 4 + X // 2),
+    ]
+    crops = set()
+    for y_lo, y_hi, x_lo, x_hi in regions:
+        if y_hi - y_lo < 1 or x_hi - x_lo < 1:
+            continue
+        y0, x0, size = select_crop(zyx[:, y_lo:y_hi, x_lo:x_hi], crop_size=crop_size)
+        crops.add((y_lo + y0, x_lo + x0, size))
+    return sorted(crops)
+
+
+def resolve_z_focus_offset(
+    czyx_data: xr.DataArray,
+    settings: Settings = None,
+    device: str | torch.device | None = None,
+) -> Settings:
+    """Resolve ``z_focus_offset: "auto"`` from the data.
+
+    Reconstructs 3D phase volumes on a handful of structured crops of
+    the data, scores each slice's midband spectral power, and takes the
+    median sharpest slice across crops as the focus:
+    ``z_focus_offset = focus_idx - Z // 2``.
+
+    This discrete integer search is robust to multi-slice focus errors,
+    which gradient optimization cannot fix: shifting the model focus by
+    a whole number of slices relabels which acquired plane is "in
+    focus" and still reconstructs a locally sharp image, so the
+    sharpness landscape has a local optimum at every integer offset.
+    For sub-slice precision, write
+    ``z_focus_offset: {init: auto, lr: 0.05}``: the integer search runs
+    first and seeds the gradient optimizer, which refines within the
+    correct basin and co-optimizes any other optimizable parameters
+    (e.g. tilt angles).
+
+    Parameters
+    ----------
+    czyx_data : xr.DataArray
+        CZYX brightfield data (single channel).
+    settings : Settings, optional
+        Phase settings. Returned unchanged unless ``z_focus_offset`` is
+        ``"auto"``, either bare or as an ``OptimizableFloat`` init.
+    device : str, torch.device, or None
+        Compute device. None = CPU, "auto" = best available.
+
+    Returns
+    -------
+    Settings
+        Copy of ``settings`` with ``z_focus_offset`` resolved to a float
+        (or to an ``OptimizableFloat`` with a float init).
+    """
+    if settings is None:
+        settings = Settings()
+    if not _z_focus_offset_is_auto(settings.transfer_function):
+        return settings
+
+    Z = czyx_data.shape[1]
+    if Z == 1:
+        offset = 0.0
+        focus_indices = []
+    else:
+        # The focus reconstruction needs a numeric offset (its value does not
+        # enter the 3D model) and enough z padding to keep wrap-around from
+        # biasing the per-slice score.
+        tf_3d = settings.transfer_function.model_copy(
+            update={
+                "z_focus_offset": 0.0,
+                "z_padding": max(settings.transfer_function.z_padding, Z // 2),
+            }
+        )
+        settings_3d = Settings(transfer_function=tf_3d, apply_inverse=settings.apply_inverse)
+        s = tf_3d.resolve_floats()
+        yx = YXPixelSize.from_value(s.yx_pixel_size)
+
+        zyx = torch.as_tensor(np.asarray(czyx_data.values[0], dtype=np.float32))
+        focus_indices = []
+        for y0, x0, size in _select_scoring_crops(zyx):
+            czyx_crop = czyx_data.isel(y=slice(y0, y0 + size), x=slice(x0, x0 + size))
+            phase_zyx = reconstruct(czyx_crop, recon_dim=3, settings=settings_3d, device=device).values[0]
+            midband_per_slice = (
+                compute_midband_power(
+                    torch.as_tensor(phase_zyx),
+                    NA_det=s.numerical_aperture_detection,
+                    lambda_ill=s.wavelength_illumination,
+                    pixel_size=(yx.y + yx.x) / 2,
+                )
+                .cpu()
+                .numpy()
+            )
+            focus_indices.append(int(np.argmax(midband_per_slice)))
+        offset = float(int(np.median(focus_indices)) - (Z // 2))
+
+    current = settings.transfer_function.z_focus_offset
+    if isinstance(current, OptimizableFloat):
+        resolved = OptimizableFloat(initial_value=offset, learning_rate=current.learning_rate)
+    else:
+        resolved = offset
+    print(
+        f"Resolved z_focus_offset = {offset:g} (slice units) from the data"
+        + (f"; per-crop focus slices {focus_indices}" if focus_indices else "")
+    )
+    return Settings(
+        transfer_function=settings.transfer_function.model_copy(update={"z_focus_offset": resolved}),
+        apply_inverse=settings.apply_inverse,
+    )
 
 
 def simulate(
@@ -108,6 +255,8 @@ def simulate(
     """
     if settings is None:
         settings = Settings()
+    if _z_focus_offset_is_auto(settings.transfer_function):
+        raise ValueError("z_focus_offset: 'auto' is estimated from measured data; set a numeric value for simulate()")
 
     s = settings.transfer_function.resolve_floats()
     yx_pixel_size = YXPixelSize.from_value(s.yx_pixel_size)
@@ -219,6 +368,12 @@ def compute_transfer_function(
     if settings is None:
         settings = Settings()
     device = resolve_device(device)
+
+    if _z_focus_offset_is_auto(settings.transfer_function):
+        if recon_dim == 3:
+            settings = _drop_auto_z_focus_offset(settings, "3D reconstructions do not use a focus offset")
+        else:
+            settings = resolve_z_focus_offset(czyx_data, settings, device=device)
 
     zyx_shape = czyx_data.shape[1:]  # CZYX -> ZYX
     s = settings.transfer_function.resolve_floats()
@@ -386,6 +541,11 @@ def reconstruct(
     """
     if settings is None:
         settings = Settings()
+    if _z_focus_offset_is_auto(settings.transfer_function):
+        if recon_dim == 3:
+            settings = _drop_auto_z_focus_offset(settings, "3D reconstructions do not use a focus offset")
+        else:
+            settings = resolve_z_focus_offset(czyx_data, settings, device=device)
 
     tf = compute_transfer_function(czyx_data, recon_dim, settings, device=device)
     return apply_inverse_transfer_function(czyx_data, tf, recon_dim, settings, device=device)
@@ -445,6 +605,12 @@ def optimize(
     if settings is None:
         settings = Settings()
     device = resolve_device(device)
+
+    if _z_focus_offset_is_auto(settings.transfer_function):
+        if recon_dim == 3:
+            settings = _drop_auto_z_focus_offset(settings, "3D reconstructions do not use a focus offset")
+        else:
+            settings = resolve_z_focus_offset(czyx_data, settings, device=device)
 
     opt_params, _ = extract_optimizable_params(settings.transfer_function)
 
