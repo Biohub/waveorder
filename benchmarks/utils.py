@@ -1,15 +1,15 @@
-"""Shared utilities for benchmarks: timing, metadata, and formatting."""
+"""Shared utilities for benchmarks: timing and metadata."""
 
 import json
 import platform
 import subprocess
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
 
-import numpy as np
 import torch
 
 # --- TimingTree ---
@@ -48,12 +48,12 @@ class TimingTree:
     2
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.root: TimingNode | None = None
         self._stack: list[TimingNode] = []
 
     @contextmanager
-    def time(self, name: str):
+    def time(self, name: str) -> Iterator[TimingNode]:
         """Time a named block. Blocks can be nested."""
         node = TimingNode(name=name)
         if self._stack:
@@ -74,7 +74,7 @@ class TimingTree:
             return {}
         return self.root.to_dict()
 
-    def save(self, path: Path):
+    def save(self, path: Path) -> None:
         """Write timing tree to JSON."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2))
@@ -128,33 +128,3 @@ def collect_metadata() -> dict:
         "gpu_count": gpu_count,
         "platform": platform.platform(),
     }
-
-
-# --- Formatting ---
-
-
-def render_histogram(hist: dict) -> str:
-    """Render a histogram as an inline sparkline.
-
-    Parameters
-    ----------
-    hist : dict
-        Histogram with "bin_edges" and "counts" keys.
-
-    Returns
-    -------
-    str
-        Single-line sparkline with range labels,
-        e.g. ``[0.00] ▁▃█▇▃▁ [1.00]``
-    """
-    counts = np.array(hist["counts"])
-    edges = np.array(hist["bin_edges"])
-
-    if counts.max() == 0:
-        return "(empty)"
-
-    blocks = "▁▂▃▄▅▆▇█"
-    normalized = counts / counts.max()
-    bars = "".join(blocks[int(v * 7)] for v in normalized)
-
-    return f"[{edges[0]:.3g}] {bars} [{edges[-1]:.3g}]"

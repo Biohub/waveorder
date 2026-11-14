@@ -1,0 +1,22 @@
+# The baseline student of a thin phase model (Phase2D): a 3x3 projection of 5 planes, a small ResNet, a plane head
+# and an L1 loss. Run from a folder that holds phase_2d.yml (the configuration wo rec made the targets with) and
+# index/ (wo distill index), or pass --model.reconstruction and --data.index. The other files here are layers:
+#   wo distill fit --config base.yml --config cytoland.yml
+seed_everything: 0
+trainer:
+  max_epochs: 2
+  logger: {class_path: CSVLogger, init_args: {save_dir: runs, name: base}}
+model:
+  reconstruction: phase_2d.yml
+  student:
+    class_path: UNet
+    init_args:
+      stem: {class_path: PlaneProjection, init_args: {planes: 5, channels: 8}}
+      encoder: {class_path: ResNetEncoder, init_args: {widths: [8, 8, 8, 8], depths: [1, 1, 1, 1]}}
+      head: PlaneHead
+      decoder_channels: [8, 8, 8, 8, 8]
+  input_normalizer: FieldStandardize
+  target_normalizer: {class_path: Affine, init_args: {percentiles: [1, 99]}}
+  losses: {l1: L1}
+  optimization: {lr: 1.0e-3, warmup_epochs: 0.5}
+data: {index: index, patch_size: [32, 32], per_field: 4, batch_size: 4, workers: 0}

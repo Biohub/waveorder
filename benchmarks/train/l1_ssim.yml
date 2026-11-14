@@ -1,0 +1,9 @@
+# Half L1, half SSIM. A layer replaces a dictionary whole, so it lists l1 again; the flags merge instead:
+#   --model.losses.ssim SSIM --model.losses.ssim.window 7 --model.weights '{l1: 0.5, ssim: 0.5}'
+trainer:
+  logger: {init_args: {name: l1_ssim}}
+model:
+  losses:
+    l1: L1
+    ssim: {class_path: SSIM, init_args: {window: 7}}
+  weights: {l1: 0.5, ssim: 0.5}

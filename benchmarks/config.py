@@ -5,13 +5,11 @@ reconstruction config, and case type. Cases can inherit shared
 ``base_phantom`` and ``base_config`` from the experiment level.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveFloat, PositiveInt, model_validator
 
 
 class PhantomConfig(BaseModel):
@@ -20,7 +18,7 @@ class PhantomConfig(BaseModel):
     Parameters
     ----------
     function : str
-        Name of the phantom function ("single_bead" or "random_beads").
+        Name of the phantom function in :mod:`benchmarks.phantoms`.
     shape : tuple[int, int, int]
         Volume shape (Z, Y, X) in pixels.
     pixel_sizes : tuple[float, float, float]
@@ -29,7 +27,7 @@ class PhantomConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    function: Literal["single_bead", "random_beads", "grid_beads", "grid_beads_gaussian"]
+    function: Literal["single_bead", "grid_beads_gaussian"]
     shape: tuple[PositiveInt, PositiveInt, PositiveInt] = (64, 128, 128)
     pixel_sizes: tuple[PositiveFloat, PositiveFloat, PositiveFloat] = (0.25, 0.1, 0.1)
 
@@ -37,11 +35,9 @@ class PhantomConfig(BaseModel):
 class SimulationConfig(BaseModel):
     """Optional forward-model override for a synthetic case.
 
-    By default a synthetic case uses the shift-invariant
-    ``isotropic_fluorescent_thick_3d`` / ``phase_thick_3d`` simulators.
-    Set ``forward_model: shift_variant`` to use the spatial-polynomial
-    pupil simulator from
-    :mod:`waveorder.models.shift_variant_fluorescent_3d`.
+    By default a synthetic case is imaged by one shift-invariant system (:mod:`benchmarks.simulate`). Set
+    ``forward_model: shift_variant`` for pupil aberrations that vary over the field as a polynomial in the field
+    position (:func:`benchmarks.simulate.simulate_shift_variant_fluorescence_3d`).
 
     Parameters
     ----------
@@ -63,18 +59,13 @@ class SimulationConfig(BaseModel):
 
 
 class RecoveryConfig(BaseModel):
-    """Optional shift-variant Zernike recovery, executed in place of ``wo rec``.
+    """Optional per-tile Zernike recovery, run in place of ``wo rec``.
 
-    When set on a synthetic case, the runner replaces the standard
-    inverse-transfer-function reconstruction with the per-tile Zernike
-    optimisation from :mod:`waveorder.api.shift_variant_recovery`. The
-    case writes ``recovered_coefs.npy``, ``truth_coefs.npy``, and a
-    ``zernike_recovery`` block into ``metrics.json`` containing the
-    recovery_score FoM and per-mode RMSE/correlation.
-
-    Tile geometry mirrors ``waveorder.tile_stitch``; the sim's
-    ``n_tiles_yx`` is independent — the recovery's ``tile_size_yx`` is
-    aligned with the bead grid.
+    The runner fits the coefficients of ``noll_indices`` on every tile with ``waveorder.tiling.run.recover_zernikes``
+    and writes ``recovered_coefs.npy``, ``truth_coefs.npy`` and a ``zernike_recovery`` block (``recovery_score``,
+    per-mode RMS error and correlation) into ``metrics.json``. Tiles follow 3.x ``tile-stitch``: ``tile_size_yx`` is
+    the tile's size and ``tile_overlap_yx`` the pixels neighbouring tiles share. ``loss`` and ``optimizer`` keep the
+    3.x names; the waveorder 4 search refuses optimizers it does not have.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -84,16 +75,10 @@ class RecoveryConfig(BaseModel):
     tile_size_yx: dict[str, PositiveInt] = Field(default_factory=lambda: {"y": 26, "x": 26})
     tile_overlap_yx: dict[str, int] = Field(default_factory=lambda: {"y": 0, "x": 0})
     bead_template_sigma_um: tuple[PositiveFloat, PositiveFloat, PositiveFloat] = (0.15, 0.1, 0.1)
-    loss: Literal["mse", "midband", "midband_3d", "tv", "laplacian_var", "normalized_var", "spectral_flatness"] = (
-        "midband"
-    )
+    loss: Literal["mse", "midband", "tv", "laplacian_var", "normalized_var", "spectral_flatness"] = "midband"
     midband_fractions: tuple[float, float] = (0.2, 0.4)
-    l1_strength: float = 0.0
-    smooth_strength: float = 0.0
     scale_fit: bool = True
     optimizer: Literal["adam", "adamw", "nadam", "sgd", "lbfgs"] = "sgd"
-    lr_schedule: Literal["constant", "cosine", "step", "warmup"] = "constant"
-    lr_mult: PositiveFloat = 1.0
     n_iter: PositiveInt = 250
     wiener_regularization: PositiveFloat = 1.0e-3
 
@@ -101,12 +86,10 @@ class RecoveryConfig(BaseModel):
 class ReferenceBound(BaseModel):
     """One-sided or two-sided bound on a referenced value.
 
-    Used to gate benchmark regressions. Each key in a case's
-    ``reference`` dict is a dotted path into the computed metrics (e.g.
-    ``image_quality.midband_power``, ``with_phantom.ssim``) or into the
-    optimizer's final parameters under the ``parameter.`` prefix (e.g.
-    ``parameter.z_focus_offset``). At least one of ``min`` or ``max``
-    must be provided.
+    Used to gate benchmark regressions. Each key in a case's ``reference`` dict is a dotted path into the computed
+    metrics (e.g. ``image_quality.midband_power``, ``with_phantom.ssim``) or, under the ``parameter.`` prefix, a
+    value ``wo rec`` calibrated (e.g. ``parameter.z_focus_offset``). At least one of ``min`` or ``max`` must be
+    provided.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -115,7 +98,7 @@ class ReferenceBound(BaseModel):
     max: float | None = None
 
     @model_validator(mode="after")
-    def _validate(self):
+    def _validate(self) -> Self:
         if self.min is None and self.max is None:
             raise ValueError("ReferenceBound requires at least one of 'min' or 'max'")
         if self.min is not None and self.max is not None and self.min > self.max:
@@ -140,19 +123,23 @@ class CropConfig(BaseModel):
     def slices(self) -> tuple[slice, slice, slice]:
         """Return ``(z_slice, y_slice, x_slice)`` ready to index a ZYX array."""
 
-        def _sl(r):
+        def _sl(r: tuple[int, int] | None) -> slice:
             return slice(r[0], r[1]) if r else slice(None)
 
         return _sl(self.z), _sl(self.y), _sl(self.x)
 
 
 class CaseConfig(BaseModel):
-    """Configuration for a single benchmark case."""
+    """Configuration for a single benchmark case.
+
+    ``tile`` and ``tile_overlap`` (z, y, x) are passed to ``wo rec --tile`` and ``--tile-overlap``.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     type: Literal["synthetic", "hpc"] = "synthetic"
-    cli: Literal["rec", "tile-stitch"] = "rec"
+    tile: tuple[PositiveInt, PositiveInt, PositiveInt] | None = None
+    tile_overlap: tuple[NonNegativeInt, NonNegativeInt, NonNegativeInt] | None = None
     phantom: PhantomConfig | None = None
     config: str | None = None
     overrides: dict[str, Any] | None = None
@@ -187,7 +174,7 @@ class ExperimentConfig(BaseModel):
     cases: dict[str, CaseConfig] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def inherit_base_phantom(self):
+    def inherit_base_phantom(self) -> Self:
         """Copy base_phantom into cases that don't define their own."""
         if self.base_phantom is not None:
             for case in self.cases.values():
@@ -196,7 +183,7 @@ class ExperimentConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def inherit_base_config(self):
+    def inherit_base_config(self) -> Self:
         """Copy base_config into cases that don't define their own."""
         if self.base_config is not None:
             for case in self.cases.values():
@@ -258,21 +245,12 @@ def resolve_recon_config(case: CaseConfig, experiment_dir: Path) -> dict:
     return config
 
 
-def recon_block(recon_config: dict) -> dict:
-    """Return the ``wo rec``-schema block of a config.
-
-    Plain ``wo rec`` configs are the block themselves; ``wo tile-stitch``
-    configs nest it under ``recon``.
-    """
-    return recon_config.get("recon", recon_config)
-
-
 def infer_modality(recon_config: dict) -> str:
     """Return ``"phase"`` if the recon config has a phase block, else ``"fluorescence"``."""
-    return "phase" if "phase" in recon_block(recon_config) else "fluorescence"
+    return "phase" if "phase" in recon_config else "fluorescence"
 
 
-def _deep_set(d: dict, keys: list[str], value: Any):
+def _deep_set(d: dict, keys: list[str], value: object) -> None:
     """Set a nested dict value by key path.
 
     Parameters
@@ -281,7 +259,7 @@ def _deep_set(d: dict, keys: list[str], value: Any):
         Target dict (modified in-place).
     keys : list[str]
         Key path, e.g. ["phase", "apply_inverse", "regularization_strength"].
-    value : Any
+    value : object
         Value to set.
     """
     for key in keys[:-1]:

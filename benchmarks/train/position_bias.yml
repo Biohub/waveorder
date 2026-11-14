@@ -1,0 +1,10 @@
+# The field position as a per-channel bias; the module's conditions and the student's sizes must agree.
+# The flags that do the same: --model.conditions+ FieldPosition --model.student.init_args.conditioning Bias
+#   --model.student.init_args.conditioning.sizes '{field_position: 2}'
+trainer:
+  logger: {init_args: {name: position_bias}}
+model:
+  conditions: [FieldPosition]
+  student:
+    init_args:
+      conditioning: {class_path: Bias, init_args: {sizes: {field_position: 2}}}

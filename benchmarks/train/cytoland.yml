@@ -1,0 +1,11 @@
+# One Conv3d whose kernel is its stride replaces the encoder's stem (Cytoland's layout), with a sub-pixel head.
+# The flags that do the same: --model.student.init_args.stem StridedVolume --model.student.init_args.stem.planes 5
+#   --model.student.init_args.head SubPixelHead --model.student.init_args.decoder_channels '[8, 8, 8]'
+trainer:
+  logger: {init_args: {name: cytoland}}
+model:
+  student:
+    init_args:
+      stem: {class_path: StridedVolume, init_args: {planes: 5}}
+      head: SubPixelHead
+      decoder_channels: [8, 8, 8]
