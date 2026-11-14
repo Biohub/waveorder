@@ -229,9 +229,10 @@ def calculate_singular_system(
     phase_2d_to_3d_transfer_function : Tensor
         Transfer function for phase, same shape as absorption TF
     use_svd : bool
-        If True (default), use torch.linalg.svd for best reconstruction
-        accuracy. Set to False for a norm-based decomposition that
-        supports gradient backpropagation on all devices
+        If True (default), use torch.linalg.svd. Set to False for an
+        equivalent closed-form decomposition of the 2x2 Gram matrix with
+        epsilon-smoothed branch points, which supports gradient
+        backpropagation on all devices
 
     Returns
     -------
@@ -257,11 +258,10 @@ def calculate_singular_system(
 
     if use_svd:
         # Full SVD over the (s=2, Z) matrix at each spatial frequency.
-        # Captures cross-channel coupling between absorption and phase,
-        # giving the best reconstruction accuracy.
-        # Note: torch.linalg.svd backward fails with complex tensors on
-        # some GPU types due to singular vector phase ambiguity
-        # (svd_backward: e^{i phi} error). Use use_svd=False when
+        # Note: torch.linalg.svd backward produces non-finite gradients
+        # where singular values are degenerate (e.g. both zero beyond the
+        # band limit) and fails outright with complex tensors on some GPU
+        # types (svd_backward: e^{i phi} error). Use use_svd=False when
         # gradients are needed.
         BVyVxsZ = sfYX.permute(0, 3, 4, 1, 2)
         Up, Sp, Vhp = torch.linalg.svd(BVyVxsZ, full_matrices=False)
@@ -269,17 +269,67 @@ def calculate_singular_system(
         S = Sp.permute(0, 3, 1, 2)  # (B, s, Vy, Vx)
         Vh = Vhp.permute(0, 3, 4, 1, 2)  # (B, s, Z, Vy, Vx)
     else:
-        # Norm-based decomposition: assumes absorption and phase channels
-        # are independent (U=identity). Less accurate than full SVD but
-        # supports gradient backpropagation on all devices.
-        # Per-channel norms: S[b, k] = norm(H[b, k, :])
-        S = torch.sqrt(torch.clamp(torch.sum(torch.abs(sfYX) ** 2, dim=2), min=1e-12))  # (B, s=2, Vy, Vx)
-        # Normalized rows: Vh[b, k, z] = H[b, k, z] / S[b, k]
-        Vh = sfYX / (S[:, :, None] + 1e-12)  # (B, s=2, Z, Vy, Vx)
-        # U = identity (each channel reconstructs independently)
-        U = torch.zeros(B, s, s, Vy, Vx, dtype=sfYX.dtype, device=sfYX.device)
-        for i in range(s):
-            U[:, i, i] = 1.0
+        # Closed-form singular system from the 2x2 Gram matrix G = H H^†.
+        # This is the same decomposition the SVD branch computes (up to
+        # the phase gauge, which the reconstruction is invariant to), but
+        # with epsilon-smoothed branch points so gradients stay finite
+        # where the singular values are degenerate or zero, where
+        # torch.linalg.svd backward does not. Works on all devices.
+        absorption_row = sfYX[:, 0]  # (B, Z, Vy, Vx)
+        phase_row = sfYX[:, 1]
+        # G = [[a, b], [conj(b), c]] at each spatial frequency. The Gram
+        # entries square the transfer function, so accumulate and solve the
+        # (Z-free) eigenproblem in double precision to keep the
+        # decomposition tight in float32 overall.
+        a = (absorption_row.abs() ** 2).sum(dim=1, dtype=torch.float64)  # (B, Vy, Vx)
+        c = (phase_row.abs() ** 2).sum(dim=1, dtype=torch.float64)
+        b = (absorption_row * phase_row.conj()).sum(dim=1, dtype=torch.complex128)
+
+        mean = (a + c) / 2
+        # Smooth the eigenvalue gap with a relative epsilon (so healthy
+        # frequencies are perturbed by <1e-9 relative) plus a tiny absolute
+        # floor that keeps sqrt backward finite where H is exactly zero.
+        tiny = 1e-30
+        half_gap = torch.sqrt(((a - c) / 2) ** 2 + b.abs() ** 2 + (1e-9 * mean) ** 2 + tiny)
+        lam1 = mean + half_gap
+        lam2 = torch.clamp(mean - half_gap, min=0.0)
+        S = torch.stack((torch.sqrt(lam1 + tiny), torch.sqrt(lam2 + tiny)), dim=1).to(
+            absorption_row.real.dtype
+        )  # (B, 2, Vy, Vx)
+
+        # Leading eigenvector of G, taking whichever closed form is better
+        # conditioned at each frequency: [b, lam1 - a] or [lam1 - c, conj(b)].
+        # Where H is ~zero both forms vanish and the normalized vector decays
+        # to zero along with S, so no explicit degenerate branch is needed.
+        u_x, u_y = b, (lam1 - a).to(b.dtype)
+        w_x, w_y = (lam1 - c).to(b.dtype), b.conj()
+        use_u = (u_x.abs() ** 2 + u_y.abs() ** 2) >= (w_x.abs() ** 2 + w_y.abs() ** 2)
+        v1_x = torch.where(use_u, u_x, w_x)
+        v1_y = torch.where(use_u, u_y, w_y)
+        norm1 = torch.sqrt(v1_x.abs() ** 2 + v1_y.abs() ** 2 + tiny)
+        v1_x = v1_x / norm1
+        v1_y = v1_y / norm1
+
+        v1_x = v1_x.to(sfYX.dtype)
+        v1_y = v1_y.to(sfYX.dtype)
+
+        # Columns of U: v1 and its orthonormal complement [-conj(v1_y), conj(v1_x)]
+        U = torch.stack(
+            (
+                torch.stack((v1_x, -v1_y.conj()), dim=1),
+                torch.stack((v1_y, v1_x.conj()), dim=1),
+            ),
+            dim=1,
+        )  # (B, s, s, Vy, Vx)
+
+        # Vh = S^-1 U^† H; rows have unit norm where S > 0 and vanish with S.
+        Vh = torch.stack(
+            (
+                (v1_x.conj()[:, None] * absorption_row + v1_y.conj()[:, None] * phase_row) / S[:, 0, None],
+                (-v1_y[:, None] * absorption_row + v1_x[:, None] * phase_row) / S[:, 1, None],
+            ),
+            dim=1,
+        )  # (B, s, Z, Vy, Vx)
 
     if not batched:
         U = U.squeeze(0)
@@ -547,15 +597,12 @@ def reconstruct(
         tilt_angle_azimuth=tilt_angle_azimuth,
         pupil_steepness=pupil_steepness,
     )
-    # The SVD and the norm-based decomposition are different reconstructions
-    # (the norm-based one drops the absorption/phase coupling), so an
-    # optimization must differentiate the same decomposition as the final
-    # output or it optimizes the wrong objective. Complex SVD backward is
-    # only unreliable on CUDA (singular-vector phase ambiguity), so fall
-    # back to the norm-based decomposition there alone.
+    # Both decompositions produce the same reconstruction, but
+    # torch.linalg.svd backward is non-finite at degenerate singular values
+    # (ubiquitous beyond the band limit) and unsupported for complex inputs
+    # on some GPUs, so gradient mode uses the closed-form Gram decomposition.
     needs_grad = absorption_tf.requires_grad or phase_tf.requires_grad
-    use_svd = not (needs_grad and absorption_tf.is_cuda)
-    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=use_svd)
+    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=not needs_grad)
     return apply_inverse_transfer_function(
         zyx_data,
         singular_system,
