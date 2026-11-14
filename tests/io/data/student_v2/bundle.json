@@ -1,0 +1,107 @@
+{
+  "schema": "waveorder.student/2",
+  "student": {
+    "unet": {
+      "conditioning": {
+        "bias": {
+          "sizes": [
+            [
+              "field_position",
+              2
+            ]
+          ]
+        }
+      },
+      "dropout": 0.0,
+      "norm": "group",
+      "full_resolution_channels": 0,
+      "halo": null,
+      "stem": {
+        "strided_volume": {
+          "kernel_planes": null,
+          "data_channels": 1,
+          "planes": 5
+        }
+      },
+      "encoder": {
+        "resnet": {
+          "preset": "resnet18",
+          "widths": [
+            8,
+            8,
+            8,
+            8
+          ],
+          "depths": [
+            1,
+            1,
+            1,
+            1
+          ]
+        }
+      },
+      "head": {
+        "sub_pixel": {
+          "fields": 1
+        }
+      },
+      "decoder_channels": [
+        8,
+        8,
+        8
+      ]
+    }
+  },
+  "contract": {
+    "channels": 1,
+    "planes": null,
+    "fields": [
+      "phase"
+    ],
+    "pixel_size": [
+      0.4,
+      0.15,
+      0.15
+    ],
+    "pixel_size_tolerance": 0.05,
+    "system": {
+      "class": "ThinPhase2D",
+      "sha256": null
+    },
+    "model": "Phase2D",
+    "prepare_scope": "block"
+  },
+  "conditions": [
+    {
+      "field_position": {
+        "axes": "xy",
+        "offset": 0.5,
+        "scale": 0.4375,
+        "name": "field_position"
+      }
+    }
+  ],
+  "input_normalizer": {
+    "field_standardize": {
+      "eps": 1e-06
+    }
+  },
+  "target_normalizer": {
+    "affine": {
+      "offset": 0.5,
+      "scale": 2.0,
+      "percentiles": null
+    }
+  },
+  "model": {
+    "class": "Phase2D"
+  },
+  "record": {
+    "steps": 3,
+    "writer": "waveorder.student/2 before class paths"
+  },
+  "sha256": {
+    "weights.pt": "f262f8292f64066de619c6722ea244ec6ff5ea82e601f654945f92922617397d",
+    "test.pt": "0f18be4a4763c18fbc5751d34289b0a8495ecc7861f38f0c36b6ab19d727da52"
+  }
+}

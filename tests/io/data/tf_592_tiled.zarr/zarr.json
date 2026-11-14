@@ -1,0 +1,40 @@
+{
+  "attributes": {
+    "parameter_names": [
+      "defocus",
+      "coma_x",
+      "z13"
+    ],
+    "tile_grid": {
+      "size_yx": [
+        8,
+        8
+      ],
+      "overlap_yx": [
+        2,
+        2
+      ],
+      "centers_yx": [
+        [
+          1.5,
+          1.5
+        ],
+        [
+          1.5,
+          4.5
+        ]
+      ]
+    },
+    "provenance": {
+      "kind": "refined",
+      "sources": [
+        "beads.zarr/0/0/0"
+      ],
+      "config_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "score": "sharpness",
+      "time_index": 0
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}
