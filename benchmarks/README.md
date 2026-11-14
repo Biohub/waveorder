@@ -69,9 +69,6 @@ or missing reconstructions. For finer-grained comparisons:
 2. Run the same command from your feature branch checkout.
 3. `wo bm compare` diffs the two newest runs metric-by-metric.
 
-Keep runs on Intel nodes (the sbatch script pins `--constraint=intel`)
-so baselines stay hardware-comparable.
-
 ## Custom experiments
 
 Point `-e` at any experiment YAML:

@@ -222,12 +222,11 @@ wo bm compare -o runs [RUN_A] [RUN_B]     # midband power, mse and ssim of two r
 - `benchmarks/experiments/regression.yml` lists the cases: synthetic ones (a phantom, simulated, then reconstructed)
   and `hpc` ones (an OME-Zarr input on the Biohub HPC). Each has a `reference` bound, so one run flags a collapsed or
   missing reconstruction.
-- `benchmarks/run_regression.sbatch` runs `wo bm run --scope all` as a Slurm job (preempted partition, Intel
-  nodes, 1 GPU, 16 CPUs, 64 GB, 45 minutes). Set `WAVEORDER_BENCH_OUTPUT` or pass `-o`:
+- `benchmarks/run_regression.sbatch` runs `wo bm run --scope all` as a Slurm job (preempted partition, 1 GPU,
+  16 CPUs, 64 GB, 45 minutes). Set `WAVEORDER_BENCH_OUTPUT` or pass `-o`:
   `sbatch benchmarks/run_regression.sbatch -o /path/to/runs`.
-- To compare with `wo-4.0`, run the same suite from a `wo-4.0` checkout and from your branch, into one output
-  directory and on the same node type (the Intel constraint does that: `wo-4.0`'s 2D phase depends on the CPU), then
-  `wo bm compare` the two runs.
+- To compare with `wo-4.0`, run the same suite from a `wo-4.0` checkout and from your branch into one output
+  directory, then `wo bm compare` the two runs.
 - `tests/benchmarks/` tests the runner itself; `benchmarks/README.md` describes the output layout and how to add a
   case.
 - `benchmarks/train/` holds example training configurations (`base.yml` and the layers `cytoland.yml`,

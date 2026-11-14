@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=wo-bench-regression
 #SBATCH --partition=preempted
-#SBATCH --constraint=intel
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
@@ -14,7 +13,7 @@
 #   sbatch benchmarks/run_regression.sbatch -o /path/to/runs
 #
 # Arguments are passed on to `wo bm run`. Runs land in -o, else in $WAVEORDER_BENCH_OUTPUT; one of the two is
-# required. The intel constraint keeps runs comparable with the wo-4.0 baselines (its 2D phase depends on the CPU).
+# required.
 
 set -euo pipefail
 
