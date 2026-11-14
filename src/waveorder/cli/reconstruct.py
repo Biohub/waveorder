@@ -23,6 +23,7 @@ from waveorder.cli.options import (
     Tile,
     TileOverlap,
     TransferFunctionDirpath,
+    UniqueId,
     Wandb,
     WriteConfigScaleToOutput,
     parse_zyx,
@@ -43,6 +44,7 @@ def reconstruct(  # noqa: PLR0913 (one keyword per flag)
     keep_going: KeepGoing = False,
     write_config_scale_to_output: WriteConfigScaleToOutput = False,
     wandb: Wandb = None,
+    unique_id: UniqueId = None,
 ) -> None:
     """Reconstruct every position and time of a dataset into an output plate.
 
@@ -55,6 +57,8 @@ def reconstruct(  # noqa: PLR0913 (one keyword per flag)
     Example: wo rec -i 'in.zarr/*/*/*' -c phase.yml -o out.zarr
     """
     from waveorder.cli import _reconstruct
+
+    del unique_id  # wo-4.0's --unique-id, accepted so its command lines still run
 
     _reconstruct.reconstruct(
         _reconstruct.Flags(

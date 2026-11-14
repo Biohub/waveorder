@@ -66,10 +66,10 @@ def test_calibrate_tf_checks_the_prior_and_start_stores_against_the_model(phase_
     other = tmp_path / "other.zarr"
     computed = _compute(phase_plate, fluorescence, other)
     assert computed.exit_code == 0, computed.output
-    for flag in ("--prior", "-t", "--start"):
+    for flag in ("--prior", "-t", "--start", "--init"):  # --init is wo-4.0's spelling of --start
         unfit = _calibrate(phase_plate, phase_config, tmp_path / "x.zarr", flag, str(other))
         assert unfit.exit_code == 2
-        shown = "--start" if flag == "--start" else "--prior"
+        shown = "--start" if flag in ("--start", "--init") else "--prior"
         assert f"wo calibrate-tf: error: {shown} {other}: " in unfit.stderr
         assert "none of which is free in the model" in unfit.stderr
         assert not (tmp_path / "x.zarr").exists()

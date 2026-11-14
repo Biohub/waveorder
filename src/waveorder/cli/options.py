@@ -302,6 +302,10 @@ WriteConfigScaleToOutput = Annotated[
         "from the input's is used for the reconstruction either way, with a warning).",
     ),
 ]
+UniqueId = Annotated[
+    str | None,
+    typer.Option("--unique-id", "-uid", hidden=True, help="Accepted for wo-4.0 command lines and ignored."),
+]
 Device = Annotated[
     str | None,
     typer.Option(

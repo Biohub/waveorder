@@ -55,10 +55,11 @@ def test_rec_thick_phase(plate, tmp_path):
     assert image.shape == (2, 1, 8, 32, 32)
     assert "waveorder-Phase3D" in attrs
     assert not (tmp_path / "out_transfer_function_phase.zarr").exists()  # nothing free: no store
-    again = _rec(plate, tmp_path / "phase.yml", output)  # no --resume: every unit is written again, in place
-    assert again.exit_code == 0, again.output
+    again = _rec(plate, tmp_path / "phase.yml", output, "-uid", "x")  # no --resume: every unit is written again
+    assert again.exit_code == 0, again.output  # wo-4.0's --unique-id is accepted and changes nothing
     assert again.stdout == f"{output}: finished; 4 units: 4 reconstructed, 0 failed, 0 left\n"
     assert torch.equal(read_output(output, "A/1/1")[1], image)
+    assert "--unique-id" not in runner.invoke(app, ["rec", "--help"]).stdout
 
 
 def test_rec_resume_skips_the_units_an_earlier_run_finished_unless_the_reconstruction_changed(plate, tmp_path):

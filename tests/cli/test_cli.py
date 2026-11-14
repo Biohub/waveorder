@@ -102,11 +102,11 @@ _REMOVED = {
     "rec": [
         "--json", "--dry-run", "--events", "--torch-trace", "--wandb-project", "--wandb-tag", "--wandb-run-name",
         "--memory-budget", "--calibrate-on", "--time-indices", "--output-version", "--allow-system-mismatch",
-        "--unique-id", "-t", "-v", "-q", "--traceback",
+        "-t", "-v", "-q", "--traceback",
     ],
     "apply-inv-tf": ["--json", "--dry-run", "--allow-system-mismatch", "--output-version", "--time-indices"],
     "compute-tf": ["--shape", "--dry-run", "-t", "--allow-system-mismatch", "--json"],
-    "calibrate-tf": ["--calibrate-on", "--time-indices", "--dry-run", "--init", "--json"],
+    "calibrate-tf": ["--calibrate-on", "--time-indices", "--dry-run", "--json"],
 }  # fmt: skip
 
 

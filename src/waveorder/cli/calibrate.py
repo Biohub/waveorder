@@ -38,6 +38,7 @@ _Start = Annotated[
     Path | None,
     typer.Option(
         "--start",
+        "--init",
         metavar="STORE",
         rich_help_panel="Inputs",
         help="A transfer-function store whose parameters are the starting point of the search only.",
