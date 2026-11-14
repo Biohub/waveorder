@@ -1,0 +1,23 @@
+# The Slurm layer of the two-node test, over ../base.yml. The sbatch file fills ${RUN} and ${DATA} (envsubst).
+# DDP over NCCL, deterministic kernels, last.ckpt after every step, 6 epochs of 4 steps per rank.
+trainer:
+  accelerator: gpu
+  strategy: ddp
+  deterministic: true
+  max_epochs: 6
+  default_root_dir: ${RUN}  # where SLURMEnvironment writes hpc_ckpt_N.ckpt
+  logger:
+    class_path: CSVLogger
+    init_args: {save_dir: ${RUN}, name: "", version: ""}  # the run folder is ${RUN} on every attempt
+  plugins:
+    class_path: lightning.pytorch.plugins.environments.SLURMEnvironment
+    init_args: {auto_requeue: true}  # SIGUSR1 (the time limit): hpc_ckpt_N.ckpt and scontrol requeue
+  callbacks:
+    - {class_path: callbacks.Trace, init_args: {path: "${RUN}/trace"}}
+checkpoint_every: 1
+model:
+  reconstruction: ${DATA}/model.yml
+data:
+  index: ${DATA}/index
+  workers: 2
+  device: auto

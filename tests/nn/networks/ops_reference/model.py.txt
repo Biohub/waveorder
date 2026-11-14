@@ -1,0 +1,404 @@
+"""CoordTimmUNet: TimmUNet with coordinate-channel conditioning.
+
+Vendored from ``mehta-lab/waveorder-design``
+(``benchmark_table/src/benchmark_table/unet/model.py``) with one change:
+the 4 conditioning floats of NEXT_STEPS §1.5 are broadcast to constant
+spatial planes and concatenated (a) to the z-stack before the learned
+projection stem and (b) to every encoder feature map entering the decoder
+(channel-concat conditioning; FiLM is a later ablation).
+
+Architecture: learned Z-projection stem (``Conv2d(in_z + 4 -> proj_ch)``)
+-> timm backbone in ``features_only`` mode -> standard U-net decoder ->
+1-channel head. Any timm model with a 5-level ``features_only`` interface
+works (``resnet34``, ``efficientnet_b0``, ``convnext_tiny``, ...).
+
+``stem="cytoland"`` (fixed ``in_z``): Cytoland's stem (VisCy ``UNeXt2Stem``), one
+Conv3d with kernel = stride = ``(stem_kz, 4, 4)`` over the stack and the coordinate
+planes, replacing both the projection and the encoder's own stride-4 stem. The
+decoder stops at 1/4 resolution and a sub-pixel head returns to full size, so a
+single small conv runs above 1/4 resolution. ResNet-style timm encoders only;
+``proj_ch`` is unused.
+
+``stem="optical_defocus"``: the same layout for any slice count and spacing. The stem's
+kernel is a learned function of each slice's defocus, its distance from the focus
+plane in axial optical units (``OpticalDefocusStem``), and ``forward`` then also
+needs ``defocus``.
+
+``cond="bias"`` drops the coordinate planes: the 4 floats enter as a learned
+per-channel offset after the stem conv and after the first conv of every decoder
+block. Away from image borders that is the function the planes compute, without the
+extra input channels (decoder conv widths stay multiples of 32).
+"""
+
+from __future__ import annotations
+
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .batchrenorm import convert_to_batchrenorm
+
+
+NORMS = ("bn", "gn")
+GN_GROUPS = 8
+
+
+def _norm2d(ch: int, norm: str) -> nn.Module:
+    """BatchNorm2d, or GroupNorm with up to GN_GROUPS groups (fewer groups keep
+    more of the relative scale between channels than per-channel norms)."""
+    if norm == "bn":
+        return nn.BatchNorm2d(ch)
+    if norm == "gn":
+        g = min(GN_GROUPS, ch)
+        while ch % g:
+            g -= 1
+        return nn.GroupNorm(g, ch)
+    raise ValueError(f"norm must be one of {NORMS}, got {norm!r}")
+
+
+class _ConvBNAct(nn.Sequential):
+    def __init__(self, in_ch: int, out_ch: int, norm: str = "bn"):
+        super().__init__(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            _norm2d(out_ch, norm),
+            nn.ReLU(inplace=True),
+        )
+
+
+def _cond_offset(n_cond: int, out_ch: int, conv_in_ch: int) -> nn.Linear:
+    """Conditioning floats -> one offset per channel, the function constant planes
+    compute through a conv (away from zero-padded borders). Starts at the scale those
+    planes have through a default-initialised conv with ``conv_in_ch`` input channels,
+    planes included; nn.Linear's own default would start about 15x larger."""
+    offset = nn.Linear(n_cond, out_ch, bias=False)
+    bound = conv_in_ch ** -0.5
+    nn.init.uniform_(offset.weight, -bound, bound)
+    return offset
+
+
+class _DecoderBlock(nn.Module):
+    """Upsample x2, concatenate the skip, two 3x3 convs, spatial dropout. With
+    ``cond_dim``, a learned per-channel offset from the conditioning floats is added
+    after the first conv."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int,
+                 drop_rate: float = 0.0, norm: str = "bn", cond_dim: int = 0):
+        super().__init__()
+        self.conv1 = _ConvBNAct(in_ch + skip_ch, out_ch, norm)
+        self.conv2 = _ConvBNAct(out_ch, out_ch, norm)
+        self.cond = (_cond_offset(cond_dim, out_ch, in_ch + skip_ch + cond_dim)
+                     if cond_dim else None)
+        self.drop = nn.Dropout2d(drop_rate) if drop_rate > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor | None,
+                cond: torch.Tensor | None = None) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode="nearest")
+        if skip is not None:
+            if skip.shape[-2:] != x.shape[-2:]:
+                x = F.interpolate(x, size=skip.shape[-2:], mode="nearest")
+            x = torch.cat([x, skip], dim=1)
+        conv, norm, act = self.conv1
+        x = conv(x)
+        if self.cond is not None:
+            x = x + self.cond(cond)[:, :, None, None]
+        return self.drop(self.conv2(act(norm(x))))
+
+
+STEMS = ("zproj", "cytoland", "optical_defocus")
+# Stems that take per-slice defocus and any slice count. The loader, collate, predict
+# and well-reconstruction paths that feed them are keyed on ``CoordTimmUNet.z_variable``.
+Z_VARIABLE_STEMS: tuple[str, ...] = ("optical_defocus",)
+# Stems that land at 1/4 resolution in place of the encoder's own stride-4 stem.
+QUARTER_STEMS = ("cytoland", "optical_defocus")
+CONDS = ("concat", "bias")
+PATCH = 4
+# Periods of the defocus encoding, in axial optical units (n * lambda / NA^2). The optics
+# pass no z detail finer than a period of about 2 units; 16 is longer than any stack we
+# feed, so every slice in range gets a distinct encoding.
+DEFOCUS_PERIODS = (16.0, 8.0, 4.0, 2.0)
+
+
+def encode_defocus(defocus: torch.Tensor, z_range: float,
+                   periods: tuple[float, ...] = DEFOCUS_PERIODS) -> torch.Tensor:
+    """(..., N) defocus in axial units -> (..., N, 1 + 2 * len(periods)): the defocus
+    scaled to about -1..1, then a sine per period, then a cosine per period."""
+    w = 2 * torch.pi / torch.tensor(periods, dtype=defocus.dtype, device=defocus.device)
+    a = defocus.unsqueeze(-1) * w
+    return torch.cat([defocus.unsqueeze(-1) / z_range, a.sin(), a.cos()], dim=-1)
+
+
+class CytolandStem(nn.Module):
+    """Cytoland's stem (VisCy ``UNeXt2Stem``): one Conv3d whose kernel equals its
+    stride, ``(kz, 4, 4)``, on a (B, C, N, H, W) stack; the N / kz depth planes that
+    remain are folded into channels, giving (B, out_ch, H/4, W/4).
+
+    ``kz == in_z`` leaves one plane (VSCyto2D's layout). ``in_z`` must be a multiple
+    of ``kz`` and ``in_z / kz`` must divide ``out_ch``. Unlike VisCy's, a stack with
+    another slice count is an error rather than silently truncated.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, in_z: int, kz: int):
+        super().__init__()
+        if in_z % kz:
+            raise ValueError(f"in_z={in_z} is not a multiple of the stem kernel depth {kz}")
+        planes = in_z // kz
+        if out_ch % planes:
+            raise ValueError(f"in_z / stem_kz = {planes} depth planes do not divide the "
+                             f"encoder's {out_ch} stem channels")
+        self.in_z = in_z
+        self.conv = nn.Conv3d(in_ch, out_ch // planes, (kz, PATCH, PATCH),
+                              stride=(kz, PATCH, PATCH))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[2] != self.in_z:
+            raise ValueError(f"this stem takes {self.in_z} slices, got {x.shape[2]}")
+        return self.conv(x).flatten(1, 2)
+
+
+class OpticalDefocusStem(nn.Module):
+    """A Cytoland stem whose kernel is a learned function of defocus, for any slice
+    count and spacing: (B, N, H, W) slices -> (B, out_ch, H/4, W/4).
+
+    ``defocus`` is each slice's distance from the focus plane in axial optical units,
+    n * lambda / NA^2 (``dataset.slice_defocus``), so the same number means the same
+    blur for any objective and wavelength. It is encoded as sines and cosines
+    (``encode_defocus``) and a small MLP maps the encoding to that slice's 4 x 4
+    stride-4 kernels. The stem sums kernel * slice over the slices present, scaled by
+    the slice spacing, so the sum approximates an integral over z and keeps its scale
+    across protocols. For one fixed stack this is a ``CytolandStem`` with kernel depth
+    N. Slices with |defocus| > ``z_range`` and padded slots (defocus = NaN) get zero
+    weight. Kernels are computed per sample, so stacks with different slice counts
+    share a batch after zero-padding (``collate_subtiles``).
+
+    ``z_range`` is half the longest encoding period. ``ref_spacing`` is the spacing at
+    which a slice counts once: 2 um at 0.45 um wavelength and NA 0.55.
+    """
+
+    def __init__(self, out_ch: int, hidden: int = 32, z_range: float = DEFOCUS_PERIODS[0] / 2,
+                 ref_spacing: float = 1.344):
+        super().__init__()
+        self.out_ch = out_ch
+        self.z_range, self.ref_spacing = z_range, ref_spacing
+        self.kernel_mlp = nn.Sequential(
+            nn.Linear(1 + 2 * len(DEFOCUS_PERIODS), hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, out_ch * PATCH * PATCH),
+        )
+
+    def kernels(self, defocus: torch.Tensor) -> torch.Tensor:
+        """(B, N) defocus in axial units, NaN = padding -> (B, out_ch, N, 4, 4) slice kernels."""
+        valid = torch.isfinite(defocus) & (defocus.abs() <= self.z_range)
+        u = torch.where(valid, defocus, torch.zeros_like(defocus))
+        w = self.kernel_mlp(encode_defocus(u, self.z_range))        # (B, N, out*4*4)
+        w = w * valid.unsqueeze(-1).to(w.dtype)
+        # spacing of the slices present: (max - min) / (n - 1); one slice -> reference
+        n = valid.sum(1)
+        lo = torch.where(valid, u, torch.full_like(u, float("inf"))).amin(1)
+        hi = torch.where(valid, u, torch.full_like(u, float("-inf"))).amax(1)
+        spacing = torch.where(n > 1, (hi - lo) / (n - 1).clamp(min=1),
+                              torch.full_like(lo, self.ref_spacing))
+        w = w * (spacing / self.ref_spacing)[:, None, None]
+        B, N = defocus.shape
+        return w.view(B, N, self.out_ch, PATCH, PATCH).transpose(1, 2)
+
+    def forward(self, x: torch.Tensor, defocus: torch.Tensor) -> torch.Tensor:
+        """x: (B, N, H, W) slices (padded slots zero); defocus: (B, N) or (N,)."""
+        B, N, H, W = x.shape
+        if defocus.dim() == 1:
+            defocus = defocus.expand(B, -1)
+        w = self.kernels(defocus).reshape(B * self.out_ch, N, PATCH, PATCH)
+        y = F.conv2d(x.reshape(1, B * N, H, W), w, stride=PATCH, groups=B)
+        return y.view(B, self.out_ch, H // PATCH, W // PATCH)
+
+
+def _strip_resnet_stem(encoder: nn.Module) -> int:
+    """Remove a ResNet-style timm encoder's own stride-4 stem (conv, norm, act,
+    max-pool); returns the channel count its first stage expects."""
+    own = ("conv1", "bn1", "act1", "maxpool")
+    if not all(hasattr(encoder, name) for name in own):
+        raise ValueError("the cytoland stems need a ResNet-style timm encoder "
+                         f"(with {', '.join(own)})")
+    ch = encoder.bn1.num_features
+    for name in own:
+        setattr(encoder, name, nn.Identity())
+    return ch
+
+
+class CoordTimmUNet(nn.Module):
+    def __init__(self, encoder: str = "resnet34", in_z: int = 7,
+                 n_coords: int = 4, proj_ch: int = 3, pretrained: bool = True,
+                 decoder_channels: tuple[int, ...] = (256, 128, 64, 32, 16),
+                 drop_rate: float = 0.1, drop_path_rate: float = 0.1,
+                 n_params: int = 0, use_batch_renorm: bool = False,
+                 norm: str = "bn", stem: str = "zproj", full_res_ch: int = 0,
+                 stem_kz: int = 0, cond: str = "concat"):
+        super().__init__()
+        if norm != "bn" and use_batch_renorm:
+            raise ValueError("use_batch_renorm applies to norm='bn' only")
+        if stem not in STEMS:
+            raise ValueError(f"stem must be one of {STEMS}, got {stem!r}")
+        if cond not in CONDS:
+            raise ValueError(f"cond must be one of {CONDS}, got {cond!r}")
+        self.in_z = in_z
+        self.n_coords = n_coords
+        self.n_params = n_params
+        self.use_batch_renorm = use_batch_renorm
+        self.norm = norm
+        self.stem = stem
+        self.cond = cond
+        quarter = stem in QUARTER_STEMS
+        if quarter and full_res_ch:
+            raise ValueError(f"the {stem} stem has no full-resolution path; "
+                             "full_res_ch must be 0")
+        # channels the coordinate planes add wherever they are concatenated
+        planes_ch = n_coords if cond == "concat" else 0
+        if stem == "zproj":
+            # Learned projection of in_z slices + coord planes to a 2-D image, with a
+            # norm layer so its scale is stable regardless of input normalization.
+            self.zproj = nn.Sequential(
+                nn.Conv2d(in_z + planes_ch, proj_ch, kernel_size=3, padding=1),
+                _norm2d(proj_ch, norm),
+            )
+        enc_kwargs = dict(features_only=True, in_chans=proj_ch, pretrained=pretrained)
+        if quarter:
+            enc_kwargs["out_indices"] = (1, 2, 3, 4)       # drop the 1/2-resolution level
+        try:
+            self.encoder = timm.create_model(
+                encoder, drop_path_rate=drop_path_rate, **enc_kwargs)
+        except TypeError:
+            self.encoder = timm.create_model(encoder, **enc_kwargs)
+        enc_ch = self.encoder.feature_info.channels()      # fine -> coarse
+        enc_ch_r = enc_ch[::-1]                             # coarse -> fine
+        # With cond="concat", every encoder feature entering the decoder carries
+        # +n_coords constant conditioning planes.
+        skip_ch = [c + planes_ch for c in enc_ch_r[1:]]
+        stem_ch = proj_ch
+        if quarter:
+            # The encoder's finest map is at 1/4 and the decoder stops there: one
+            # block per skip, then the sub-pixel head. stem_kz = 0: the whole stack.
+            stem_ch = _strip_resnet_stem(self.encoder)
+            conv = (OpticalDefocusStem(stem_ch) if self.z_variable else
+                    CytolandStem(1 + planes_ch, stem_ch, in_z, stem_kz or in_z))
+            self.zproj = nn.Sequential(conv, _norm2d(stem_ch, norm), nn.ReLU(inplace=True))
+            decoder_channels = decoder_channels[:len(skip_ch)]
+        else:
+            # The encoder's finest map is already 2x downsampled, so the last block
+            # has no skip unless full_res_ch adds a full-resolution one: two 3x3
+            # convs on the stem output.
+            skip_ch.append(full_res_ch)
+        if len(skip_ch) != len(decoder_channels):
+            raise ValueError(
+                f"{encoder} exposes {len(enc_ch)} feature levels; "
+                f"decoder_channels has {len(decoder_channels)}.")
+        # Where the stem takes no planes (cond="bias", or a variable-z stem, whose
+        # input has no fixed channel layout), position is an offset on its conv output.
+        self.stem_cond = (
+            _cond_offset(n_coords, stem_ch, (1 if quarter else in_z) + n_coords)
+            if n_coords and (cond == "bias" or self.z_variable) else None)
+        self.full_res = (nn.Sequential(_ConvBNAct(proj_ch, full_res_ch, norm),
+                                       _ConvBNAct(full_res_ch, full_res_ch, norm))
+                         if full_res_ch else None)
+        blocks = []
+        in_ch = enc_ch_r[0] + planes_ch
+        for dc, sc in zip(decoder_channels, skip_ch):
+            blocks.append(_DecoderBlock(in_ch, sc, dc, drop_rate=drop_rate, norm=norm,
+                                        cond_dim=n_coords if cond == "bias" else 0))
+            in_ch = dc
+        self.decoder = nn.ModuleList(blocks)
+        if quarter:
+            # x4 back to full resolution in two sub-pixel steps, with one 3x3 conv at
+            # 1/2 resolution between them (UNeXt2's head for a single output plane).
+            c = decoder_channels[-1] // PATCH
+            self.head = nn.Sequential(nn.PixelShuffle(2), _ConvBNAct(c, c, norm),
+                                      nn.Conv2d(c, PATCH, kernel_size=1), nn.PixelShuffle(2))
+        else:
+            self.head = nn.Conv2d(decoder_channels[-1], 1, kernel_size=1)
+        # Optional per-subtile parameter regression (model class 3 head):
+        # global-average-pooled bottleneck + the conditioning floats -> MLP.
+        if n_params:
+            self.param_head = nn.Sequential(
+                nn.Linear(enc_ch_r[0] + n_coords, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(drop_rate),
+                nn.Linear(256, n_params),
+            )
+        if use_batch_renorm:
+            # Swap every BatchNorm2d (zproj, decoder blocks, AND the timm
+            # encoder's internal norms) for BatchRenorm2d, carrying over
+            # whatever stats already exist (ImageNet-pretrained, at this
+            # point) as the starting point.
+            convert_to_batchrenorm(self)
+        if norm == "gn":
+            # Batch-independent everywhere: GroupNorm in zproj and the decoder,
+            # and the timm encoder's BatchNorms frozen at their pretrained stats
+            # and affine (FrozenBatchNorm2d keeps the same state-dict keys). A
+            # bright outlier cell can then no longer shift the normalization of
+            # other subtiles in the batch (the 2026-09 amplitude-washout
+            # mechanism) -- without BatchRenorm, whose training was unstable.
+            from timm.layers import freeze_batch_norm_2d
+            self.encoder = freeze_batch_norm_2d(self.encoder)
+
+    @property
+    def z_variable(self) -> bool:
+        """True when forward() takes per-slice defocus (any number of slices)."""
+        return self.stem in Z_VARIABLE_STEMS
+
+    @staticmethod
+    def _planes(coords: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
+        """(B, n_coords) -> constant (B, n_coords, H, W) planes."""
+        return coords[:, :, None, None].expand(-1, -1, *hw)
+
+    def _stem(self, x: torch.Tensor, coords: torch.Tensor,
+              defocus: torch.Tensor | None) -> torch.Tensor:
+        """Stack (+ position) -> the encoder's input features."""
+        concat = self.cond == "concat"
+        conv, *rest = self.zproj
+        if self.z_variable:
+            if defocus is None:
+                raise ValueError(f"the {self.stem} stem needs per-slice defocus")
+            h = conv(x, defocus)
+        elif self.stem == "cytoland":
+            h = x[:, None]                                  # the stack is one channel
+            if concat:                 # each coordinate plane, repeated over z, another
+                planes = self._planes(coords, x.shape[-2:])
+                h = torch.cat([h, planes[:, :, None].expand(-1, -1, x.shape[1], -1, -1)], dim=1)
+            h = conv(h)
+        else:
+            h = conv(torch.cat([x, self._planes(coords, x.shape[-2:])], dim=1) if concat else x)
+        if self.stem_cond is not None:
+            h = h + self.stem_cond(coords)[:, :, None, None]
+        for layer in rest:
+            h = layer(h)
+        return h
+
+    def forward(self, x: torch.Tensor, coords: torch.Tensor,
+                defocus: torch.Tensor | None = None):
+        """x: (B, in_z, H, W), or (B, N, H, W) for a variable-z stem;
+        coords: (B, n_coords); defocus: (B, N) each slice's distance from focus in
+        axial optical units (NaN = padding), required by variable-z stems and
+        ignored otherwise.
+
+        Returns the (B, 1, H, W) phase patch, or a
+        ``(patch, (B, n_params) params)`` tuple when ``n_params > 0``.
+        """
+        in_hw = x.shape[-2:]
+        concat = self.cond == "concat"
+        x = self._stem(x, coords, defocus)
+        feats = self.encoder(x)[::-1]                       # coarse -> fine
+        if concat:
+            feats = [torch.cat([f, self._planes(coords, f.shape[-2:])], dim=1)
+                     for f in feats]
+        skips = list(feats[1:]) + [self.full_res(x) if self.full_res is not None else None]
+        h = feats[0]
+        for block, skip in zip(self.decoder, skips):
+            h = block(h, skip, coords)
+        out = self.head(h)
+        if out.shape[-2:] != in_hw:
+            out = F.interpolate(out, size=in_hw, mode="bilinear", align_corners=False)
+        if not self.n_params:
+            return out
+        pooled = feats[0].mean(dim=(-2, -1))
+        if not concat:
+            pooled = torch.cat([pooled, coords], dim=1)
+        return out, self.param_head(pooled)

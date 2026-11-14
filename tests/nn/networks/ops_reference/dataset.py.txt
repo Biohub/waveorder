@@ -1,0 +1,667 @@
+"""Subtile draws over a phase_recon dataset manifest.
+
+Each draw is one of the 8x8 = 64 subtiles (256x256) of a manifest FOV:
+
+* input  ``x``      — ``(7, 256, 256)`` brightfield z-stack crop (channel
+  ``BF`` of ``phenotyping_transform.zarr``), z-scored **per FOV** (one
+  mean/std over the full 7x2048x2048 stack, shared by all subtiles of the
+  FOV — stable for near-empty subtiles and identical at train and
+  inference time), or against train-split pixel stats when the norm dict
+  carries ``bf_in_mean`` (``--input-norm dataset``, keeps absolute dynamic
+  range; see ``compute_input_norm``).
+* coords ``c``      — 4 floats in [-1, 1] (NEXT_STEPS §1.5): ``(x0, y0)``
+  FOV center within the well (grid indices relative to ``WellGeometry``
+  center, normalized by ``max_radius``), ``(x1, y1)`` subtile center
+  within the FOV (``(sub - 3.5) / 3.5`` on the 8x8 grid).
+* target ``y``      — ``(1, 256, 256)`` crop of the ``Phase2D`` channel,
+  affine-mapped by a **per-dataset robust scale** (pooled 1/99 percentiles
+  over sampled train FOVs, ``metrics.robust_scale``), NOT clipped and NOT
+  per-crop min-max — a flat patch must stay flat, and the map must invert
+  exactly at inference.
+
+I/O layout note: the BF store is chunked as whole FOVs
+``(1, 1, 7, 2048, 2048)``, so reading any subtile decompresses the full
+~56 MB stack. The dataset is therefore indexed by FOV and returns
+``subtiles_per_draw`` (K) subtiles per read; ``collate_subtiles``
+flattens, so a DataLoader ``batch_size`` of B yields B*K patches per step.
+
+No D4 augmentation: flips/rotations would invalidate the coordinate
+conditioning unless the coords are transformed jointly — deferred with the
+coordinate ablations.
+
+z-variable mode (``z_variable=True``, for variable-z stems): items are
+``(x, c, y, defocus)`` with ``x`` of shape ``(K, N, 256, 256)`` for whatever N
+slices the protocol selects, and ``defocus`` ``(K, N)`` each slice's distance
+from that subtile's focus plane in axial optical units (``slice_defocus``:
+spacing from the store's OME z scale, focus from the well's tilt csv, the
+unit from ``Optics``). The z-score runs over the selected slices only.
+Training draws a random contiguous crop and a random error on the focus
+plane per FOV; val/test use a fixed ``z_protocol`` (see
+``z_protocol_indices``). ``collate_subtiles`` pads N to the batch maximum
+(x with 0, defocus with NaN).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
+
+from ops_analysis.benchmarks.phase_recon.metrics import robust_scale
+from ops_analysis.benchmarks.phase_recon.runner import load_manifest
+from ops_analysis.utils.fov_selection.geometry import WellGeometry
+
+BF_CHANNEL = "BF"
+GT_CHANNEL = "Phase2D"
+GRID = 8          # 8x8 subtiles per FOV
+TILE = 256        # 2048 / 8
+N_COORDS = 4
+# Parameter targets (model class 3 head): z_offset and zenith are z-scored
+# with train-split stats; azimuth is circular so it is regressed as
+# (sin, cos) — already bounded, no normalization, decoded with atan2.
+N_PARAMS = 4      # z_offset, zenith, sin(azimuth), cos(azimuth)
+
+
+# ---------------------------------------------------------------------------
+# manifest + stores
+# ---------------------------------------------------------------------------
+def load_stores(manifest_path: str | Path) -> dict[str, dict[str, str]]:
+    """Per-experiment {'bf': ..., 'gt': ...} store paths from manifest_meta.json."""
+    meta = json.loads((Path(manifest_path).parent / "manifest_meta.json").read_text())
+    return meta["stores"]
+
+
+def split_rows(manifest_path: str | Path, split: str) -> list[dict]:
+    rows = [r for r in load_manifest(Path(manifest_path)) if r["split"] == split]
+    if not rows:
+        raise ValueError(f"no rows with split={split!r} in {manifest_path}")
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# normalization
+# ---------------------------------------------------------------------------
+def compute_norm(manifest_path: str | Path, n_sample: int = 64) -> dict:
+    """Robust (lo, hi) of the Phase2D target over sampled TRAIN FOVs.
+
+    Same pooled-percentile convention as ``report.py``'s feature scale.
+    Store the result next to the checkpoints; every consumer (training
+    target map, inference inverse map) must use the same constants.
+    """
+    from iohub import open_ome_zarr
+
+    rows = split_rows(manifest_path, "train")
+    stores = load_stores(manifest_path)
+    sample = rows[:: max(1, len(rows) // n_sample)][:n_sample]
+
+    def _images():
+        handles: dict[str, object] = {}
+        for r in sample:
+            exp = r["experiment"]
+            if exp not in handles:
+                handles[exp] = open_ome_zarr(stores[exp]["gt"], mode="r")
+            pos = handles[exp][r["name"]]
+            ci = pos.channel_names.index(GT_CHANNEL)
+            yield np.asarray(pos.data[0, ci, 0], dtype=np.float32)
+
+    lo, hi = robust_scale(_images())
+    return {"target_lo": lo, "target_hi": hi, "n_sample": len(sample),
+            "channel": GT_CHANNEL, "split": "train"}
+
+
+def bf_amplitude(bf: np.ndarray, kind: str, eps: float = 1e-6) -> float:
+    """Per-FOV brightfield amplitude fed as conditioning.
+
+    ``std`` is the raw standard deviation (c55003f1). ``cv`` is std/mean: raw
+    std also tracks illumination, which varies 17-23% across FOVs within a
+    well, while std/mean cancels it and predicts phase amplitude far better
+    (r=+0.67 to +0.98 within every experiment, against -0.70 to +0.17 for std).
+    """
+    std = float(bf.std())
+    if kind == "std":
+        return std
+    if kind == "cv":
+        return std / (float(bf.mean()) + eps)
+    raise ValueError(f"unknown amplitude input {kind!r}; expected 'std' or 'cv'")
+
+
+def compute_amplitude_norm(manifest_path: str | Path, n_sample: int = 64,
+                           eps: float = 1e-6, kind: str = "std") -> dict:
+    """Train-split mean/std of log(raw BF std) -- the per-FOV dynamic-range
+    signal fed as conditioning (2026-09 amplitude-washout fix): ``read_fov``
+    z-scores BF *per FOV*, which throws away its absolute dynamic range, so
+    this is computed from the RAW stack before that normalization and
+    supplied back to the model explicitly via ``amplitude_of``.
+    """
+    from iohub import open_ome_zarr
+
+    rows = split_rows(manifest_path, "train")
+    stores = load_stores(manifest_path)
+    sample = rows[:: max(1, len(rows) // n_sample)][:n_sample]
+
+    logs = []
+    handles: dict[str, object] = {}
+    for r in sample:
+        exp = r["experiment"]
+        if exp not in handles:
+            handles[exp] = open_ome_zarr(stores[exp]["bf"], mode="r")
+        pos = handles[exp][r["name"]]
+        ci = pos.channel_names.index(BF_CHANNEL)
+        bf = np.asarray(pos.data[0, ci], dtype=np.float32)
+        logs.append(np.log(bf_amplitude(bf, kind, eps) + eps))
+    logs = np.asarray(logs)
+    return {"bf_amp_mean": float(logs.mean()), "bf_amp_std": float(logs.std()),
+            "bf_amp_n_sample": len(sample), "bf_amp_input": kind}
+
+
+def compute_input_norm(manifest_path: str | Path, n_sample: int = 64) -> dict:
+    """Train-split mean/std of raw BF pixels, pooled over sampled FOVs.
+
+    With these in the norm dict, ``read_fov`` z-scores BF against the dataset
+    instead of each FOV's own mean/std, so a FOV's absolute dynamic range
+    reaches the model (``--input-norm dataset``; the target is already scaled
+    dataset-wide by ``compute_norm``).
+    """
+    from iohub import open_ome_zarr
+
+    rows = split_rows(manifest_path, "train")
+    stores = load_stores(manifest_path)
+    sample = rows[:: max(1, len(rows) // n_sample)][:n_sample]
+
+    n, s, ss = 0, 0.0, 0.0
+    handles: dict[str, object] = {}
+    for r in sample:
+        exp = r["experiment"]
+        if exp not in handles:
+            handles[exp] = open_ome_zarr(stores[exp]["bf"], mode="r")
+        pos = handles[exp][r["name"]]
+        ci = pos.channel_names.index(BF_CHANNEL)
+        bf = np.asarray(pos.data[0, ci], dtype=np.float64)
+        n += bf.size
+        s += bf.sum()
+        ss += np.square(bf).sum()
+    mean = s / n
+    return {"bf_in_mean": float(mean), "bf_in_std": float(np.sqrt(ss / n - mean ** 2)),
+            "bf_in_n_sample": len(sample)}
+
+
+def zscore_bf(bf: np.ndarray, norm: dict, eps: float = 1e-6) -> tuple[np.ndarray, float]:
+    """(normalized BF, raw per-FOV std). Dataset-level when ``norm`` carries
+    ``bf_in_mean`` (``--input-norm dataset``), else per-FOV (the default)."""
+    raw_std = float(bf.std())
+    if "bf_in_mean" in norm:
+        return (bf - float(norm["bf_in_mean"])) / (float(norm["bf_in_std"]) + eps), raw_std
+    return (bf - bf.mean()) / (raw_std + eps), raw_std
+
+
+def amplitude_of(raw_std: float, amp_mean: float, amp_std: float,
+                 eps: float = 1e-6) -> float:
+    """Raw per-FOV BF std -> bounded (~[-1, 1]) conditioning float:
+    z-score of log(raw_std) against train-split stats, clipped to +-3
+    sigma then rescaled.
+    """
+    z = (np.log(raw_std + eps) - amp_mean) / (amp_std + eps)
+    return float(np.clip(z, -3.0, 3.0) / 3.0)
+
+
+# ---------------------------------------------------------------------------
+# optics: the unit of defocus
+# ---------------------------------------------------------------------------
+PHENO_PHASE_CONFIG = Path(__file__).resolve().parents[3] / "configs" / "phase_config_pheno.yaml"
+
+
+@dataclass(frozen=True)
+class Optics:
+    """What sets the axial optical unit, n * lambda / NA^2: the z step below which
+    the detection optics pass no more detail (in the small-angle limit)."""
+
+    wavelength_um: float
+    na_detection: float
+    n_medium: float = 1.0
+
+    @property
+    def axial_unit_um(self) -> float:
+        return self.n_medium * self.wavelength_um / self.na_detection ** 2
+
+    @classmethod
+    def from_phase_config(cls, path: str | Path | None = None) -> "Optics":
+        """From a WaveOrder phase config (default: the 20x phenotyping one), so the
+        network is told the same optics as the reconstruction it reproduces."""
+        import yaml
+
+        tf = yaml.safe_load(Path(path or PHENO_PHASE_CONFIG).read_text())["phase"]["transfer_function"]
+        return cls(float(tf["wavelength_illumination"]), float(tf["numerical_aperture_detection"]),
+                   float(tf["index_of_refraction_media"]))
+
+
+# ---------------------------------------------------------------------------
+# per-subtile tilt parameters: the focus plane, and the parameter-head targets
+# ---------------------------------------------------------------------------
+def tilt_csv_path(stores: dict, experiment: str, well: str) -> Path:
+    return (Path(stores[experiment]["gt"]).parent / "tilt_calibration" / "pheno"
+            / well.replace("/", "_") / "tilt_params_all.csv")
+
+
+def read_tilt_csv(path: str | Path) -> dict[tuple[str, int], tuple[float, float, float]]:
+    """A well's ``tilt_params_all.csv`` -> (fov, subtile_id) -> (z_offset, zenith, azimuth)."""
+    import csv as _csv
+
+    table = {}
+    with open(path, newline="") as f:
+        for row in _csv.DictReader(f):
+            table[(row["position"].split("/")[-1], int(row["subtile_id"]))] = (
+                float(row["z_offset"]), float(row["zenith"]), float(row["azimuth"]))
+    return table
+
+
+def focus_offsets(table: dict, fov: str) -> np.ndarray:
+    """(64,) focus offset of each subtile of ``fov``, in slices from slice ``Z // 2``
+    (WaveOrder's ``z_focus_offset``)."""
+    return np.array([table[(fov, s)][0] for s in range(GRID * GRID)], dtype=np.float32)
+
+
+class TiltParams:
+    """Lazy per-(experiment, well) lookup: (fov, subtile_id) -> (z, zen, azi)."""
+
+    def __init__(self, stores: dict):
+        self.stores = stores
+        self._cache: dict[tuple[str, str], dict] = {}
+
+    def _table(self, r: dict) -> dict:
+        key = (r["experiment"], r["well"])
+        if key not in self._cache:
+            self._cache[key] = read_tilt_csv(tilt_csv_path(self.stores, *key))
+        return self._cache[key]
+
+    def get(self, r: dict, subtile: int) -> tuple[float, float, float]:
+        return self._table(r)[(r["fov"], int(subtile))]
+
+    def focus_offsets(self, r: dict) -> np.ndarray:
+        return focus_offsets(self._table(r), r["name"].split("/")[-1])
+
+
+def compute_param_norm(manifest_path: str | Path, n_sample_wells: int = 6) -> dict:
+    """Train-split mean/std for z_offset and zenith (azimuth needs none)."""
+    import csv as _csv
+
+    rows = split_rows(manifest_path, "train")
+    stores = load_stores(manifest_path)
+    wells = sorted({(r["experiment"], r["well"]) for r in rows})
+    step = max(1, len(wells) // n_sample_wells)
+    z, zen = [], []
+    for exp, well in wells[::step][:n_sample_wells]:
+        with open(tilt_csv_path(stores, exp, well), newline="") as f:
+            for row in _csv.DictReader(f):
+                z.append(float(row["z_offset"]))
+                zen.append(float(row["zenith"]))
+    z, zen = np.asarray(z), np.asarray(zen)
+    return {"z_offset_mean": float(z.mean()), "z_offset_std": float(z.std()),
+            "zenith_mean": float(zen.mean()), "zenith_std": float(zen.std())}
+
+
+# ---------------------------------------------------------------------------
+# coordinates
+# ---------------------------------------------------------------------------
+class WellCoords:
+    """Per-(experiment, well) FOV-center coordinates via ``WellGeometry``.
+
+    Geometry is derived from the FOVs populated in the GT store (the full
+    well disc), not from the manifest subset — the manifest's 220 FOVs
+    would bias the center/radius.
+    """
+
+    def __init__(self, stores: dict[str, dict[str, str]]):
+        self.stores = stores
+        self._geom: dict[tuple[str, str], WellGeometry] = {}
+
+    def fov_xy(self, r: dict) -> tuple[float, float]:
+        key = (r["experiment"], r["well"])
+        geom = self._geom.get(key)
+        if geom is None:
+            geom = WellGeometry.from_store(self.stores[key[0]]["gt"], key[1])
+            if not geom.coords:
+                raise FileNotFoundError(f"no FOVs for {key} under GT store")
+            self._geom[key] = geom
+        cr, cc = geom.center
+        x0 = (int(r["grid_col"]) - cc) / geom.max_radius
+        y0 = (int(r["grid_row"]) - cr) / geom.max_radius
+        return float(x0), float(y0)
+
+
+def subtile_xy(subtile: int) -> tuple[float, float]:
+    """Subtile-center coords in [-1, 1] for subtile id = sub_row * 8 + sub_col."""
+    sr, sc = divmod(int(subtile), GRID)
+    return (sc - (GRID - 1) / 2) / ((GRID - 1) / 2), (sr - (GRID - 1) / 2) / ((GRID - 1) / 2)
+
+
+def z_protocol_indices(n_z: int, protocol: str) -> np.ndarray:
+    """Slice indices of an ``n_z`` stack selected by a fixed protocol.
+
+    ``full``: every slice. ``crop:N``: the N contiguous slices at the center.
+    ``stride:S``: every S-th slice, placed symmetrically when possible
+    (``stride:2`` turns 2 um spacing into 4 um).
+    """
+    kind, _, arg = protocol.partition(":")
+    if kind == "full":
+        return np.arange(n_z)
+    if kind == "crop":
+        n = int(arg)
+        if not 1 <= n <= n_z:
+            raise ValueError(f"crop:{n} needs 1..{n_z} slices")
+        start = (n_z - n) // 2
+        return np.arange(start, start + n)
+    if kind == "stride":
+        s = int(arg)
+        if s < 1:
+            raise ValueError(f"stride must be >= 1, got {s}")
+        return np.arange(((n_z - 1) % s) // 2, n_z, s)
+    raise ValueError(f"unknown z protocol {protocol!r}; expected full, crop:N or stride:S")
+
+
+def slice_defocus(idx: np.ndarray, n_z: int, spacing_um: float, focus_offset,
+                  unit_um: float, shift_um: float = 0.0) -> np.ndarray:
+    """Defocus of the selected slices of an ``n_z`` stack, in axial optical units.
+
+    The focus plane sits ``focus_offset`` slices from slice ``n_z // 2`` and z runs
+    down the stack, both as in WaveOrder's ``z_position_list``. ``focus_offset`` may
+    be an array, one offset per subtile: the result is then ``(..., N)``.
+    ``shift_um`` moves the focus plane (a training-time error on the focus estimate).
+    """
+    focus_idx = n_z // 2 + np.asarray(focus_offset, dtype=np.float64)[..., None]
+    return (((focus_idx - idx) * spacing_um + shift_um) / unit_um).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# dataset
+# ---------------------------------------------------------------------------
+class SubtileDataset(Dataset):
+    """K random (train) or seeded-deterministic (val/test) subtiles per FOV.
+
+    ``__getitem__`` returns ``(x, c, y)`` with a leading K dimension;
+    use ``collate_subtiles`` so the DataLoader emits flat patch batches.
+    """
+
+    def __init__(self, manifest_path: str | Path, split: str,
+                 norm: dict, subtiles_per_draw: int = 8,
+                 deterministic: bool = False, seed: int = 0,
+                 limit_fovs: int | None = None, eps: float = 1e-6,
+                 with_params: bool = False, z_variable: bool = False,
+                 z_protocol: str = "full", z_crop_prob: float = 0.0,
+                 z_min_slices: int = 5, z_shift_um: float = 0.0,
+                 optics: Optics | None = None):
+        self.rows = split_rows(manifest_path, split)
+        if limit_fovs:
+            self.rows = self.rows[:limit_fovs]
+        self.stores = load_stores(manifest_path)
+        self.coords = WellCoords(self.stores)
+        self.with_params = with_params
+        if with_params or z_variable:
+            self.tilt = TiltParams(self.stores)
+        if with_params:
+            self.pnorm = {k: float(norm[k]) for k in
+                          ("z_offset_mean", "z_offset_std",
+                           "zenith_mean", "zenith_std")}
+        self.k = int(subtiles_per_draw)
+        self.deterministic = deterministic
+        self.seed = seed
+        self.norm = dict(norm)                # full constants, for predict.py
+        self.lo, self.hi = float(norm["target_lo"]), float(norm["target_hi"])
+        self.span = self.hi - self.lo + eps   # shared by predict.py's inverse map
+        self.eps = eps
+        # amplitude conditioning is on iff norm.json carries its stats
+        # (i.e. training was run with --use-amplitude-cond); no separate
+        # flag needed -- every downstream reload (predict.py,
+        # reconstruct_well.py) gets the same norm dict from the checkpoint.
+        self.with_amplitude = "bf_amp_mean" in norm
+        if self.with_amplitude:
+            self.amp_mean = float(norm["bf_amp_mean"])
+            self.amp_std = float(norm["bf_amp_std"])
+            # checkpoints from before this key existed used raw std
+            self.amp_input = norm.get("bf_amp_input", "std")
+        # zarr handles are not fork-safe; cache per (pid, store path)
+        self._cache: dict[tuple[int, str], object] = {}
+        # z-variable mode: which slices, and their defocus
+        self.z_variable = z_variable
+        self.z_protocol = z_protocol
+        self.z_crop_prob, self.z_min_slices = float(z_crop_prob), int(z_min_slices)
+        self.z_shift_um = float(z_shift_um)
+        self._z_spacing: dict[str, float] = {}
+        self.optics = (optics or Optics.from_phase_config()) if z_variable else None
+
+    def _pos(self, store_path: str, name: str):
+        from iohub import open_ome_zarr
+
+        key = (os.getpid(), store_path)
+        store = self._cache.get(key)
+        if store is None:
+            store = open_ome_zarr(store_path, mode="r")
+            self._cache[key] = store
+        return store[name]
+
+    def _read_raw(self, r: dict):
+        """(raw BF stack (Z, Y, X) float32, normalized Phase2D (Y, X), BF position)."""
+        bf_pos = self._pos(self.stores[r["experiment"]]["bf"], r["name"])
+        ci = bf_pos.channel_names.index(BF_CHANNEL)
+        bf = np.asarray(bf_pos.data[0, ci], dtype=np.float32)      # (Z, Y, X)
+        gt_pos = self._pos(self.stores[r["experiment"]]["gt"], r["name"])
+        gi = gt_pos.channel_names.index(GT_CHANNEL)
+        tgt = np.asarray(gt_pos.data[0, gi, 0], dtype=np.float32)  # (Y, X)
+        return bf, (tgt - self.lo) / self.span, bf_pos
+
+    def _normalize(self, bf: np.ndarray) -> tuple[np.ndarray, float]:
+        """(z-scored stack, raw amplitude) -- amplitude from the raw stack."""
+        raw_amp = (bf_amplitude(bf, self.amp_input, self.eps)
+                   if self.with_amplitude else None)
+        bf, raw_std = zscore_bf(bf, self.norm, self.eps)
+        return bf, (raw_std if raw_amp is None else raw_amp)
+
+    def read_fov(self, r: dict) -> tuple[np.ndarray, np.ndarray, float]:
+        """(z-scored BF stack (7, 2048, 2048), normalized Phase2D (2048,
+        2048), raw pre-normalization BF std -- the amplitude/dynamic-range
+        signal ``read_fov``'s own z-scoring would otherwise discard).
+        """
+        bf, tgt, _ = self._read_raw(r)
+        bf, raw_amp = self._normalize(bf)
+        return bf, tgt, raw_amp
+
+    def z_spacing_um(self, r: dict, bf_pos=None) -> float:
+        """Slice spacing of the experiment's BF store (OME z scale, um)."""
+        exp = r["experiment"]
+        if exp not in self._z_spacing:
+            pos = bf_pos or self._pos(self.stores[exp]["bf"], r["name"])
+            self._z_spacing[exp] = float(pos.scale[2])
+        return self._z_spacing[exp]
+
+    def _draw_z(self, n_z: int, rng: np.random.Generator | None) -> tuple[np.ndarray, float]:
+        """(slice indices, focus shift um): fixed protocol, or a training draw."""
+        if rng is None:
+            return z_protocol_indices(n_z, self.z_protocol), 0.0
+        idx = np.arange(n_z)
+        lo = min(self.z_min_slices, n_z)
+        if self.z_crop_prob and rng.random() < self.z_crop_prob:
+            n = int(rng.integers(lo, n_z + 1))
+            start = int(rng.integers(0, n_z - n + 1))
+            idx = np.arange(start, start + n)
+        shift = float(rng.uniform(-self.z_shift_um, self.z_shift_um)) if self.z_shift_um else 0.0
+        return idx, shift
+
+    def read_fov_z(self, r: dict, rng: np.random.Generator | None = None):
+        """z-variable read: (z-scored selected slices (N, Y, X), normalized
+        Phase2D, raw amplitude of the selected slices, defocus (64, N): one row
+        per subtile, in axial optical units from that subtile's focus plane).
+        ``rng=None`` applies ``z_protocol``; otherwise a random training draw.
+        """
+        bf, tgt, bf_pos = self._read_raw(r)
+        n_z = bf.shape[0]
+        idx, shift = self._draw_z(n_z, rng)
+        bf, raw_amp = self._normalize(bf[idx])
+        defocus = slice_defocus(idx, n_z, self.z_spacing_um(r, bf_pos), self.tilt.focus_offsets(r),
+                                self.optics.axial_unit_um, shift)
+        return bf, tgt, raw_amp, defocus
+
+    def amplitude_of(self, raw_std: float) -> float:
+        return amplitude_of(raw_std, self.amp_mean, self.amp_std, self.eps)
+
+    def _pick_subtiles(self, index: int) -> np.ndarray:
+        if self.k >= GRID * GRID:
+            return np.arange(GRID * GRID)
+        if self.deterministic:
+            rng = np.random.default_rng((self.seed, index))
+        else:
+            rng = np.random.default_rng()
+        return rng.choice(GRID * GRID, size=self.k, replace=False)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def norm_params(self, r: dict, subtile: int) -> torch.Tensor:
+        """(z_offset, zenith, azimuth) GT -> normalized 4-vector target."""
+        z, zen, azi = self.tilt.get(r, subtile)
+        p = self.pnorm
+        return torch.tensor(
+            [(z - p["z_offset_mean"]) / (p["z_offset_std"] + self.eps),
+             (zen - p["zenith_mean"]) / (p["zenith_std"] + self.eps),
+             np.sin(azi), np.cos(azi)], dtype=torch.float32)
+
+    def __getitem__(self, index: int):
+        r = self.rows[index]
+        defocus = None
+        if self.z_variable:
+            rng = None if self.deterministic else np.random.default_rng()
+            bf, tgt, raw_std, defocus = self.read_fov_z(r, rng)
+        else:
+            bf, tgt, raw_std = self.read_fov(r)
+        x0, y0 = self.coords.fov_xy(r)
+        coord_base = [x0, y0, self.amplitude_of(raw_std)] if self.with_amplitude else [x0, y0]
+
+        xs, cs, ys, ps = [], [], [], []
+        picked = self._pick_subtiles(index)
+        for s in picked:
+            sr, sc = divmod(int(s), GRID)
+            sl = (slice(sr * TILE, (sr + 1) * TILE), slice(sc * TILE, (sc + 1) * TILE))
+            x1, y1 = subtile_xy(s)
+            xs.append(torch.from_numpy(np.ascontiguousarray(bf[:, sl[0], sl[1]])))
+            cs.append(torch.tensor(coord_base + [x1, y1], dtype=torch.float32))
+            ys.append(torch.from_numpy(np.ascontiguousarray(tgt[sl[0], sl[1]]))[None])
+            if self.with_params:
+                ps.append(self.norm_params(r, int(s)))
+        out = (torch.stack(xs), torch.stack(cs), torch.stack(ys))
+        if defocus is not None:
+            out += (torch.from_numpy(defocus[picked]),)
+        return out + (torch.stack(ps),) if self.with_params else out
+
+
+def collate_subtiles(batch):
+    """Flatten the per-FOV K dimension: B FOVs x K subtiles -> B*K patches.
+
+    Handles (x, c, y), (x, c, y, params), and the z-variable (x, c, y, defocus[,
+    params]) items. When FOVs carry different slice counts, x is zero-padded
+    and defocus NaN-padded to the largest N (variable-z stems ignore NaN slots).
+    """
+    out = []
+    for parts in zip(*batch):
+        n = max(p.shape[1] for p in parts) if parts[0].dim() >= 2 else None
+        if n is not None and any(p.shape[1] != n for p in parts):
+            fill = float("nan") if parts[0].dim() == 2 else 0.0
+            parts = [torch.cat([p, p.new_full((p.shape[0], n - p.shape[1], *p.shape[2:]), fill)], 1)
+                     if p.shape[1] < n else p for p in parts]
+        out.append(torch.cat(parts))
+    return tuple(out)
+
+
+class BufferedSubtiles(IterableDataset):
+    """Training loader that decodes each FOV once for all 64 subtiles.
+
+    Each epoch draws ``n_fovs`` FOVs (a fresh random subset, the same draw in
+    every worker) and splits them across DataLoader workers. Every worker
+    mixes its FOVs' patches through a ``PatchShuffleBuffer`` of
+    ``buffer_fovs`` FOVs and yields ready batches of ``batch_patches``, so the
+    main process receives batches of the usual size. (A buffer in the main
+    process is slower: copying out of freshly mapped worker shared memory
+    page-faults on every page, single-threaded.) Use with
+    ``DataLoader(batch_size=None)`` and persistent workers.
+    """
+
+    def __init__(self, ds: "SubtileDataset", n_fovs: int, buffer_fovs: int,
+                 batch_patches: int, seed: int = 0):
+        if ds.k != GRID * GRID:
+            raise ValueError("BufferedSubtiles needs a SubtileDataset with all 64 subtiles")
+        self.ds, self.n_fovs = ds, min(int(n_fovs), len(ds))
+        self.buffer_fovs, self.batch_patches, self.seed = buffer_fovs, batch_patches, seed
+        self.epoch = 0                                # advances per __iter__ (persistent workers)
+
+    def __len__(self) -> int:
+        return self.n_fovs * GRID * GRID // self.batch_patches
+
+    def __iter__(self):
+        info = get_worker_info()
+        wid, nw = (info.id, info.num_workers) if info else (0, 1)
+        epoch, self.epoch = self.epoch, self.epoch + 1
+        picks = np.random.default_rng((self.seed, epoch)).permutation(len(self.ds))[:self.n_fovs]
+        items = (self.ds[int(i)] for i in picks[wid::nw])
+        yield from PatchShuffleBuffer(items, self.buffer_fovs, self.batch_patches,
+                                      GRID * GRID, seed=(self.seed, epoch, wid))
+
+
+class PatchShuffleBuffer:
+    """Turn per-FOV items (all K subtiles of each FOV) into shuffled patch batches.
+
+    Decoding a FOV is the expensive part of loading (the BF store holds one
+    chunk per FOV), so the buffered loader reads each FOV once for all of its
+    subtiles and mixes patches from ``buffer_fovs`` FOVs at a time. Every patch
+    of every FOV the loader yields comes out exactly once per pass, in batches
+    of ``batch_patches`` (a short last batch is dropped, like ``drop_last``).
+
+    ``loader`` yields items shaped like ``SubtileDataset`` items: a tuple of
+    tensors with a leading K dimension. Batches are built with
+    ``collate_subtiles``, so mixed slice counts are padded as usual.
+    """
+
+    def __init__(self, loader, buffer_fovs: int, batch_patches: int,
+                 patches_per_fov: int, seed=None):
+        self.loader, self.buffer_fovs = loader, int(buffer_fovs)
+        self.batch_patches, self.patches_per_fov = int(batch_patches), int(patches_per_fov)
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        return len(self.loader) * self.patches_per_fov // self.batch_patches
+
+    def __iter__(self):
+        pool: list[tuple[int, int]] = []          # (item slot, patch index)
+        items: dict[int, tuple] = {}
+        left: dict[int, int] = {}
+        src = iter(self.loader)
+        slot, exhausted = 0, False
+
+        def refill():
+            nonlocal slot, exhausted
+            while not exhausted and len(items) < self.buffer_fovs:
+                try:
+                    item = next(src)
+                except StopIteration:
+                    exhausted = True
+                    return
+                k = item[0].shape[0]
+                items[slot], left[slot] = item, k
+                pool.extend((slot, i) for i in range(k))
+                slot += 1
+
+        refill()
+        while len(pool) >= self.batch_patches:
+            picks = []
+            for _ in range(self.batch_patches):
+                j = int(self.rng.integers(len(pool)))
+                pool[j], pool[-1] = pool[-1], pool[j]
+                picks.append(pool.pop())
+            batch = collate_subtiles([tuple(t[i:i + 1] for t in items[s]) for s, i in picks])
+            for s, _ in picks:
+                left[s] -= 1
+                if not left[s]:
+                    del items[s], left[s]
+            yield batch
+            refill()

@@ -13,11 +13,12 @@ reconstruct existing data.
 ## Install (from scratch)
 
     git clone https://github.com/mehta-lab/waveorder && cd waveorder
-    uv sync --group bench
+    uv sync
     source .venv/bin/activate  # or prepend `uv run` to commands
 
-`wo bm` / `wo benchmark` appears once the `bench` group is installed
-and the venv is active.
+`wo bm` / `wo benchmark` runs the suite of the checkout `waveorder` was
+installed from (an editable install, as `uv sync` makes); it needs no extra
+dependencies (`make_thumbnails.py` also needs matplotlib).
 
 ## First run
 
@@ -38,9 +39,6 @@ and the venv is active.
 
     wo bm compare [RUN_A RUN_B]
         Diff metrics between two runs (default: the two newest).
-
-    wo bm view [latest|RUN_NAME][/CASE_NAME]
-        Open raw input + reconstruction side-by-side in napari grid mode.
 
 ## Adding a benchmark case
 
@@ -70,9 +68,6 @@ or missing reconstructions. For finer-grained comparisons:
    (writes to the shared `/hpc/projects/waveorder/benchmarks`).
 2. Run the same command from your feature branch checkout.
 3. `wo bm compare` diffs the two newest runs metric-by-metric.
-
-Keep runs on Intel nodes (the sbatch script pins `--constraint=intel`)
-so baselines stay hardware-comparable.
 
 ## Custom experiments
 
