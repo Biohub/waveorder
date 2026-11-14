@@ -172,27 +172,65 @@ def test_every_package_has_a_layer():
     assert owners <= set(LAYERS) | UTILITIES, f"no layer rule for {sorted(owners - set(LAYERS) - UTILITIES)}"
 
 
+def _reached(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(line, name)`` for every import, and every ``waveorder.<x>`` reached by attribute through a module."""
+    names, modules = _bound(tree)
+    found = _imported(tree)
+    for node in ast.walk(tree):
+        dotted = _dotted(node) if isinstance(node, ast.Attribute) else None
+        if dotted is not None and dotted[0] in modules and names.get(dotted[0], dotted[0]).startswith("waveorder"):
+            found.append((getattr(node, "lineno", 0), ".".join([names.get(dotted[0], dotted[0]), *dotted[1]])))
+    return found
+
+
+def layer_violations(owner: str, source: str) -> list[tuple[int, str]]:
+    """Return ``(line, name)`` for every use of a ``waveorder`` layer that ``owner`` may not import."""
+    allowed = (frozenset() if owner in UTILITIES else LAYERS[owner]) | UTILITIES | {owner}
+    known = set(LAYERS) | UTILITIES
+    return sorted(
+        {
+            (line, name)
+            for line, name in _reached(ast.parse(source))
+            if _package(name) not in allowed | {None} and _package(name) in known
+        }
+    )
+
+
 @pytest.mark.parametrize("path", _files(), ids=lambda path: str(path.relative_to(ROOT)))
 def test_imports_go_down_only(path):
     owner = _owner(path)
     if owner in ("__init__", "__main__"):
         return  # the package root re-exports the user API lazily
-    allowed = (frozenset() if owner in UTILITIES else LAYERS[owner]) | UTILITIES | {owner}
     source = path.read_text()
-    imported = _imported(ast.parse(source, filename=str(path)))
-    above = sorted(
-        {
-            f"{path.relative_to(ROOT.parent)}:{line}: {name}"
-            for line, name in imported
-            if _package(name) not in allowed | {None}
-        }
-    )
-    known = set(LAYERS) | UTILITIES
-    above = [entry for entry in above if _package(entry.rsplit(": ", 1)[1]) in known]
-    assert not above, f"waveorder.{owner} may import only {sorted(allowed)}:\n" + "\n".join(above)
+    above = [f"{path.relative_to(ROOT.parent)}:{line}: {name}" for line, name in layer_violations(owner, source)]
+    assert not above, f"waveorder.{owner} may import only {sorted(LAYERS.get(owner, ()))}:\n" + "\n".join(above)
     if owner == "nn":
         files = [f"{line}: {name}" for line, name in file_io(source)]
         assert not files, "waveorder.nn reads and writes no files:\n" + "\n".join(files)
+
+
+ATTRIBUTE_FORM = """
+import waveorder
+import waveorder.nn as wnn
+
+
+def build():
+    return waveorder.models.Phase3D(wnn.Detection())
+
+
+def read():
+    return waveorder.io.read_plate
+"""
+"""A lower layer reaching ``waveorder.models`` by attribute, without importing it by name."""
+
+
+def test_the_layer_rule_catches_a_layer_reached_by_attribute():
+    assert {name for _, name in layer_violations("io", ATTRIBUTE_FORM)} == {
+        "waveorder.models",
+        "waveorder.models.Phase3D",
+    }
+    assert layer_violations("models", ATTRIBUTE_FORM) == []  # models may use nn and io
+    assert {name for _, name in layer_violations("nn", ATTRIBUTE_FORM)} >= {"waveorder.io", "waveorder.models"}
 
 
 OLD_BUNDLE = """

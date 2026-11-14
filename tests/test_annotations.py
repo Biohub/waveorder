@@ -23,7 +23,8 @@ def _strings(node: ast.expr) -> list[ast.Constant]:
 
 
 def _annotations(tree: ast.AST) -> list[ast.expr]:
-    """Return every argument, return and variable annotation of ``tree``, and the type of each ``cast``."""
+    """Return every argument, return and variable annotation of ``tree``, each ``type X = ...`` value, and the type of
+    each ``cast``."""
     found: list[ast.expr] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -34,6 +35,8 @@ def _annotations(tree: ast.AST) -> list[ast.expr]:
                 found.append(node.returns)
         elif isinstance(node, ast.AnnAssign):
             found.append(node.annotation)
+        elif isinstance(node, ast.TypeAlias):
+            found.append(node.value)
         elif isinstance(node, ast.Call) and node.args:
             function = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
             if function == "cast":
@@ -61,6 +64,10 @@ def test_no_annotation_is_a_string(path):
         ("def f(x: Literal['auto', 'off']) -> None: ...", 0),
         ("def f(x: Annotated[int, 'metadata']) -> None: ...", 0),
         ("def f(x: Annotated['Model', 'metadata']) -> None: ...", 1),
+        ("type Model = 'Thing'", 1),
+        ("type Pair = tuple['Model', int] | None", 1),
+        ("type Mode = Literal['auto', 'off']", 0),
+        ("type Weight = Annotated[float, 'metadata']", 0),
     ],
 )
 def test_the_walk_finds_string_annotations_and_only_those(source, count):
