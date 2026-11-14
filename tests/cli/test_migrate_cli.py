@@ -99,11 +99,12 @@ def test_a_migration_that_does_not_build_is_refused_and_not_written(tmp_path):
     assert not (tmp_path / "tv_2d_v4.yml").exists()
 
 
-def test_a_preview_file_is_refused_by_check_with_the_migrate_command(tmp_path):
+def test_a_preview_file_passes_check_with_the_migrate_command_in_its_warning(tmp_path):
+    # wo-4.0 wrote it; it loads as wo-4.0 read it, and the warning names the command that converts it.
     source = Path(shutil.copy(PREVIEW, tmp_path / "old.yml"))
     result = runner.invoke(app, ["config", "check", str(source)])
-    assert result.exit_code == 2
-    assert f"wo config migrate {source}" in result.stderr
+    assert result.exit_code == 0, result.output
+    assert f"if wo-4.0 wrote it, convert it with: wo config migrate {source}" in result.stderr
 
 
 @pytest.mark.parametrize("command", [["config", "check"], ["config", "show"]])

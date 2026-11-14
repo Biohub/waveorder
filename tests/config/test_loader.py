@@ -112,12 +112,22 @@ def test_each_problem_starts_with_its_dotted_path_and_is_located_at_the_file(tmp
     }
 
 
-def test_the_yx_padding_wo_40_writes_loads_and_any_other_is_refused_at_its_key():
+def test_the_yx_padding_wo_40_writes_loads_and_any_other_has_no_effect_at_its_key():
     raw = yaml.safe_load(V4_TEXT)
     loaded = load(raw | {"solver": {"padding": {"z": 5, "yx": 0}}})  # as wo-4.0's wo config migrate writes it
     assert (loaded.solver.padding.z, loaded.solver.padding.yx) == (5, 0)
-    (problem,) = _problems(raw | {"solver": {"padding": {"z": 5, "yx": 4}}})
-    assert problem.message == ("solver.padding.yx: 4 is not available in this version of WaveOrder; use 0 or (0, 0)")
+    with pytest.warns(ConfigurationWarning, match="4 has no effect: yx padding is not in this version") as caught:
+        load(raw | {"solver": {"padding": {"z": 5, "yx": 4}}})
+    assert [getattr(warning.message, "location", None) for warning in caught] == ["solver.padding.yx"]
+
+
+def test_wo_40_forms_of_a_pixel_size_and_a_tolerance_read_as_wo_40_read_them():
+    raw = yaml.safe_load(V4_TEXT)
+    wo40 = raw | {"data": raw["data"] | {"pixel_size": {"z": 0.25, "yx": {}}}}
+    with pytest.warns(ConfigurationWarning, match=r"data\.pixel_size is written \{z, yx\}"):
+        assert load(wo40).data.pixel_size == PixelSize(z=0.25, y=0.1, x=0.1)  # wo-4.0's default yx
+    never = {"solver": {"reconstruction": {"richardson_lucy": {"stopping_tolerance": 0}}}}
+    assert dump(load(raw | never))["solver"]["reconstruction"]["richardson_lucy"]["tolerance"] is None  # never stops
 
 
 def test_wo_40_richardson_lucy_stopping_tolerance_is_the_tolerance():

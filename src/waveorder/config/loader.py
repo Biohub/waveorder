@@ -17,6 +17,7 @@ import yaml
 from pydantic import ValidationError
 from yaml.constructor import ConstructorError
 
+from waveorder.config.migrate import bounded
 from waveorder.config.schema import V4Config
 from waveorder.errors import (
     ConfigurationError,
@@ -98,6 +99,9 @@ def expect_version(data: object, *, name: str) -> None:
 def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
     """Return the validated configuration of a YAML file or a mapping, or refuse it with every problem.
 
+    A free aperture or tilt zenith written without bounds, as wo-4.0 took it, gets the range ``wo config migrate``
+    writes, with a warning at its key.
+
     Parameters
     ----------
     source : str, Path, Mapping or V4Config
@@ -125,6 +129,9 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
         raise Rejected(problems(error, source=name)) from error
     wo40 = _wo40(data)
     migrate = f"wo config migrate {name if isinstance(source, str | Path) else 'FILE'}"
+    ranges: tuple[str, ...] = ()
+    if isinstance(data, Mapping):
+        data, ranges = bounded(data)  # wo-4.0 took free apertures and zeniths without bounds
     try:
         loaded = V4Config.model_validate(data)
     except CONFIG_ERRORS as error:
@@ -132,6 +139,9 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
         if wo40:
             found.append(Problem(f"{_WO40}; convert it with: {migrate}", name))
         raise Rejected(found) from error
+    for note in ranges:
+        field, _, message = note.partition(" ")
+        warnings.warn(ConfigurationWarning(message, field=field), stacklevel=2)
     if wo40:
         warnings.warn(
             ConfigurationWarning(f"{_WO40}; if wo-4.0 wrote it, convert it with: {migrate}", field=name),
@@ -142,7 +152,7 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
 
 _WO40 = (
     "data.pixel_size is written {z, yx}, as wo-4.0 writes it, and wo-4.0 files have other defaults "
-    "(detection.edge: sigmoid, unbounded apertures)"
+    "(detection.edge: sigmoid, a 3D z_focus_offset read as 0)"
 )
 
 

@@ -38,7 +38,7 @@ def _errors(result, command: str) -> list[str]:
 @pytest.mark.parametrize(
     ("dimension", "setting", "key"),
     [
-        (2, "solver.padding.z=4", "solver.padding.z"),
+        (2, "imaging_system.illumination.numerical_aperture=1.25", "imaging_system.illumination.numerical_aperture"),
         (3, "solver.device=gpu0", "solver.device"),
     ],
 )

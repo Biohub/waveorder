@@ -10,7 +10,7 @@ from tests.registration import temporarily
 from waveorder import registry
 from waveorder.config import V4Config, load
 from waveorder.config.build import build
-from waveorder.errors import ConfigurationError, Rejected, UnsupportedOptionError
+from waveorder.errors import ConfigurationError, ConfigurationWarning, Rejected, UnsupportedOptionError
 from waveorder.models import ReconstructionModel
 from waveorder.models._stores import system_record, system_sha256
 from waveorder.nn import (
@@ -99,6 +99,15 @@ def _refusal(raw: dict) -> str:
     (problem,) = rejected.value.problems
     assert problem.location == "the configuration"
     return problem.message
+
+
+def _no_effect(raw: dict) -> dict[str, str]:
+    """Return the located warnings ``from_config`` gives ``raw``, message by location; every warning is located."""
+    with pytest.warns(ConfigurationWarning) as caught:
+        ReconstructionModel.from_config(raw)
+    located = [warning.message for warning in caught if isinstance(warning.message, ConfigurationWarning)]
+    assert len(located) == len(caught)
+    return {str(warning.location): str(warning) for warning in located}
 
 
 # --- the imaging system ----------------------------------------------------------------------------------------------
@@ -198,20 +207,18 @@ def test_an_airy_unit_pinhole_is_converted_at_the_nominal_aperture():
 @pytest.mark.parametrize(
     ("raw", "field"),
     [
-        (_raw(detection={"numerical_aperture": {"nominal": 1.2}}), "imaging_system.detection.numerical_aperture"),
         (_raw(detection={"pinhole": {"diameter_um": -0.5}}), "imaging_system.detection.pinhole.diameter_um"),
         (
             _raw(detection={"pinhole": {"diameter_au": {"nominal": 1.0, "bounds": [-0.1, 2.0]}}}),
             "imaging_system.detection.pinhole.diameter_au",
         ),
-        (_phase(tilt={"zenith": {"nominal": 0.1, "tolerance": 0.05}}), "imaging_system.illumination.tilt.zenith"),
         (_phase(tilt={"zenith": 0.8}), "imaging_system.illumination.tilt.zenith"),
         (
             _loss("sharpness", midband_fractions=[0.3, 0.1]),
             "solver.calibration.advanced.loss.midband_fractions",
         ),
     ],
-    ids=["unbounded_aperture", "negative_um", "negative_au", "free_zenith", "darkfield_zenith", "fractions"],
+    ids=["negative_um", "negative_au", "darkfield_zenith", "fractions"],
 )
 def test_a_constructor_error_is_located_at_the_config_path_of_its_argument(raw, field):
     with pytest.raises(ConfigurationError) as error:
@@ -219,6 +226,26 @@ def test_a_constructor_error_is_located_at_the_config_path_of_its_argument(raw, 
     assert error.value.field == field
     assert _refusal(raw) == str(error.value)
     assert str(error.value).startswith(f"{field}: ")
+
+
+@pytest.mark.parametrize(
+    ("raw", "path", "bounds"),
+    [
+        (_raw(detection={"numerical_aperture": {"nominal": 1.2}}), "detection.numerical_aperture", (0.01, 1.33)),
+        (_phase(tilt={"zenith": {"nominal": 0.1, "tolerance": 0.05}}), "illumination.tilt.zenith", (-0.743, 0.743)),
+    ],
+    ids=["unbounded_aperture", "free_zenith"],
+)
+def test_a_free_value_without_the_range_its_part_needs_loads_with_the_range_a_migration_gives(raw, path, bounds):
+    # The parts refuse it; wo-4.0 took it, so a loaded configuration gets the range wo config migrate writes.
+    field = f"imaging_system.{path}"
+    with pytest.raises(ConfigurationError) as error:
+        build(V4Config(**raw))
+    assert error.value.field == field
+    with pytest.warns(ConfigurationWarning, match="^is free without bounds; 4.x needs") as caught:
+        model = ReconstructionModel.from_config(raw)
+    assert [getattr(warning.message, "location", None) for warning in caught] == [field]
+    assert free_specs(model.imaging_model)[f"system.{path}"].bounds == pytest.approx(bounds)
 
 
 # --- the object prior, the noise and the solver ----------------------------------------------------------------------
@@ -366,22 +393,59 @@ def test_each_search_stage_builds_its_class_in_the_configured_order():
 @pytest.mark.parametrize(
     ("advanced", "name", "arguments"),
     [
-        ({"optimizer": "adam"}, "gradient", {"optimizer": "adam"}),
+        ({"optimizer": "adam"}, "gradient", {"optimizer": "adam", "iterations": 200}),
         (
             {"optimizer": "nadam", "learning_rates": {"detection.numerical_aperture": 0.1}},
             "gradient",
             {"optimizer": "nadam", "learning_rates": {NA: 0.1}},
         ),
-        ({"optimizer": "lbfgs"}, "lbfgs", {}),
-        ({"optimizer": "nelder_mead", "convergence_tol": 1e-3}, "nelder_mead", {"tolerance": 1e-3}),
+        ({"optimizer": "lbfgs"}, "lbfgs", {"iterations": 200}),
+        ({"optimizer": "nelder_mead", "convergence_tol": 1e-3}, "nelder_mead", {"tolerance": 1e-3, "iterations": 200}),
         ({"optimizer": "grid_search", "grid_points": 5}, "grid", {"points": 5}),
     ],
     ids=["adam", "nadam", "lbfgs", "nelder_mead", "grid_search"],
 )
 def test_a_3x_optimizer_is_the_one_stage_it_names(advanced, name, arguments):
-    ((built, given),) = _stages(advanced=advanced)
+    # Its budget is the max_iter of the default lone gradient stage, 200, as wo-4.0 read it.
+    ((built, given),) = _stages(score="sharpness", advanced=advanced)
     assert built == name
     assert {key: given[key] for key in arguments} == arguments
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "nadam", "lbfgs", "nelder_mead"])
+def test_wo_40_optimizer_beside_its_gradient_stage_runs_the_optimizer_for_the_stage_max_iter(optimizer):
+    # wo-4.0's wo config migrate writes both; its sharpness calibration ran the optimizer for search.0's max_iter.
+    raw = _free(
+        solver={
+            "calibration": {
+                "score": "sharpness",
+                "search": [{"gradient": {"max_iter": 50, "method": "split"}}],
+                "advanced": {"optimizer": optimizer, "learning_rates": {"detection.numerical_aperture": 0.05}},
+            }
+        }
+    )
+    ((built, given),) = [_spec(stage) for stage in _parts(raw)["search"]]
+    assert (built, given["iterations"]) == ({"adam": "gradient", "nadam": "gradient"}.get(optimizer, optimizer), 50)
+    if built == "gradient":
+        assert (given["optimizer"], given["learning_rates"]) == (optimizer, {NA: 0.05})
+
+
+def test_wo_40_optimizer_beside_a_search_it_does_not_read_warns_at_what_has_no_effect():
+    sharpness = {"score": "sharpness", "advanced": {"optimizer": "lbfgs"}}
+    stages = _free(solver={"calibration": sharpness | {"search": [{"grid": {"points": 3}}, "gradient"]}})
+    stages["imaging_system"]["detection"]["numerical_aperture"] = FREE_NA | {"tolerance": "free"}
+    assert list(_no_effect(stages)) == ["solver.calibration.search"]
+    with pytest.warns(ConfigurationWarning):
+        assert [_spec(stage)[0] for stage in _parts(stages)["search"]] == ["lbfgs"]
+    other = _free(solver={"calibration": sharpness | {"search": [{"gradient": {"optimizer": "adamw"}}]}})
+    assert list(_no_effect(other)) == ["solver.calibration.search.0.gradient.optimizer"]
+    evidence = _free(solver={"calibration": {"search": ["lbfgs"], "advanced": {"optimizer": "adam"}}})
+    assert list(_no_effect(evidence)) == ["solver.calibration.advanced.optimizer"]
+    with pytest.warns(ConfigurationWarning):
+        assert [_spec(stage)[0] for stage in _parts(evidence)["search"]] == ["lbfgs"]  # evidence runs the search
+    consistent = {"search": [{"gradient": {"max_iter": 7}}], "advanced": {"optimizer": "adam"}}
+    ((_, given),) = _stages(**consistent)  # adam describes the adam stage: accepted silently
+    assert given["iterations"] == 7
 
 
 def test_name_keyed_settings_reach_the_stages_under_the_parameter_names():
@@ -409,13 +473,15 @@ def test_name_keyed_settings_reach_the_stages_under_the_parameter_names():
     ],
     ids=["noll_spelling", "typo"],
 )
-def test_a_name_keyed_setting_of_no_free_quantity_is_refused_at_its_key(calibration, field, hint):
+def test_a_name_keyed_setting_of_no_free_quantity_is_dropped_with_a_warning_at_its_key(calibration, field, hint):
+    # wo-4.0 read these mappings by the free quantities' names only, so another key changed nothing.
     spherical = {"spherical": {"nominal": 0.0, "bounds": [-0.2, 0.2]}}
     raw = _free(solver={"calibration": {"score": "evidence", **calibration}})
     raw["imaging_system"]["detection"]["pupil_aberrations"] = spherical
-    message = _refusal(raw)
-    assert message.startswith(f"{field}: names no free quantity of imaging_system; ")
-    assert hint in message
+    warned = _no_effect(raw)
+    assert list(warned) == [field]
+    assert "names no free quantity of imaging_system; " in warned[field]
+    assert hint in warned[field]
 
 
 def test_no_score_or_search_is_built_without_a_free_quantity_and_a_calibration_block():
@@ -428,22 +494,7 @@ def test_no_score_or_search_is_built_without_a_free_quantity_and_a_calibration_b
 
 @pytest.mark.parametrize(
     ("raw", "field"),
-    [
-        (_raw(solver={"padding": {"z": 2}}, object={"dimension": 2}), "solver.padding.z"),
-        (_raw(detection={"pinhole": "point"}, object={"dimension": 2}), "imaging_system.detection.pinhole"),
-        (
-            _free(solver={"calibration": {"advanced": {"optimizer": "adam", "convergence_tol": 1e-3}}}),
-            "solver.calibration.advanced.convergence_tol",
-        ),
-        (
-            _free(solver={"calibration": {"advanced": {"optimizer": "lbfgs", "grid_points": 5}}}),
-            "solver.calibration.advanced.grid_points",
-        ),
-        (
-            _raw(noise={"poisson_gaussian": {"sigma": "estimate"}}, object={"prior": "none"}),
-            "noise.poisson_gaussian.sigma",
-        ),
-    ],
+    [(_raw(detection={"pinhole": "point"}, object={"dimension": 2}), "imaging_system.detection.pinhole")],
 )
 def test_a_setting_nothing_runs_is_refused_with_its_reason(raw, field):
     with pytest.raises(UnsupportedOptionError) as error:
@@ -453,51 +504,97 @@ def test_a_setting_nothing_runs_is_refused_with_its_reason(raw, field):
     assert _refusal(raw) == str(error.value)
 
 
+SHARP = {"score": "sharpness"}
+
+
 @pytest.mark.parametrize(
     ("raw", "field"),
     [
-        (_raw(outputs=["reconstruction", "score_map"]), "outputs.1"),
+        (_raw(solver={"padding": {"z": 2}}, object={"dimension": 2}), "solver.padding.z"),
+        (
+            _free(solver={"calibration": SHARP | {"advanced": {"optimizer": "adam", "convergence_tol": 1e-3}}}),
+            "solver.calibration.advanced.convergence_tol",
+        ),
+        (
+            _free(solver={"calibration": SHARP | {"advanced": {"optimizer": "lbfgs", "grid_points": 5}}}),
+            "solver.calibration.advanced.grid_points",
+        ),
+        (
+            _raw(noise={"poisson_gaussian": {"sigma": "estimate"}}, object={"prior": "none"}),
+            "noise.poisson_gaussian.sigma",
+        ),
         (_raw(outputs=["transfer_function"]), "outputs"),
+        (_raw(outputs=["reconstruction", "psf", "tile_map"]), "outputs.1"),
+        (_raw(object={"prior": {"denoiser": {"checkpoint": "x.pt"}}}), "object.prior.denoiser"),
+        (_raw(noise={"gaussian": {"sigma": {"dark_frames": "dark.zarr"}}}), "noise.gaussian.sigma.dark_frames"),
+        (_raw(object={"source": {"phantom": {"kind": "beads"}}}), "object.source.phantom"),
+        (_raw(object={"source": {"from_recon": {"path": "r.zarr"}}}), "object.source.from_recon"),
+        (_raw(solver={"padding": {"yx": [4, 4]}}), "solver.padding.yx"),
+        (_raw(noise={"gaussian": {"snr_db": 20.0}}), "noise.gaussian.snr_db"),
+        (
+            _free(solver={"calibration": {"final_estimate": "average_near_best_H"}}),
+            "solver.calibration.final_estimate",
+        ),
+        (
+            _free(solver={"calibration": {"search": [{"gradient": {"method": "joint"}}]}}),
+            "solver.calibration.search.0.gradient.method",
+        ),
+    ],
+    ids=[
+        "thin_padding",
+        "tol_not_read",
+        "points_not_read",
+        "poisson_gaussian_estimate",
+        "no_reconstruction",
+        "unwritten_output",
+        "denoiser",
+        "dark_frames",
+        "phantom",
+        "from_recon",
+        "yx_padding",
+        "snr_db_outside_a_simulation",
+        "average_near_best_H",
+        "joint_gradient",
     ],
 )
-def test_a_setting_this_version_does_not_have_is_refused_at_load(raw, field):
+def test_a_wo_40_setting_nothing_runs_is_accepted_with_a_warning_at_its_key(raw, field):
+    warned = _no_effect(raw)
+    assert field in warned
+    assert "has no effect: " in warned[field]
+
+
+def test_wo_40_placeholders_build_what_runs_without_them():
+    with pytest.warns(ConfigurationWarning, match="denoiser"):
+        parts = _parts(_raw(object={"prior": {"denoiser": {"checkpoint": "x.pt"}}, "weight": 0.1}))
+    assert isinstance(parts["object_prior"], NoPrior)
+    with pytest.warns(ConfigurationWarning, match="dark frames"):
+        parts = _parts(_raw(noise={"gaussian": {"sigma": {"dark_frames": "dark.zarr"}}}))
+    assert parts["noise"].sigma == 1.0  # the default
+    with pytest.warns(ConfigurationWarning, match="nothing to pad"):
+        assert _parts(_raw(solver={"padding": {"z": 2}}, object={"dimension": 2}))["z_padding"] == 0
+
+
+def test_an_output_that_is_no_wo_40_output_is_refused_at_load():
     with pytest.raises(Rejected) as error:
-        load(raw)
+        load(_raw(outputs=["reconstruction", "score_map"]))
     (problem,) = error.value.problems
-    assert problem.message.startswith(f"{field}: ")
+    assert problem.message.startswith("outputs.1: ")
     assert "not available in this version of WaveOrder" in problem.message
 
 
-@pytest.mark.parametrize(
-    ("raw", "field"),
-    [
-        (_raw(object={"prior": {"denoiser": {"checkpoint": "x.pt"}}}), "object.prior"),
-        (_raw(noise={"gaussian": {"sigma": {"dark_frames": "dark.zarr"}}}), "noise.gaussian.sigma"),
-        (_raw(object={"source": {"phantom": {"kind": "beads"}}}), "object.source"),
-    ],
-)
-def test_a_placeholder_of_no_version_is_not_in_the_schema(raw, field):
-    with pytest.raises(Rejected) as error:
-        load(raw)
-    assert all(problem.message.startswith(field) for problem in error.value.problems)
-
-
-def test_a_score_grid_needs_a_grid_stage_and_score_arrays_a_whole_field():
+def test_a_score_grid_without_a_grid_and_score_arrays_of_a_tiled_field_are_accepted_with_a_warning():
     outputs = ["reconstruction", "score_trace", "score_grid"]
     assert (
         load(_free(outputs=outputs, solver={"calibration": {"search": [{"grid": {"points": 5}}]}})).outputs == outputs
     )
-    load(_free(outputs=outputs, solver={"calibration": {"advanced": {"optimizer": "grid_search"}}}))
+    load(_free(outputs=outputs, solver={"calibration": SHARP | {"advanced": {"optimizer": "grid_search"}}}))
     for solver in ({"calibration": {"search": [{"gradient": {}}]}}, {}):
-        with pytest.raises(Rejected) as error:
+        with pytest.warns(ConfigurationWarning, match="'score_grid' has no effect: the calibration runs no grid"):
             load(_free(outputs=outputs, solver=solver))
-        (problem,) = error.value.problems
-        assert problem.message.startswith("outputs: score_grid needs a grid stage in solver.calibration.search")
     tiled = BASE["imaging_system"] | {"field_dependence": {"tiled": {"size_yx": [16, 16]}}}
-    with pytest.raises(Rejected) as error:
+    with pytest.warns(ConfigurationWarning, match="a field-tiled calibration keeps no score arrays") as caught:
         load(_free(outputs=["reconstruction", "score_trace"], imaging_system=tiled))
-    (problem,) = error.value.problems
-    assert problem.message == "outputs: score_trace: a field-tiled calibration keeps no score arrays; remove it"
+    assert [getattr(warning.message, "location", None) for warning in caught] == ["outputs.1"]
 
 
 def test_a_rule_based_weight_does_not_run_with_a_calibration():
@@ -521,33 +618,48 @@ UNREAD_ILLUMINATION = _raw(imaging_system=BASE["imaging_system"] | {"illuminatio
 @pytest.mark.parametrize(
     ("raw", "field"),
     [
-        (UNREAD_ILLUMINATION, "imaging_system.illumination.wavelength"),
-        (_raw(object={"prior": "none", "weight": 0.1}), "object.weight"),
-        (
-            _phase() | {"imaging_system": PHASE | {"detection": {"wavelength": 0.6}}},
-            "imaging_system.detection.wavelength",
-        ),
-        (_loss("evidence", type="total_variation"), "solver.calibration.advanced.loss"),
         (_loss("sharpness", type="brenner"), "solver.calibration.advanced.loss.type"),
         (
             _loss("sharpness", type="total_variation", midband_fractions=[0.1, 0.3]),
             "solver.calibration.advanced.loss.midband_fractions",
         ),
     ],
-    ids=[
-        "illumination_of_fluorescence",
-        "weight_of_no_prior",
-        "phase_detection_wavelength",
-        "loss_of_evidence",
-        "unknown_loss",
-        "fractions_of_a_spatial_loss",
-    ],
+    ids=["unknown_loss", "fractions_of_a_spatial_loss"],
 )
 def test_a_value_set_where_nothing_reads_it_is_refused_there(raw, field):
     with pytest.raises(ConfigurationError) as error:
         build(V4Config(**raw))
     assert error.value.field == field
     assert _refusal(raw).startswith(f"{field}: ")
+
+
+@pytest.mark.parametrize(
+    ("raw", "field"),
+    [
+        (UNREAD_ILLUMINATION, "imaging_system.illumination.wavelength"),
+        (_raw(object={"prior": "none", "weight": 0.1}), "object.weight"),
+        (
+            _phase() | {"imaging_system": PHASE | {"detection": {"wavelength": 0.6}}},
+            "imaging_system.detection.wavelength",
+        ),
+        (
+            _phase() | {"imaging_system": PHASE | {"detection": {"pinhole": "point"}}},
+            "imaging_system.detection.pinhole",
+        ),
+        (_loss("evidence", type="total_variation"), "solver.calibration.advanced.loss"),
+    ],
+    ids=[
+        "illumination_of_fluorescence",
+        "weight_of_no_prior",
+        "phase_detection_wavelength",
+        "phase_pinhole",
+        "loss_of_evidence",
+    ],
+)
+def test_a_value_wo_40_accepted_where_nothing_reads_it_is_accepted_with_a_warning_there(raw, field):
+    warned = _no_effect(raw)
+    assert list(warned) == [field]
+    assert "has no effect: " in warned[field]
 
 
 def test_the_apodization_rolloff_builds_and_reaches_the_weight_sweep():

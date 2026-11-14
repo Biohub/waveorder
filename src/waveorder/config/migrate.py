@@ -745,7 +745,7 @@ def _from_preview(migration: _Migration) -> MigrationResult:
     pixel_size = _lookup(config, "data.pixel_size")
     if isinstance(pixel_size, dict) and "yx" in pixel_size:
         yx = pixel_size.pop("yx")
-        y, x = (yx.get("y"), yx.get("x")) if isinstance(yx, Mapping) else (yx, yx)
+        y, x = ((yx.get("y"), yx.get("x")) if yx else (0.1, 0.1)) if isinstance(yx, Mapping) else (yx, yx)
         config["data"]["pixel_size"] = {"z": pixel_size.pop("z", None), "y": y, "x": x, **pixel_size}
     migration.note(_PIXEL_NOTE)
     system = config.get("imaging_system")
@@ -883,6 +883,38 @@ def _bound_zenith(migration: _Migration, system: dict[str, Any]) -> None:
         f"3.x could reach from {start}, inside |zenith| < asin({aperture} / {index}), where the unscattered light "
         "stays inside the detection aperture"
     )
+
+
+def bounded(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Return ``raw`` with the range a migration gives each free aperture and tilt zenith written without bounds.
+
+    wo-4.0 took these unbounded, and 4.x needs a range, so :func:`waveorder.config.load` reads such a configuration
+    with the range :func:`migrate` writes. Returns the copy and one note per range, each ``imaging_system.<path> ...``.
+    """
+    config = copy.deepcopy(dict(raw))
+    system = config.get("imaging_system")
+    migration = _Migration(raw)
+    if isinstance(system, dict):
+        migration.reach = _reach(config)
+        _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2)
+        _bound_zenith(migration, system)
+    return config, tuple(migration.notes)
+
+
+def _reach(config: Mapping[str, Any]) -> dict[str, float]:
+    """Return how far wo-4.0's adam or nadam could move each free value: max_iter times its learning rate."""
+    calibration = _lookup(config, "solver.calibration")
+    advanced = calibration.get("advanced") if isinstance(calibration, Mapping) else None
+    if not isinstance(advanced, Mapping) or advanced.get("optimizer") not in ("adam", "nadam"):
+        return {}
+    search = calibration.get("search") if isinstance(calibration, Mapping) else None
+    stage = search[0] if isinstance(search, list) and len(search) == 1 else None
+    gradient = stage.get("gradient") if isinstance(stage, Mapping) else None
+    iterations = gradient.get("max_iter", 200) if isinstance(gradient, Mapping) else 200
+    rates = advanced.get("learning_rates")
+    if not isinstance(rates, Mapping) or not isinstance(iterations, int | float):
+        return {}
+    return {path: iterations * rate for path, rate in rates.items() if isinstance(rate, int | float)}
 
 
 _PREVIEW_ADVANCED = "solver.calibration.advanced"

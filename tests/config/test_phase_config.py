@@ -5,7 +5,7 @@ import torch
 import yaml
 
 from waveorder.config import V4Config
-from waveorder.errors import Rejected
+from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import Evidence, GridSearch, Sampling, ThickPhase3D, ThinPhase2D, Wiener, free_specs
 
@@ -93,13 +93,6 @@ def test_a_free_azimuth_is_the_system_parameter_under_its_yaml_path():
 @pytest.mark.parametrize(
     ("overrides", "field"),
     [
-        ({"imaging_system__illumination__wavelength": None}, "imaging_system.illumination.wavelength"),
-        ({"imaging_system__illumination__numerical_aperture": None}, "imaging_system.illumination.numerical_aperture"),
-        ({"imaging_system__detection__wavelength": 0.6}, "imaging_system.detection.wavelength"),
-        (
-            {"imaging_system__illumination__tilt__zenith": {"nominal": 0.1, "tolerance": 0.05}},
-            "imaging_system.illumination.tilt.zenith",
-        ),
         ({"imaging_system__illumination__tilt__zenith": 0.8}, "imaging_system.illumination.tilt.zenith"),
         (
             {
@@ -110,10 +103,6 @@ def test_a_free_azimuth_is_the_system_parameter_under_its_yaml_path():
         ),
     ],
     ids=[
-        "no-wavelength",
-        "no-condenser-aperture",
-        "detection-wavelength-differs",
-        "unbounded-free-zenith",
         "darkfield-tilt",
         "thin-condenser-reaches-objective",
     ],
@@ -123,3 +112,37 @@ def test_configs_the_phase_modules_cannot_represent_are_refused_at_their_field(o
         ReconstructionModel.from_config(_raw(**overrides))
     (problem,) = rejected.value.problems
     assert problem.message.startswith(f"{field}: ")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field", "built"),
+    [
+        ({"imaging_system__illumination__wavelength": None}, "imaging_system.illumination.wavelength", 0.532),
+        (
+            {"imaging_system__illumination__numerical_aperture": None},
+            "imaging_system.illumination.numerical_aperture",
+            0.9,
+        ),
+    ],
+    ids=["no-wavelength", "no-condenser-aperture"],
+)
+def test_an_omitted_illumination_setting_is_what_wo_40_reconstructed_with(overrides, field, built):
+    with pytest.warns(ConfigurationWarning, match=f"is not given, so it is {built}, the ") as caught:
+        model = ReconstructionModel.from_config(_raw(**overrides))
+    assert [getattr(warning.message, "location", None) for warning in caught] == [field]
+    system = model.system
+    assert isinstance(system, ThickPhase3D)
+    values = {
+        "wavelength": system.illumination.wavelength,
+        "numerical_aperture": system.illumination.fixed_quantities().get("numerical_aperture"),
+    }
+    assert values[field.rpartition(".")[2]] == built
+
+
+def test_a_detection_wavelength_brightfield_does_not_read_has_no_effect():
+    with pytest.warns(ConfigurationWarning, match="0.6 has no effect: brightfield detects") as caught:
+        model = ReconstructionModel.from_config(_raw(imaging_system__detection__wavelength=0.6))
+    assert [getattr(warning.message, "location", None) for warning in caught] == ["imaging_system.detection.wavelength"]
+    system = model.system
+    assert isinstance(system, ThickPhase3D)
+    assert system.detection.wavelength == 0.532

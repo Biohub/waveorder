@@ -7,6 +7,7 @@ class to choose. A constructor's own :class:`~waveorder.errors.ParameterError` i
 together is for the parts to say when the model is built.
 """
 
+import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from pydantic import BaseModel
 from waveorder import registry
 from waveorder.config.schema import (
     CalibrationAdvanced,
+    DarkFrames,
     DetectionSettings,
     FieldDependenceTiled,
     FreeParameter,
@@ -23,6 +25,7 @@ from waveorder.config.schema import (
     LoopOptions,
     Pinhole,
     PriorBeads,
+    PriorDenoiser,
     ReconstructionAdmm,
     ReconstructionDistilled,
     ReconstructionFista,
@@ -35,10 +38,17 @@ from waveorder.config.schema import (
     V4Config,
     WeightAuto,
     free_parameter_specs,
+    no_effect,
     nominal_of,
     parameter_name,
 )
-from waveorder.errors import BundleError, ConfigurationError, ParameterError, UnsupportedOptionError
+from waveorder.errors import (
+    BundleError,
+    ConfigurationError,
+    ConfigurationWarning,
+    ParameterError,
+    UnsupportedOptionError,
+)
 from waveorder.io.bundle import load_bundle
 from waveorder.nn import (
     Distilled,
@@ -73,16 +83,18 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
     The arguments are ``object_prior``, ``noise`` and ``solver`` (``None`` when the configuration does not write
     them), ``score`` and ``search`` (``None`` unless ``solver.calibration`` is set and a quantity is free),
     ``z_padding``, ``field_tiles`` (``None``, or the ``size_yx``, ``overlap_yx`` and ``blend`` of tiled field
-    dependence) and ``device``.
+    dependence) and ``device``. A value wo-4.0 accepted that no part reads is warned of at its path
+    (:class:`~waveorder.errors.ConfigurationWarning`), and an omitted wavelength or condenser aperture is the one
+    wo-4.0's ``wo reconstruct`` used.
 
     Raises
     ------
     ConfigurationError
-        At the config path of a value the parts refuse or do not read.
+        At the config path of a value the parts refuse.
     UnsupportedOptionError
         At a setting the schema takes and no part runs yet, with the reason.
     """
-    _expect_run(config)
+    thin = _expect_run(config)
     system = _system(config)
     written = config.model_fields_set
     object_written = {"prior", "weight", "constraints"} & config.object.model_fields_set
@@ -112,7 +124,7 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
             "scale": rule.search_scale,
             "rolloff": config.solver.apodization_rolloff,
             # auto resolves per stack: the model gives the sweep the slices it chose when it calibrates
-            "z_padding": 0 if config.solver.padding.z == "auto" else config.solver.padding.z,
+            "z_padding": 0 if thin or config.solver.padding.z == "auto" else config.solver.padding.z,
             "keep_slices": rule.plot_path is not None,
         }
         keys = {"samples": "object.weight.auto.num_samples", "scale": "object.weight.auto.search_scale"}
@@ -126,7 +138,7 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
         # A bead calibration scores by the bead fit's own likelihood (calibrate_beads), not by solver.calibration.score.
         "score": _score(config) if calibrated and not isinstance(config.object.prior, PriorBeads) else None,
         "search": search,
-        "z_padding": config.solver.padding.z,
+        "z_padding": 0 if thin else config.solver.padding.z,
         "field_tiles": None
         if tiles is None
         else {"size_yx": tiles.size_yx, "overlap_yx": tiles.overlap_yx, "blend": tiles.tile_blend},
@@ -168,23 +180,34 @@ def _quantity(value: object, *, at: str) -> object:
 
 
 def _unread(settings: object, default: object, *, at: str, by: str) -> None:
-    """Refuse a value of ``settings`` that differs from ``default``, where no part reads it."""
+    """Warn of each value of ``settings`` that differs from ``default``, where no part reads it."""
     given = settings.model_dump() if isinstance(settings, BaseModel) else settings
     usual = default.model_dump() if isinstance(default, BaseModel) else default
     if isinstance(given, dict) and isinstance(usual, dict):
         for key, value in given.items():
             _unread(value, usual.get(key), at=f"{at}.{key}", by=by)
     elif given != usual:
-        raise ConfigurationError(at, f"is set, but {by} does not read it; remove it")
+        no_effect(at, given, f"{by} does not read it, nor did wo-4.0; remove it")
 
 
-def _expect_run(config: V4Config) -> None:
-    """Refuse settings the schema takes and no part runs."""
-    solver = config.solver
-    if solver.padding.z and config.object.dimension == 2:
-        raise UnsupportedOptionError(
-            "solver.padding.z", str(solver.padding.z), reason="a thin object has one plane, nothing to pad; set 0"
-        )
+def _assumed(field: str, value: float, *, what: str) -> float:
+    """Return wo-4.0's value for an omitted setting, ``value``, and warn that it is assumed."""
+    warnings.warn(
+        ConfigurationWarning(
+            f"is not given, so it is {value}, the {what} wo-4.0's wo reconstruct used; give it", field=field
+        ),
+        stacklevel=3,
+    )
+    return value
+
+
+def _expect_run(config: V4Config) -> bool:
+    """Warn of settings the schema takes and no part runs; return whether the object is thin."""
+    padding = config.solver.padding.z
+    thin = config.object.dimension == 2
+    if padding and thin:
+        no_effect("solver.padding.z", padding, "a thin object has one plane, nothing to pad, as in wo-4.0")
+    return thin
 
 
 # --- the imaging system ----------------------------------------------------------------------------------------------
@@ -214,7 +237,7 @@ def _detection(settings: DetectionSettings, wavelength: float | None) -> object:
     return _resolve("detection", "detection", arguments, at=at)
 
 
-def _pinhole(settings: DetectionSettings) -> object:
+def _pinhole(settings: DetectionSettings, wavelength: float) -> object:
     at = "imaging_system.detection.pinhole"
     pinhole = settings.pinhole
     if not isinstance(pinhole, Pinhole):
@@ -222,10 +245,9 @@ def _pinhole(settings: DetectionSettings) -> object:
     if pinhole.diameter_um is not None:
         return _quantity(pinhole.diameter_um, at=f"{at}.diameter_um")
     aperture = nominal_of(settings.numerical_aperture)
-    assert settings.wavelength is not None
     assert aperture is not None
     assert pinhole.diameter_au is not None
-    airy = 1.22 * settings.wavelength / aperture  # 1 AU at the nominal aperture: the pinhole does not move with it
+    airy = 1.22 * wavelength / aperture  # 1 AU at the nominal aperture: the pinhole does not move with it
     diameter = pinhole.diameter_au
     if isinstance(diameter, FreeParameter):
         tolerance = diameter.tolerance if diameter.tolerance == "free" else diameter.tolerance * airy
@@ -235,6 +257,13 @@ def _pinhole(settings: DetectionSettings) -> object:
     return float(diameter) * airy
 
 
+_WAVELENGTH = 0.532
+"""The wavelength in um wo-4.0's ``wo reconstruct`` used where a configuration gives none."""
+
+_CONDENSER = 0.9
+"""The condenser numerical aperture wo-4.0's ``wo reconstruct`` used where a configuration gives none."""
+
+
 def _system(config: V4Config) -> ImagingSystem:
     settings = config.imaging_system
     detection, at = settings.detection, "imaging_system"
@@ -242,16 +271,17 @@ def _system(config: V4Config) -> ImagingSystem:
     thin = config.object.dimension == 2
     if settings.contrast == "fluorescence":
         _unread(settings.illumination, IlluminationSettings(), at=f"{at}.illumination", by="fluorescence")
-        if detection.wavelength is None:
-            raise ConfigurationError(f"{at}.detection.wavelength", "the emission wavelength is required")
+        wavelength = detection.wavelength
+        if wavelength is None:
+            wavelength = _assumed(f"{at}.detection.wavelength", _WAVELENGTH, what="emission wavelength in um")
         if detection.pinhole != "none":
             if thin:
                 raise UnsupportedOptionError(
                     f"{at}.detection.pinhole", "confocal", reason="confocal detection needs object.dimension: 3"
                 )
             arguments = {
-                "detection": _detection(detection, detection.wavelength),
-                "pinhole_diameter": _pinhole(detection),
+                "detection": _detection(detection, wavelength),
+                "pinhole_diameter": _pinhole(detection, wavelength),
                 "index_of_refraction_media": index,
             }
             pinhole, written = detection.pinhole, ""
@@ -263,23 +293,23 @@ def _system(config: V4Config) -> ImagingSystem:
             }
             return _resolve("system", "confocal_fluorescence_3d", arguments, at=at, keys=keys)
         name = "thin_fluorescence_2d" if thin else "widefield_fluorescence_3d"
-        arguments = {"detection": _detection(detection, detection.wavelength), "index_of_refraction_media": index}
+        arguments = {"detection": _detection(detection, wavelength), "index_of_refraction_media": index}
         return _resolve("system", name, arguments, at=at)
     illumination = settings.illumination
     field = f"{at}.illumination"
-    if illumination.wavelength is None:
-        raise ConfigurationError(f"{field}.wavelength", "the illumination wavelength is required")
-    if illumination.numerical_aperture is None:
-        raise ConfigurationError(f"{field}.numerical_aperture", "the condenser numerical aperture is required")
+    wavelength = illumination.wavelength
+    if wavelength is None:
+        wavelength = _assumed(f"{field}.wavelength", _WAVELENGTH, what="illumination wavelength in um")
+    aperture = illumination.numerical_aperture
+    if aperture is None:
+        aperture = _assumed(f"{field}.numerical_aperture", _CONDENSER, what="condenser numerical aperture")
     if detection.pinhole != "none":
-        raise UnsupportedOptionError(
-            f"{at}.detection.pinhole", "confocal", reason="confocal detection needs contrast: fluorescence"
-        )
-    if detection.wavelength not in (None, illumination.wavelength):
-        raise ConfigurationError(
+        no_effect(f"{at}.detection.pinhole", detection.pinhole, "brightfield has no pinhole, as in wo-4.0")
+    if detection.wavelength not in (None, wavelength):
+        no_effect(
             f"{at}.detection.wavelength",
-            f"is {detection.wavelength} um, but brightfield detects the illumination's {illumination.wavelength} um; "
-            "omit it",
+            detection.wavelength,
+            f"brightfield detects the illumination's {wavelength} um, as in wo-4.0; omit it",
         )
     tilt = _resolve(
         "tilt",
@@ -294,8 +324,8 @@ def _system(config: V4Config) -> ImagingSystem:
         "illumination",
         "illumination",
         {
-            "wavelength": illumination.wavelength,
-            "numerical_aperture": _quantity(illumination.numerical_aperture, at=f"{field}.numerical_aperture"),
+            "wavelength": wavelength,
+            "numerical_aperture": _quantity(aperture, at=f"{field}.numerical_aperture"),
             "tilt": tilt,
         },
         at=field,
@@ -321,9 +351,11 @@ def _prior(config: V4Config) -> ObjectPrior:
         weight = _AUTO_WEIGHT if weight == "auto" else Free(1e-3, bounds=(1e-12, 1e12))
     if isinstance(prior, PriorBeads):
         return _resolve("object_prior", "beads", prior.beads.model_dump(), at=f"{at}.beads")
+    if isinstance(prior, PriorDenoiser):  # warned of by the schema; its weight goes with it
+        return _resolve("object_prior", "none", {"nonnegative": nonnegative}, at=at)
     if prior == "none":
         if "weight" in settings.model_fields_set:
-            raise ConfigurationError("object.weight", "is set, but object.prior: none has no weight; remove it")
+            no_effect("object.weight", settings.weight, "object.prior: none has no weight, as in wo-4.0; remove it")
         return _resolve("object_prior", "none", {"nonnegative": nonnegative}, at=at)
     return _resolve("object_prior", prior, {"weight": weight, "nonnegative": nonnegative}, at="object")
 
@@ -335,7 +367,9 @@ def _noise(config: V4Config) -> Noise:
     at = f"noise.{name}"
     arguments = settings.model_dump(exclude={"snr_db", "photons"})
     sigma = getattr(settings, "sigma", None)
-    if sigma == "estimate" and name == "gaussian":
+    if isinstance(sigma, DarkFrames):  # warned of by the schema
+        arguments["sigma"] = 1.0
+    elif sigma == "estimate" and name == "gaussian":
         # Estimated with the evidence or by beads; elsewhere sigma cancels out of the solve and the score.
         calibration = config.solver.calibration
         estimated = isinstance(config.object.prior, PriorBeads) or (
@@ -343,9 +377,8 @@ def _noise(config: V4Config) -> Noise:
         )
         arguments["sigma"] = "estimate" if estimated else 1.0
     elif sigma == "estimate":
-        raise UnsupportedOptionError(
-            f"{at}.sigma", "estimate", reason="only noise.gaussian.sigma is estimated; give sigma as a number"
-        )
+        no_effect(f"{at}.sigma", sigma, "only noise.gaussian.sigma is estimated, as in wo-4.0; sigma is 1, the default")
+        arguments["sigma"] = 1.0
     return _resolve("noise", name, arguments, at=at)
 
 
@@ -391,7 +424,7 @@ def _score(config: V4Config) -> Score:
     loss = None if calibration.advanced is None else calibration.advanced.loss
     if calibration.score != "sharpness":
         if loss is not None:
-            raise ConfigurationError(loss_at, f"is a sharpness setting, and score is {calibration.score}; remove it")
+            no_effect(loss_at, loss, f"it is a sharpness setting, and score is {calibration.score}; remove it")
         return _resolve("score", calibration.score, {}, at=at)
     settings = dict(loss or {"type": "midband_power"})
     kind = settings.pop("type", "midband_power")
@@ -411,7 +444,10 @@ def _score(config: V4Config) -> Score:
 
 
 def _keyed(value: object, *, at: str, config: V4Config) -> object:
-    """Return a per-quantity setting keyed by parameter names instead of the paths the configuration writes."""
+    """Return a per-quantity setting keyed by parameter names instead of the paths the configuration writes.
+
+    A key that names no free quantity is dropped with a warning, as wo-4.0 read only the free ones.
+    """
     if not isinstance(value, Mapping):
         return value
     paths = free_parameter_specs(config.imaging_system, expand_shorthand=True)
@@ -424,7 +460,8 @@ def _keyed(value: object, *, at: str, config: V4Config) -> object:
             except ValueError:
                 spelled = None
             hint = f"write {spelled!r}" if spelled in paths else f"the free quantities are {sorted(paths)}"
-            raise ConfigurationError(f"{at}.{key}", f"names no free quantity of imaging_system; {hint}")
+            no_effect(f"{at}.{key}", entry, f"it names no free quantity of imaging_system; {hint}")
+            continue
         keyed[parameter_name(key)] = entry
     return keyed
 
@@ -437,22 +474,25 @@ def _profile(prior: ObjectPrior | None, noise: Noise | None) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _optimizer_stage(advanced: CalibrationAdvanced, rates: object) -> SearchStage:
-    """Return the one stage a 3.x ``advanced.optimizer`` names, with the 3.x setting it reads."""
+def _optimizer_stage(advanced: CalibrationAdvanced, rates: object, *, iterations: int | None) -> SearchStage:
+    """Return the one stage a 3.x ``advanced.optimizer`` names, with the 3.x settings it reads.
+
+    ``iterations`` is the 3.x ``max_iterations`` (``None``: the stage's default), which ``grid_search`` ignores.
+    """
     at = "solver.calibration.advanced"
     optimizer = advanced.optimizer
+    budget = {} if iterations is None else {"iterations": iterations}
+    steps = {"iterations": "solver.calibration.search.0.gradient.max_iter"}
     if optimizer in ("adam", "nadam"):
-        arguments = {"learning_rates": rates, "optimizer": optimizer, "learning_rate": 0.01, "last": True}
-        return _resolve(
-            "search", "gradient", arguments, at=f"{at}.optimizer", keys={"learning_rates": f"{at}.learning_rates"}
-        )
+        arguments = {"learning_rates": rates, "optimizer": optimizer, "learning_rate": 0.01, "last": True, **budget}
+        keys = {"learning_rates": f"{at}.learning_rates", **steps}
+        return _resolve("search", "gradient", arguments, at=f"{at}.optimizer", keys=keys)
     if optimizer == "lbfgs":
-        return _resolve("search", "lbfgs", {}, at=f"{at}.optimizer")
+        return _resolve("search", "lbfgs", budget, at=f"{at}.optimizer", keys=steps)
     if optimizer == "nelder_mead":
-        arguments = {} if advanced.convergence_tol is None else {"tolerance": advanced.convergence_tol}
-        return _resolve(
-            "search", "nelder_mead", arguments, at=f"{at}.optimizer", keys={"tolerance": f"{at}.convergence_tol"}
-        )
+        arguments = budget if advanced.convergence_tol is None else {"tolerance": advanced.convergence_tol, **budget}
+        keys = {"tolerance": f"{at}.convergence_tol", **steps}
+        return _resolve("search", "nelder_mead", arguments, at=f"{at}.optimizer", keys=keys)
     arguments = {"width": 2.0} if advanced.grid_points is None else {"points": advanced.grid_points, "width": 2.0}
     return _resolve("search", "grid", arguments, at=f"{at}.optimizer", keys={"points": f"{at}.grid_points"})
 
@@ -461,7 +501,8 @@ def _search(config: V4Config, *, profile: tuple[str, ...]) -> tuple[SearchStage,
     """Build the search stages; with ``profile``, a grid over those quantities goes first and before each gradient.
 
     Gradient stages take wo-4.0's step (``learning_rate=0.01``) and end at their last point (``last=True``), and
-    grids span wo-4.0's width of two tolerances, so a migrated file calibrates as wo-4.0 did.
+    grids span wo-4.0's width of two tolerances, so a migrated file calibrates as wo-4.0 did. Under score sharpness
+    ``advanced.optimizer`` is the one stage, for the ``max_iter`` of a lone gradient stage, as wo-4.0 ran it.
     """
     calibration = config.solver.calibration
     assert calibration is not None
@@ -469,14 +510,14 @@ def _search(config: V4Config, *, profile: tuple[str, ...]) -> tuple[SearchStage,
     at = "solver.calibration.advanced"
     rate_at = f"{at}.learning_rates"
     rates = _keyed(advanced.learning_rates, at=rate_at, config=config)
+    drives = calibration.optimizer_drives
     reads = {"nelder_mead": "convergence_tol", "grid_search": "grid_points"}
     for name in ("convergence_tol", "grid_points"):
-        if getattr(advanced, name) is not None and reads.get(advanced.optimizer or "") != name:
-            raise UnsupportedOptionError(
-                f"{at}.{name}", str(getattr(advanced, name)), reason="it is not run; remove it"
-            )
-    if advanced.optimizer is not None:
-        return (_optimizer_stage(advanced, rates),)
+        value = getattr(advanced, name)
+        if value is not None and not (drives and reads.get(advanced.optimizer or "") == name):
+            no_effect(f"{at}.{name}", value, "no stage of this calibration reads it, nor did wo-4.0; remove it")
+    if drives:
+        return (_optimizer_stage(advanced, rates, iterations=calibration.budget),)
     grid = None
     if profile:
         grid = _resolve("search", "grid", {"points": 13, "names": profile, "width": 2.0}, at="solver.calibration")

@@ -4,7 +4,7 @@ import pytest
 import torch
 import yaml
 
-from waveorder.errors import Rejected
+from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import ADMM, PoissonGaussian, RichardsonLucy, Sampling
 
@@ -108,7 +108,11 @@ def test_richardson_lucy_solves_poisson_gaussian_noise_as_a_model_built_in_pytho
     assert _refused_at(raw | {"noise": {"gaussian": {}}}) == "solver.reconstruction"
 
 
-def test_a_poisson_gaussian_sigma_to_estimate_is_refused_at_its_key():
+def test_a_poisson_gaussian_sigma_to_estimate_has_no_effect_and_sigma_is_the_default():
     noise = {"poisson_gaussian": {"sigma": "estimate"}}
     raw = _raw(object_block={"prior": "none"}, noise=noise, reconstruction="richardson_lucy")
-    assert _refused_at(raw) == "noise.poisson_gaussian.sigma"
+    with pytest.warns(ConfigurationWarning, match="'estimate' has no effect: only noise.gaussian.sigma") as caught:
+        model = ReconstructionModel.from_config(raw)
+    assert [getattr(warning.message, "location", None) for warning in caught] == ["noise.poisson_gaussian.sigma"]
+    assert isinstance(model.noise, PoissonGaussian)
+    assert model.noise.sigma == 1.0

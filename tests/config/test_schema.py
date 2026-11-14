@@ -22,6 +22,7 @@ from waveorder.config.schema import (
 )
 from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
+from waveorder.nn import free_specs
 
 # Design document example 4.1: blind, tiled, evidence-scored phase reconstruction.
 EXAMPLE_4_1 = """
@@ -123,15 +124,18 @@ def _blocks_4_1() -> dict:
     }
 
 
-def test_example_4_1_validates_and_its_model_refuses_the_unbounded_free_tilt():
-    # The document is valid (its grid warns); the phase systems clamp a free zenith to [0, pi/2] only with bounds.
+def test_example_4_1_validates_and_its_model_bounds_the_unbounded_free_tilt_as_a_migration_does():
+    # The document is valid (its grid warns); the phase systems clamp a free zenith only with bounds, which wo-4.0
+    # did not need, so the model takes the range wo config migrate gives it, with a warning at the key.
     raw = yaml.safe_load(EXAMPLE_4_1)
     with pytest.warns(ConfigurationWarning, match="the grid evaluates"):
         V4Config(**raw)
-    with pytest.warns(ConfigurationWarning), pytest.raises(Rejected) as rejected:
-        ReconstructionModel.from_config(raw)
-    (problem,) = rejected.value.problems
-    assert problem.message.startswith("imaging_system.illumination.tilt.zenith: ")
+    with pytest.warns(ConfigurationWarning) as caught:
+        model = ReconstructionModel.from_config(raw)
+    assert "imaging_system.illumination.tilt.zenith" in {
+        getattr(warning.message, "location", None) for warning in caught
+    }
+    assert free_specs(model.imaging_model)["system.illumination.tilt.zenith"].bounds == pytest.approx((-0.877, 0.877))
 
 
 def test_example_4_1_parses():
@@ -507,7 +511,7 @@ def _messages(**blocks: object) -> list[str]:
     [
         (
             {"object": {"prior": "lasso"}},
-            "object.prior: 'lasso' is not an option; choose one of tikhonov, tv, none, beads",
+            "object.prior: 'lasso' is not an option; choose one of tikhonov, tv, none, beads, denoiser",
         ),
         (
             {"solver": {"reconstruction": "newton"}},

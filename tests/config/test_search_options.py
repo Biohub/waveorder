@@ -1,5 +1,7 @@
 """``solver.calibration.search``: the gradient optimizer, the Nelder-Mead stage, and the 3.x ``advanced.optimizer``."""
 
+from pathlib import Path
+
 import pytest
 import torch
 import yaml
@@ -79,13 +81,13 @@ def test_a_nelder_mead_stage_reaches_the_minimum_of_a_fine_grid():
 @pytest.mark.parametrize(
     ("advanced", "kind", "attributes"),
     [
-        ({"optimizer": "adam"}, GradientSearch, {"optimizer": "adam"}),
+        ({"optimizer": "adam"}, GradientSearch, {"optimizer": "adam", "iterations": 200}),
         (
             {"optimizer": "nadam", "learning_rates": {"detection.numerical_aperture": 0.01}},
             GradientSearch,
             {"optimizer": "nadam", "learning_rates": {"system.detection.numerical_aperture": 0.01}},
         ),
-        ({"optimizer": "lbfgs"}, LBFGSSearch, {"iterations": LBFGSSearch().iterations}),
+        ({"optimizer": "lbfgs"}, LBFGSSearch, {"iterations": 200}),
         ({"optimizer": "nelder_mead"}, NelderMeadSearch, {"tolerance": NelderMeadSearch().tolerance}),
         ({"optimizer": "nelder_mead", "convergence_tol": 1e-6}, NelderMeadSearch, {"tolerance": 1e-6}),
         ({"optimizer": "grid_search"}, GridSearch, {"points": GridSearch().points}),
@@ -94,28 +96,39 @@ def test_a_nelder_mead_stage_reaches_the_minimum_of_a_fine_grid():
     ids=["adam", "nadam_with_rates", "lbfgs", "nelder_mead", "nelder_mead_tol", "grid", "grid_points"],
 )
 def test_the_3x_optimizer_names_the_search(advanced, kind, attributes):
-    (stage,) = _search(advanced=advanced)
+    # A sharpness calibration runs it, for the max_iter of the default lone gradient stage, as wo-4.0 did.
+    (stage,) = _search(score="sharpness", advanced=advanced)
     assert type(stage) is kind
     assert {name: getattr(stage, name) for name in attributes} == attributes
 
 
+def test_a_592_file_with_optimizer_and_search_loads_as_wo_40_ran_it():
+    # wo-4.0's wo config migrate writes advanced.optimizer beside the gradient stage that holds its max_iter.
+    raw = yaml.safe_load((Path(__file__).parent / "data/592/phase_3d_optimized.yml").read_text())
+    with pytest.warns(ConfigurationWarning) as caught:
+        model = ReconstructionModel.from_config(raw)
+    assert {warning.message.location for warning in caught if isinstance(warning.message, ConfigurationWarning)} >= {
+        "solver.calibration.advanced.convergence_patience",
+        "imaging_system.illumination.numerical_aperture",  # free without bounds: the range a migration gives
+    }
+    assert model.search is not None
+    (stage,) = model.search
+    assert isinstance(stage, GradientSearch)
+    assert (stage.optimizer, stage.iterations) == ("adam", 10)
+    assert stage.learning_rates == {"system.illumination.numerical_aperture": 0.01}
+
+
 @pytest.mark.parametrize(
-    ("calibration", "location"),
+    ("advanced", "location"),
     [
-        ({"advanced": {"optimizer": "adam"}, "search": ["lbfgs"]}, "solver.calibration.advanced.optimizer"),
-        ({"advanced": {"optimizer": "adam", "convergence_tol": 1e-3}}, "solver.calibration.advanced.convergence_tol"),
-        ({"advanced": {"optimizer": "lbfgs", "grid_points": 5}}, "solver.calibration.advanced.grid_points"),
-        (
-            {"advanced": {"optimizer": "nelder_mead", "convergence_tol": -1.0}},
-            "solver.calibration.advanced.convergence_tol",
-        ),
-        ({"advanced": {"optimizer": "grid_search", "grid_points": 1}}, "solver.calibration.advanced.grid_points"),
+        ({"optimizer": "nelder_mead", "convergence_tol": -1.0}, "solver.calibration.advanced.convergence_tol"),
+        ({"optimizer": "grid_search", "grid_points": 1}, "solver.calibration.advanced.grid_points"),
     ],
-    ids=["two_searches", "tol_not_read", "points_not_read", "negative_tol", "one_point"],
+    ids=["negative_tol", "one_point"],
 )
-def test_a_3x_optimizer_setting_it_cannot_honour_is_refused_at_its_key(calibration, location):
+def test_a_3x_optimizer_setting_it_cannot_honour_is_refused_at_its_key(advanced, location):
     with pytest.raises(Rejected) as rejected:
-        ReconstructionModel.from_config(_raw(**calibration))
+        ReconstructionModel.from_config(_raw(score="sharpness", advanced=advanced))
     (problem,) = rejected.value.problems
     assert problem.message.startswith(f"{location}: ")
 
@@ -129,5 +142,5 @@ def test_the_wo_40_optimizer_settings_this_version_does_not_execute_are_accepted
     assert sorted(warning.location or "" for warning in located) == [
         f"solver.calibration.advanced.{name}" for name in sorted(ignored)
     ]
-    assert all("is ignored" in str(warning) for warning in located)
+    assert all("has no effect" in str(warning) for warning in located)
     assert model.search == ReconstructionModel.from_config(_raw(advanced={"optimizer": "adam"})).search

@@ -62,6 +62,11 @@ def _non_negative(value: float) -> float:
     return value
 
 
+def _zero_is_none(value: object) -> object:
+    """Read a stopping tolerance of 0 as none: wo-4.0 accepted 0, which never stops early."""
+    return None if value == 0 and not isinstance(value, bool) else value
+
+
 type FiniteFloat = Annotated[float, BeforeValidator(_not_a_bool), Field(allow_inf_nan=False)]
 type PositiveFiniteFloat = Annotated[
     float, BeforeValidator(_not_a_bool), Field(allow_inf_nan=False), AfterValidator(_positive)
@@ -166,6 +171,11 @@ def _available(*values: object) -> AfterValidator:
     return AfterValidator(check)
 
 
+def no_effect(field: str, value: object, reason: str) -> None:
+    """Warn that the setting at ``field``, which wo-4.0 accepted, is accepted here and changes nothing, and why."""
+    warnings.warn(ConfigurationWarning(f"{value!r} has no effect: {reason}", field=field), stacklevel=3)
+
+
 # --- free parameters -------------------------------------------------------------------------------------------------
 
 
@@ -220,7 +230,10 @@ def _pixel_size(value: object) -> object:
     if isinstance(value, dict) and "yx" in value:
         rest = {key: item for key, item in value.items() if key != "yx"}
         yx = value["yx"]
-        y, x = (yx.get("y"), yx.get("x")) if isinstance(yx, dict) else (yx, yx)
+        if isinstance(yx, dict):
+            y, x = (yx.get("y"), yx.get("x")) if yx else (0.1, 0.1)  # wo-4.0 read {} as its default, 0.1 um
+        else:
+            y, x = yx, yx
         return {**rest, "y": y, "x": x}
     return value
 
@@ -372,9 +385,23 @@ class PriorBeads(V4BaseModel):
     beads: BeadsPrior
 
 
-_PRIOR = _Option("beads", bare_names=("tikhonov", "tv", "none"))
+class DenoiserPrior(V4BaseModel):
+    """wo-4.0's learned denoiser prior, which neither wo-4.0 nor this version runs."""
+
+    checkpoint: str
+
+
+class PriorDenoiser(V4BaseModel):
+    """``prior: {denoiser: ...}``: accepted as wo-4.0 accepted it, and reconstructed with no prior."""
+
+    denoiser: DenoiserPrior
+
+
+_PRIOR = _Option("beads", "denoiser", bare_names=("tikhonov", "tv", "none"))
 type Prior = Annotated[
-    Annotated[Literal["tikhonov", "tv", "none"], Tag("name")] | Annotated[PriorBeads, Tag("beads")],
+    Annotated[Literal["tikhonov", "tv", "none"], Tag("name")]
+    | Annotated[PriorBeads, Tag("beads")]
+    | Annotated[PriorDenoiser, Tag("denoiser")],
     Discriminator(_PRIOR.tag),
     BeforeValidator(_PRIOR.normalize),
     WrapValidator(_PRIOR.strip),
@@ -411,6 +438,30 @@ class SourceGaussianSpectrum(V4BaseModel):
     gaussian_spectrum: GaussianSpectrumSource
 
 
+class PhantomSource(V4BaseModel):
+    """wo-4.0's named phantom, which neither wo-4.0 nor this version simulates."""
+
+    kind: str
+
+
+class SourcePhantom(V4BaseModel):
+    """``source: {phantom: ...}``: accepted as wo-4.0 accepted it; a simulation draws the default object."""
+
+    phantom: PhantomSource
+
+
+class FromReconSource(V4BaseModel):
+    """wo-4.0's object read from a reconstruction, which neither wo-4.0 nor this version simulates."""
+
+    path: str
+
+
+class SourceFromRecon(V4BaseModel):
+    """``source: {from_recon: ...}``: accepted as wo-4.0 accepted it; a simulation draws the default object."""
+
+    from_recon: FromReconSource
+
+
 class ObjectSettings(V4BaseModel):
     """The object prior (or the true object of a simulation)."""
 
@@ -420,13 +471,19 @@ class ObjectSettings(V4BaseModel):
         default=1e-3, description="regularization weight, or auto"
     )
     constraints: list[Literal["nonneg"]] = Field(default_factory=list)
-    source: SourceGaussianSpectrum | None = None
+    source: SourceGaussianSpectrum | SourcePhantom | SourceFromRecon | None = None
 
 
 # --- noise -----------------------------------------------------------------------------------------------------------
 
 
-type Sigma = PositiveFiniteFloat | Literal["estimate"]
+class DarkFrames(V4BaseModel):
+    """wo-4.0's noise level from dark frames, which neither wo-4.0 nor this version reads."""
+
+    dark_frames: str
+
+
+type Sigma = PositiveFiniteFloat | Literal["estimate"] | DarkFrames
 
 
 class GaussianNoise(V4BaseModel):
@@ -492,8 +549,8 @@ class Padding(V4BaseModel):
         description="z slices on each side; auto: at least n * wavelength / NA_detection^2 in slices, then more for "
         "a fast FFT length of the padded stack",
     )
-    yx: Annotated[NonNegativeCount | tuple[NonNegativeCount, NonNegativeCount], _available(0, (0, 0))] = Field(
-        default=0, description="only 0: yx padding is not available in this version"
+    yx: NonNegativeCount | tuple[NonNegativeCount, NonNegativeCount] = Field(
+        default=0, description="wo-4.0's; yx padding is not in this version, so any value pads nothing"
     )
 
 
@@ -526,10 +583,10 @@ class RichardsonLucyReconstruction(LoopOptions):
     bp_beta: PositiveFiniteFloat | None = None
     gradient_consensus: bool = Field(default=False, description="the 3.x RLGC variant")
     start: Literal["mean", "ones"] = Field(default="mean", description="first estimate; ones is the 3.x start")
-    tolerance: PositiveFiniteFloat | None = Field(
+    tolerance: Annotated[PositiveFiniteFloat | None, BeforeValidator(_zero_is_none)] = Field(
         default=None,
         validation_alias=AliasChoices("tolerance", "stopping_tolerance"),
-        description="stop at this relative change; stopping_tolerance is wo-4.0's name",
+        description="stop at this relative change; stopping_tolerance is wo-4.0's name, and 0 never stops early",
     )
 
 
@@ -601,7 +658,9 @@ class GradientStage(V4BaseModel):
     """Gradient descent from the best point so far."""
 
     max_iter: Count = 200
-    method: Annotated[str, _available("split")] = Field(default="split", description="only split is available")
+    method: Literal["split", "alternating", "joint"] = Field(
+        default="split", description="wo-4.0's; only split runs, and the others have no effect"
+    )
     optimizer: Literal["adam", "nadam", "adamw", "sgd"] = "adam"
 
 
@@ -667,15 +726,15 @@ class CalibrationAdvanced(V4BaseModel):
     """Step sizes and the 3.x optimizer settings."""
 
     optimizer: Literal["adam", "nadam", "lbfgs", "nelder_mead", "grid_search"] | None = Field(
-        default=None, description="3.x optimizer, in place of search"
+        default=None, description="3.x optimizer; it drives a sharpness calibration, as in wo-4.0"
     )
     learning_rates: dict[str, PositiveFiniteFloat] = Field(
         default_factory=dict, description="gradient step size per quantity path under imaging_system"
     )
-    convergence_tol: PositiveFiniteFloat | None = Field(default=None, description="3.x nelder_mead tolerance")
+    convergence_tol: FiniteFloat | None = Field(default=None, description="3.x nelder_mead tolerance")
     convergence_patience: Count | None = Field(default=None, description="wo-4.0's; accepted and not executed")
     use_gradients: bool | None = Field(default=None, description="wo-4.0's; accepted and not executed")
-    grid_points: GridPoints | None = Field(default=None, description="3.x grid_search points")
+    grid_points: Count | None = Field(default=None, description="3.x grid_search points")
     loss: dict[str, Any] | None = Field(default=None, description="3.x sharpness loss: type and parameters")
     log_dir: str | None = Field(default=None, description="wo-4.0's TensorBoard folder; accepted and not written")
 
@@ -683,12 +742,10 @@ class CalibrationAdvanced(V4BaseModel):
     def _warn_ignored(self) -> Self:
         for name in ("convergence_patience", "use_gradients", "log_dir"):
             if getattr(self, name) is not None:
-                warnings.warn(
-                    ConfigurationWarning(
-                        f"{getattr(self, name)!r} is ignored: this version of WaveOrder does not execute it; remove it",
-                        field=f"solver.calibration.advanced.{name}",
-                    ),
-                    stacklevel=4,
+                no_effect(
+                    f"solver.calibration.advanced.{name}",
+                    getattr(self, name),
+                    "this version of WaveOrder does not execute it; remove it",
                 )
         return self
 
@@ -702,10 +759,23 @@ class Calibration(V4BaseModel):
 
     score: Literal["evidence", "gcv", "sharpness"] = "evidence"
     search: list[SearchStageSettings] = Field(default_factory=_default_search, min_length=1)
-    final_estimate: Annotated[str, _available("best_H")] = Field(
-        default="best_H", description="only best_H is available"
+    final_estimate: Literal["best_H", "average_near_best_H"] = Field(
+        default="best_H", description="wo-4.0's; only best_H runs, and average_near_best_H has no effect"
     )
     advanced: CalibrationAdvanced | None = None
+
+    @property
+    def optimizer_drives(self) -> bool:
+        """Whether ``advanced.optimizer`` is the search: under score sharpness, as in wo-4.0 (evidence, gcv: search)."""
+        return self.advanced is not None and self.advanced.optimizer is not None and self.score == "sharpness"
+
+    @property
+    def budget(self) -> int | None:
+        """The iterations of the 3.x optimizer: the ``max_iter`` of a lone gradient stage, as wo-4.0 read it."""
+        match self.search:
+            case [SearchGradient(gradient=gradient)]:
+                return gradient.max_iter
+        return None
 
 
 class SolverSettings(V4BaseModel):
@@ -720,9 +790,26 @@ class SolverSettings(V4BaseModel):
 
 # --- top level -------------------------------------------------------------------------------------------------------
 
-type OutputName = Annotated[str, _available("reconstruction", "transfer_function", "score_trace", "score_grid")]
-"""An output of ``outputs``; the reconstruction is always written, so a list must name it. The score arrays go into
-the calibration store."""
+_OUTPUTS = (
+    "reconstruction",
+    "transfer_function",
+    "score_trace",
+    "score_grid",
+    "parameters",
+    "psf",
+    "parameters_covariance",
+    "weight_trace",
+    "residual",
+    "tile_map",
+)
+_SCORES = _OUTPUTS[2:4]
+"""The score arrays a calibration store may hold."""
+_UNWRITTEN = frozenset(_OUTPUTS[5:])
+"""The outputs wo-4.0 accepted and wrote none of: accepted here, with no effect."""
+
+type OutputName = Annotated[str, _available(*_OUTPUTS)]
+"""An output of ``outputs``. The reconstruction is always written; the score arrays go into the calibration store,
+which always holds the parameters."""
 
 
 def _default_outputs() -> list[OutputName]:
@@ -815,51 +902,120 @@ class V4Config(V4BaseModel):
         free = free_parameter_specs(self.imaging_system)
         if isinstance(self.object.prior, PriorBeads) and not free:
             raise field_error("object.prior", "beads requires a free imaging-system quantity (beads calibrate H)")
-        gaussian = self.noise.gaussian
-        if self.simulate is None and gaussian is not None and gaussian.snr_db is not None:
-            raise field_error(
-                "noise.gaussian.snr_db", "applies only with a simulate block; give the noise level as sigma"
-            )
         calibration = self.solver.calibration
         if calibration is not None and isinstance(self.solver.reconstruction, ReconstructionDistilled):
             raise field_error(
                 "solver.calibration",
                 "needs a physics solver: a distilled solve does not depend on the free quantities; remove it",
             )
-        if self.outputs != "all" and "reconstruction" not in self.outputs:
-            raise field_error(
-                "outputs",
-                "lists no reconstruction; leaving it out is not available in this version of WaveOrder: list it",
-            )
+        _warn_unexecuted(self)
         _check_scores(self)
         if calibration is None or not free:
             return self
-        advanced = calibration.advanced
-        if advanced is not None and advanced.optimizer is not None and "search" in calibration.model_fields_set:
-            raise field_error("solver.calibration.advanced.optimizer", "and search are both set; keep one")
         if calibration.score == "sharpness" and self.object.weight == "auto":
             raise field_error("object.weight", "auto needs a score that estimates the weight (gcv or evidence)")
+        _check_searches(calibration)
         quantities = free_parameter_specs(self.imaging_system, expand_shorthand=True)  # a grid axis per quantity
         for index, stage in enumerate(calibration.search):
             _check_stage(stage, field=f"solver.calibration.search.{index}", free=quantities)
         return self
 
 
+def _warn_unexecuted(config: V4Config) -> None:
+    """Warn of the settings wo-4.0 accepted that change nothing here (nor ran in wo-4.0), each at its path."""
+    gaussian, outputs = config.noise.gaussian, config.outputs
+    if config.simulate is None and gaussian is not None and gaussian.snr_db is not None:
+        no_effect("noise.gaussian.snr_db", gaussian.snr_db, "it sets the noise of a simulation; give sigma")
+    sigma = getattr(getattr(config.noise, config.noise.kind), "sigma", None)
+    if isinstance(sigma, DarkFrames):
+        no_effect(
+            f"noise.{config.noise.kind}.sigma.dark_frames",
+            sigma.dark_frames,
+            "this version reads no dark frames, and wo-4.0 ran none; sigma is 1, the default",
+        )
+    if isinstance(config.object.prior, PriorDenoiser):
+        no_effect(
+            "object.prior.denoiser",
+            config.object.prior.denoiser.checkpoint,
+            "this version has no denoiser prior, and wo-4.0 ran none; the object is reconstructed with prior none",
+        )
+    source = config.object.source
+    if isinstance(source, SourcePhantom | SourceFromRecon):
+        ((name, _),) = source.model_dump().items()
+        no_effect(f"object.source.{name}", name, "a simulation draws the gaussian_spectrum object, as wo-4.0 did")
+    if config.solver.padding.yx not in (0, (0, 0)):
+        no_effect("solver.padding.yx", config.solver.padding.yx, "yx padding is not in this version; nothing is padded")
+    if outputs == "all":
+        return
+    if "reconstruction" not in outputs:
+        no_effect("outputs", outputs, "the reconstruction is always written")
+    for index, name in enumerate(outputs):
+        if name in _UNWRITTEN:
+            no_effect(f"outputs.{index}", name, "this version does not write it, and neither did wo-4.0")
+
+
 def _check_scores(config: V4Config) -> None:
-    """Refuse score arrays for a field-tiled calibration, and a score grid for a search without a grid stage."""
+    """Warn of score arrays a field-tiled calibration does not keep, and of a score grid with no grid to write."""
     outputs, calibration = config.outputs, config.solver.calibration
-    scores = [] if outputs == "all" else [name for name in outputs if name.startswith("score_")]
-    if scores and isinstance(config.imaging_system.field_dependence, FieldDependenceTiled):
-        raise field_error("outputs", f"{scores[0]}: a field-tiled calibration keeps no score arrays; remove it")
+    scores = [] if outputs == "all" else [(index, name) for index, name in enumerate(outputs) if name in _SCORES]
+    if isinstance(config.imaging_system.field_dependence, FieldDependenceTiled):
+        for index, name in scores:
+            no_effect(f"outputs.{index}", name, "a field-tiled calibration keeps no score arrays")
+        return
     grids = calibration is not None and (
-        any(isinstance(stage, SearchGrid) for stage in calibration.search)
-        or (calibration.advanced is not None and calibration.advanced.optimizer == "grid_search")
+        calibration.advanced is not None and calibration.advanced.optimizer == "grid_search"
+        if calibration.optimizer_drives
+        else any(isinstance(stage, SearchGrid) for stage in calibration.search)
     )
-    if "score_grid" in scores and not grids:
-        raise field_error(
-            "outputs",
-            "score_grid needs a grid stage in solver.calibration.search (or advanced.optimizer: grid_search), "
-            "which this search has not; remove it or add one",
+    for index, name in scores:
+        if name == "score_grid" and not grids:
+            no_effect(
+                f"outputs.{index}",
+                name,
+                "the calibration runs no grid (a grid stage in solver.calibration.search, or advanced.optimizer: "
+                "grid_search under score sharpness), so there is none to write",
+            )
+
+
+def _check_searches(calibration: Calibration) -> None:
+    """Warn of the search settings no stage reads: wo-4.0 wrote ``advanced.optimizer`` beside ``search``.
+
+    Under score sharpness the optimizer is the search, and reads only the ``max_iter`` of a lone gradient stage; under
+    evidence and gcv the search stages run and the optimizer is read by nothing, as in wo-4.0.
+    """
+    at = "solver.calibration"
+    if calibration.final_estimate != "best_H":
+        no_effect(f"{at}.final_estimate", calibration.final_estimate, "only best_H runs, as in wo-4.0")
+    for index, stage in enumerate(calibration.search):
+        if isinstance(stage, SearchGradient) and stage.gradient.method != "split":
+            no_effect(f"{at}.search.{index}.gradient.method", stage.gradient.method, "only split runs, as in wo-4.0")
+    optimizer = None if calibration.advanced is None else calibration.advanced.optimizer
+    if optimizer is None:
+        return
+    gradients = [stage.gradient for stage in calibration.search if isinstance(stage, SearchGradient)]
+    if not calibration.optimizer_drives:
+        if not gradients or any(gradient.optimizer != optimizer for gradient in gradients):
+            no_effect(
+                f"{at}.advanced.optimizer",
+                optimizer,
+                f"with score {calibration.score} the stages of {at}.search run, as in wo-4.0; it drives only a "
+                "sharpness calibration",
+            )
+        return
+    if calibration.budget is None:
+        no_effect(
+            f"{at}.search",
+            [next(iter(stage.model_dump())) for stage in calibration.search],
+            "advanced.optimizer drives a sharpness calibration, as in wo-4.0, and reads only the max_iter of a "
+            "lone gradient stage",
+        )
+        return
+    (gradient,) = gradients
+    if "optimizer" in gradient.model_fields_set and gradient.optimizer != optimizer:
+        no_effect(
+            f"{at}.search.0.gradient.optimizer",
+            gradient.optimizer,
+            f"advanced.optimizer ({optimizer}) drives a sharpness calibration, as in wo-4.0",
         )
 
 

@@ -5,7 +5,7 @@ import torch
 import yaml
 
 from waveorder.config import V4Config
-from waveorder.errors import Rejected
+from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import FISTA, CalibrationResult, Sampling, Score, Wiener
 from waveorder.nn.scores import (
@@ -182,6 +182,12 @@ def test_a_loss_setting_with_no_4x_meaning_is_refused_at_its_key(loss, location)
     assert _refusal(_raw(score="sharpness", loss=loss)).startswith(f"{location}: ")
 
 
-def test_a_loss_with_a_score_that_does_not_read_it_is_refused():
-    message = _refusal(_raw(score="evidence", loss={"type": "total_variation"}))
-    assert message == "solver.calibration.advanced.loss: is a sharpness setting, and score is evidence; remove it"
+def test_a_loss_with_a_score_that_does_not_read_it_has_no_effect():
+    with pytest.warns(ConfigurationWarning) as caught:
+        ReconstructionModel.from_config(_raw(score="evidence", loss={"type": "total_variation"}))
+    (warning,) = [warning.message for warning in caught]
+    assert isinstance(warning, ConfigurationWarning)
+    assert (warning.location, str(warning)) == (
+        "solver.calibration.advanced.loss",
+        "{'type': 'total_variation'} has no effect: it is a sharpness setting, and score is evidence; remove it",
+    )
