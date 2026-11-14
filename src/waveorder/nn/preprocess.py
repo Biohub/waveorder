@@ -221,8 +221,9 @@ class ZPadding:
     """Mirrored edge slices added at both ends of z before a solve, and cropped from the estimate after it.
 
     A shift-invariant inverse treats the stack as periodic along z, so an object that reaches an end slice wraps into
-    the other. Padding mirrors ``p`` edge slices at each end; the solve runs on ``Z + 2p`` slices and the central
-    ``Z`` of the estimate are kept. 3.x: ``z_padding``; config: ``solver.padding.z``::
+    the other. Padding mirrors ``p`` edge slices at each end (zeros instead when ``p >= Z``, as 3.x did); the solve runs
+    on ``Z + 2p`` slices and the central ``Z`` of the estimate are kept. 3.x: ``z_padding``; config:
+    ``solver.padding.z``::
 
         padding = ZPadding(4)
         result = padding.crop(Wiener()(padding.pad(data), model, padding.sampling(sampling)))
@@ -248,12 +249,14 @@ class ZPadding:
             raise ParameterError(f"ZPadding slices must be at least 0, got {self.slices}", path="slices")
 
     def pad(self, data: Tensor) -> Tensor:
-        """Return ``data``, ``(..., Z, Y, X)``, extended to ``(..., Z + 2p, Y, X)`` by its mirrored edge slices.
+        """Return ``data``, ``(..., Z, Y, X)``, extended to ``(..., Z + 2p, Y, X)``: mirrored edge slices if ``p < Z``.
+
+        With ``p >= Z`` there are not enough slices to mirror, and zeros are added instead (3.x ``pad_zyx_along_z``).
 
         Raises
         ------
         ShapeError
-            If ``data`` has fewer than three dimensions or at most ``p`` slices.
+            If ``data`` has fewer than three dimensions.
         """
         where = "ZPadding.pad"
         if data.ndim < 3:
@@ -262,7 +265,8 @@ class ZPadding:
         if p == 0:
             return data
         if data.shape[-3] <= p:
-            raise ShapeError(f"{where} needs more than {p} slices to mirror {p} at each end, got {data.shape[-3]}")
+            zeros = data.new_zeros((*data.shape[:-3], p, *data.shape[-2:]))
+            return torch.cat((zeros, data, zeros), dim=-3)
         return torch.cat((data[..., :p, :, :].flip(-3), data, data[..., -p:, :, :].flip(-3)), dim=-3)
 
     def sampling(self, sampling: Sampling) -> Sampling:

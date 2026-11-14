@@ -23,7 +23,6 @@ from waveorder.nn import (
     Tikhonov,
     Wiener,
 )
-from waveorder.nn.functional import hermitian_half
 from waveorder.nn.optics import Illumination, IlluminationTilt
 from waveorder.nn.preprocess import Focus, TransverseBand, ZPadding, brightfield_contrast, focus_from_transverse_band
 from waveorder.nn.systems.phase import ThickPhase3D, ThinPhase2D
@@ -237,14 +236,16 @@ def test_focus_checks_its_arguments_at_their_path() -> None:
 # --- z padding ------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("slices", [0, 1, 3, 5])
+@pytest.mark.parametrize("slices", [0, 1, 3, 5, 6, 9], ids=["none", "1", "3", "5", "6-zeros", "9-zeros"])
 def test_pad_is_3x_pad_zyx_along_z(slices) -> None:
+    # 3.x mirrors the edge slices while the pad is shorter than the stack (6 slices), and pads zeros from 6 on.
     data = _stack((2, 6, 5, 4), seed=7)
     padding = ZPadding(slices)
     padded = padding.pad(data)
     assert padded.shape == (2, 6 + 2 * slices, 5, 4)
     for channel in range(2):
         assert torch.equal(padded[channel], legacy_phase.pad_along_z(data[channel], slices))
+    assert torch.equal(padding.crop(SolveResult(padded, torch.tensor(0.0), 0, "direct")).estimate, data)
     sampling = Sampling(shape=(6, 5, 4), pixel_size=(0.4, 0.1, 0.2))
     assert padding.sampling(sampling) == Sampling(shape=(6 + 2 * slices, 5, 4), pixel_size=(0.4, 0.1, 0.2))
 
@@ -254,9 +255,7 @@ def test_pad_is_differentiable() -> None:
     assert torch.autograd.gradcheck(ZPadding(2).pad, (data,))
 
 
-def test_pad_rejects_a_pad_as_long_as_the_stack_and_a_negative_pad() -> None:
-    with pytest.raises(ShapeError, match="more than 4 slices"):
-        ZPadding(4).pad(torch.ones(1, 4, 3, 3))
+def test_pad_rejects_data_without_z_and_a_negative_pad() -> None:
     with pytest.raises(ShapeError, match=r"\(\.\.\., Z, Y, X\)"):
         ZPadding(1).pad(torch.ones(4, 3))
     with pytest.raises(ParameterError) as error:
@@ -336,15 +335,18 @@ def test_padded_thick_tikhonov_reconstruction_matches_unmodified_3x(slices) -> N
 
 
 def _stored_half(full: Tensor, nx: int) -> Tensor:
-    """A 3.x full transfer as the 4.x operator stores it: half columns, real pairs, Hermitian-projected."""
-    return hermitian_half(torch.view_as_real(full[..., : nx // 2 + 1].contiguous()), nx)
+    """A 3.x full transfer as its operator ``real(ifftn(H F))`` sees it: the half of its Hermitian part, real pairs."""
+    dims = (-3, -2, -1)
+    hermitian = 0.5 * (full + torch.roll(torch.flip(full, dims), (1, 1, 1), dims).conj())
+    return torch.view_as_real(hermitian[..., : nx // 2 + 1].contiguous())
 
 
 def test_padded_transfer_differs_from_3x_where_3x_oversampled_z() -> None:
     """With z oversampled (by 2 at a 1 um step), 3.x computed the padded transfer on ``2 Z + 2p`` fine slices (the pad
     not oversampled) and cropped ``Z + 2p`` frequencies, whose spacing is then not the padded grid's. 4.x binds the
     padded sampling, so its transfer is the 3.x transfer of a ``Z + 2p`` stack. Measured at 8 x 16 x 15 voxels of
-    (1.0, 0.15, 0.15) um, p = 3: 3.x's padded transfer differs by 53.9% (phase) and 31.7% (absorption)."""
+    (1.0, 0.15, 0.15) um, p = 3, as each operator applies it: 3.x's padded transfer differs by 50.3% (phase) and 31.7%
+    (absorption)."""
     pixel_size = (1.0, 0.15, 0.15)
     system = _thick_phase(zenith=0.0, absorption="independent")
     transfer = system.transfer(ZPadding(3).sampling(Sampling(shape=(8, 16, 15), pixel_size=pixel_size)))
@@ -352,7 +354,7 @@ def test_padded_transfer_differs_from_3x_where_3x_oversampled_z() -> None:
     assert _relative(transfer[0, 0], _stored_half(real_tf, 15)) <= 1e-10
     assert _relative(transfer[0, 1], _stored_half(imag_tf, 15)) <= 1e-10
     real_3x, imag_3x = _transfer_3x((8, 16, 15), pixel_size, zenith=0.0, z_padding=3)
-    assert _relative(transfer[0, 0], _stored_half(real_3x, 15)) == pytest.approx(0.539, abs=5e-3)
+    assert _relative(transfer[0, 0], _stored_half(real_3x, 15)) == pytest.approx(0.503, abs=5e-3)
     assert _relative(transfer[0, 1], _stored_half(imag_3x, 15)) == pytest.approx(0.317, abs=5e-3)
 
 
