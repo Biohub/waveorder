@@ -1,0 +1,65 @@
+# Written by hand in the form #592 (origin/feat/wo4-config-calibrate, 761d726) emits: waveorder/config/migrate.py
+# migrate_3x_dict then v4_to_yaml_text on the 3.x phase_3d.yml example with
+# numerical_aperture_illumination: {init: 0.9, lr: 0.01} and optimization: {method: adam, max_iterations: 10}.
+version: 4
+data:
+  input_channel_names:
+  - Brightfield
+  time_indices: all
+  pixel_size:
+    yx:
+      y: 0.1
+      x: 0.1
+    z: 0.25
+imaging_system:
+  contrast: phase
+  field_dependence: shift_invariant
+  index_of_refraction_media: 1.3
+  detection:
+    numerical_aperture: 1.2
+    pinhole: none
+    z_focus_offset: 0.0
+  illumination:
+    wavelength: 0.532
+    numerical_aperture:
+      nominal: 0.9
+      tolerance: free
+    tilt:
+      zenith: 0.0
+      azimuth: 0.0
+    invert_phase_contrast: false
+object:
+  dimension: 3
+  prior: tikhonov
+  weight: 0.001
+  constraints: []
+noise:
+  gaussian:
+    sigma: 1.0
+solver:
+  padding:
+    z: 0
+    yx: 0
+  reconstruction: closed_form
+  calibration:
+    score: sharpness
+    search:
+    - gradient:
+        max_iter: 10
+        method: split
+    final_estimate: best_H
+    advanced:
+      optimizer: adam
+      learning_rates:
+        illumination.numerical_aperture: 0.01
+      convergence_patience: 5
+      grid_points: 7
+      loss:
+        type: midband_power
+        midband_fractions:
+        - 0.125
+        - 0.25
+  apodization_rolloff: 0.0
+outputs:
+- reconstruction
+- transfer_function
