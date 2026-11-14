@@ -1,0 +1,38 @@
+# WaveOrder 4 configuration: fluorophore density of a thick object from a widefield or confocal stack.
+# Check it with `wo config check FILE`; print it with every default filled in with `wo config show FILE`.
+# Any number under imaging_system except the wavelengths and the refractive index may be calibrated: write
+# {nominal: 1.2, tolerance: 0.05, bounds: [1.0, 1.3]} instead of 1.2. wo calibrate-tf and wo rec then estimate it,
+# by the evidence with the default search; calibration: {score: ..., search: [...]} under solver chooses others.
+version: 4
+
+data:
+  input_channel_names: [GFP]              # the one fluorescence channel of the input
+  time_indices: all                       # all, one index, or a list such as [0, 1, 5]
+  pixel_size: {z: 0.25, y: 0.1, x: 0.1}   # voxel size in micrometers, per axis
+
+imaging_system:
+  contrast: fluorescence
+  index_of_refraction_media: 1.3          # refractive index of the imaging medium
+  detection:
+    wavelength: 0.532                     # emission, micrometers
+    numerical_aperture: 1.2               # detection objective
+    z_focus_offset: 0.0                   # slices; every slice is its own reference: translates the estimate along z
+    pinhole: none                         # none (widefield), point, or {diameter_au: 1.0} / {diameter_um: 0.5}
+                                          # diameter_um is in the object plane: physical diameter / magnification
+
+object:
+  dimension: 3                            # 2 for a thin object (a single plane)
+  prior: tikhonov
+  weight: 0.001                           # regularization strength
+
+noise:
+  gaussian: {sigma: 1.0}                  # noise standard deviation, in the units of the data
+                                          # or poisson: {} with reconstruction: richardson_lucy and prior: none
+
+solver:
+  padding: {z: 0}                         # z: slices mirrored against axial boundary artifacts; auto: n*wavelength/NA^2
+  reconstruction: closed_form             # or {fista: {iterations: 50}}
+  apodization_rolloff: 0.0                # closed_form only: fraction of the yx band rolled off to Nyquist; 0 is none
+  device: null                            # null is cpu; cuda, cuda:1, mps or auto
+
+outputs: [reconstruction, transfer_function]
