@@ -1,7 +1,7 @@
 """``reconstruct_positions``: the checks, the output plate, the units, resume and the report."""
 
 import re
-from typing import Any
+from typing import Any, Literal
 
 import iohub
 import pytest
@@ -467,10 +467,10 @@ def test_a_read_that_fails_inside_the_tile_loader_is_a_read_error_too(tmp_path, 
     assert failed.error_type == "ReadError"
 
 
-def _single_store(path, volume: torch.Tensor):
+def _single_store(path, volume: torch.Tensor, version: Literal["0.4", "0.5"] = "0.5"):
     """Write a single-position store (no plate lists it) of one time point at ``path``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with iohub.open_ome_zarr(path, layout="fov", mode="w-", channel_names=["BF"]) as position:
+    with iohub.open_ome_zarr(path, layout="fov", mode="w-", channel_names=["BF"], version=version) as position:
         position.create_image("0", series(volume, 1)[:, None].to(torch.float32).numpy())
         for axis, size in zip("zyx", PIXEL_SIZE, strict=True):
             position.set_scale("0", axis, size)
@@ -714,6 +714,25 @@ def test_v04_plates_keep_their_version_and_refuse_tiles(plate, tmp_path):
         assert node.version == "0.4"
         assert [name for name, _ in node.positions()] == ["A/1/0", "A/1/1"]
     assert read_output(output, "A/1/1")[1].abs().max() > 0
+
+
+def test_a_new_output_keeps_the_version_of_the_first_input(tmp_path, volume):
+    old = tmp_path / "old.zarr"
+    write_plate(old, [series(volume, 1)], version="0.4")
+    new = tmp_path / "new.zarr"
+    write_plate(new, [series(volume, 1)])
+    single = _single_store(tmp_path / "single.zarr", volume, version="0.4")
+    model = phase_model()
+    cases = [(old, "plate.zarr", "0.4"), (new, "plate5.zarr", "0.5"), (single, "single.out.zarr", "0.4")]
+    for source, name, version in cases:
+        model.reconstruct_positions(source, output=tmp_path / name, channels=["BF"])
+        with iohub.open_ome_zarr(tmp_path / name, mode="r") as node:
+            assert node.version == version
+    model.reconstruct_positions(new, output=tmp_path / "plate.zarr", channels=["BF"], overwrite=True)
+    with iohub.open_ome_zarr(tmp_path / "plate.zarr", mode="r") as node:
+        assert node.version == "0.5"  # a replaced store is new: its version is the input's, not the old store's
+    with pytest.raises(Rejected, match=r"v0\.4 outputs have no shards"):
+        _plan(model, old, output=tmp_path / "tiled.zarr", channels=["BF"], tile=(8, 16, 16))  # a v0.4 output too
 
 
 def _failing_at(monkeypatch, time: int, error: BaseException | None = None, position: str = "") -> None:

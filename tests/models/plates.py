@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Unpack
+from typing import Literal, Unpack
 
 import iohub
 import torch
@@ -65,10 +65,11 @@ def write_plate(
     *,
     channel: str = "BF",
     pixel_size: tuple[float, float, float] = PIXEL_SIZE,
+    version: Literal["0.4", "0.5"] = "0.5",
 ) -> list[Path]:
-    """Write one position per ``(T, Z, Y, X)`` tensor (``A/1/0``, ``A/1/1``, ...); return their paths."""
+    """Write one position per ``(T, Z, Y, X)`` tensor (``A/1/0``, ``A/1/1``, ...) as a ``version`` plate."""
     paths = []
-    with iohub.open_ome_zarr(path, layout="hcs", mode="w-", channel_names=[channel]) as plate:
+    with iohub.open_ome_zarr(path, layout="hcs", mode="w-", channel_names=[channel], version=version) as plate:
         plate.zattrs["acquisition"] = {"microscope": "test"}
         for index, volume in enumerate(positions):
             position = plate.create_position("A", "1", str(index))

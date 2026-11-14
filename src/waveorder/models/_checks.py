@@ -146,7 +146,7 @@ class Plan:
     """What :func:`check_positions` decided: what is read, how it reconstructs and what is written.
 
     ``pixel_sizes``, ``times`` and ``grids`` are by position name; ``version`` is an existing plate's OME-Zarr
-    version, else 0.5; ``replaces`` deletes an existing store first.
+    version, else iohub's ``version`` of the first input; ``replaces`` deletes an existing store first.
     """
 
     output: Path
@@ -176,7 +176,7 @@ def check_positions(model: ReconstructionModel, arguments: Arguments, *, problem
     output = Path(arguments.output).absolute()
     plan = Plan(
         output=output,
-        version=DEFAULT_VERSION,
+        version=metas[0].version if metas else DEFAULT_VERSION,
         creates=not output.exists(),
         replaces=arguments.overwrite and output.exists(),
         positions=tuple(metas),
@@ -473,6 +473,6 @@ def _output(plan: Plan, arguments: Arguments, *, problems: Problems) -> None:
     if plan.version == "0.4" and any(grid.tiles is not None for grid in plan.grids.values()):
         problems.add(
             f"v0.4 outputs have no shards, so the tile merger cannot give each tile row blocks of its own: drop "
-            f"{named('tile')} and field tiles, or write to a new output",
+            f"{named('tile')} and field tiles, or write to a new output from v0.5 inputs",
             str(plan.output),
         )
