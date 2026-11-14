@@ -120,6 +120,14 @@ def test_the_yx_padding_wo_40_writes_loads_and_any_other_is_refused_at_its_key()
     assert problem.message == ("solver.padding.yx: 4 is not available in this version of WaveOrder; use 0 or (0, 0)")
 
 
+def test_wo_40_richardson_lucy_stopping_tolerance_is_the_tolerance():
+    raw = yaml.safe_load(V4_TEXT)
+    wo40 = dump(load(raw | {"solver": {"reconstruction": {"richardson_lucy": {"stopping_tolerance": 1e-3}}}}))
+    ours = dump(load(raw | {"solver": {"reconstruction": {"richardson_lucy": {"tolerance": 1e-3}}}}))
+    assert wo40 == ours
+    assert ours["solver"]["reconstruction"]["richardson_lucy"]["tolerance"] == 1e-3
+
+
 @pytest.mark.parametrize(
     ("written", "expected"),
     [
@@ -146,6 +154,9 @@ def test_a_wo40_pixel_size_loads_with_a_warning_naming_the_migration(tmp_path):
         loaded = load(path)
     assert loaded.data.pixel_size == PixelSize(z=0.5, y=0.1, x=0.1)
     assert str(got[0].message).endswith(f"convert it with: wo config migrate {path}")
+    raw["data"]["pixel_size"] = {"z": 0.5, "yx": {"y": 0.1, "x": 0.2}}  # wo-4.0's {y, x} form of yx
+    with pytest.warns(ConfigurationWarning, match="as wo-4.0 writes it"):
+        assert load(raw).data.pixel_size == PixelSize(z=0.5, y=0.1, x=0.2)
     raw["data"]["pixel_size"] = {"z": -1, "yx": 0.1}
     size, *_, migrate = _problems(raw)
     assert size.message.startswith("data.pixel_size.z: ")

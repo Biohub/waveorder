@@ -25,6 +25,7 @@ from typing import Annotated, Any, Literal, LiteralString, Self, cast
 
 from pydantic import (
     AfterValidator,
+    AliasChoices,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -210,12 +211,17 @@ class PixelSize(V4BaseModel):
 
 
 def _pixel_size(value: object) -> object:
-    """Read the forms of ``data.pixel_size``: one number (isotropic), ``{z, yx}`` or ``{z, y, x}``."""
+    """Read the forms of ``data.pixel_size``: one number (isotropic), ``{z, yx}`` or ``{z, y, x}``.
+
+    wo-4.0's ``yx`` is one number or a ``{y, x}`` mapping.
+    """
     if isinstance(value, int | float) and not isinstance(value, bool):
         return {"z": value, "y": value, "x": value}
     if isinstance(value, dict) and "yx" in value:
         rest = {key: item for key, item in value.items() if key != "yx"}
-        return {**rest, "y": value["yx"], "x": value["yx"]}
+        yx = value["yx"]
+        y, x = (yx.get("y"), yx.get("x")) if isinstance(yx, dict) else (yx, yx)
+        return {**rest, "y": y, "x": x}
     return value
 
 
@@ -520,6 +526,11 @@ class RichardsonLucyReconstruction(LoopOptions):
     bp_beta: PositiveFiniteFloat | None = None
     gradient_consensus: bool = Field(default=False, description="the 3.x RLGC variant")
     start: Literal["mean", "ones"] = Field(default="mean", description="first estimate; ones is the 3.x start")
+    tolerance: PositiveFiniteFloat | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tolerance", "stopping_tolerance"),
+        description="stop at this relative change; stopping_tolerance is wo-4.0's name",
+    )
 
 
 class DistilledReconstruction(V4BaseModel):
@@ -662,11 +673,24 @@ class CalibrationAdvanced(V4BaseModel):
         default_factory=dict, description="gradient step size per quantity path under imaging_system"
     )
     convergence_tol: PositiveFiniteFloat | None = Field(default=None, description="3.x nelder_mead tolerance")
-    convergence_patience: Annotated[Count | None, _available(None)] = Field(default=None, description="not available")
-    use_gradients: Annotated[bool | None, _available(None)] = Field(default=None, description="not available")
+    convergence_patience: Count | None = Field(default=None, description="wo-4.0's; accepted and not executed")
+    use_gradients: bool | None = Field(default=None, description="wo-4.0's; accepted and not executed")
     grid_points: GridPoints | None = Field(default=None, description="3.x grid_search points")
     loss: dict[str, Any] | None = Field(default=None, description="3.x sharpness loss: type and parameters")
-    log_dir: Annotated[str | None, _available(None)] = Field(default=None, description="not available")
+    log_dir: str | None = Field(default=None, description="wo-4.0's TensorBoard folder; accepted and not written")
+
+    @model_validator(mode="after")
+    def _warn_ignored(self) -> Self:
+        for name in ("convergence_patience", "use_gradients", "log_dir"):
+            if getattr(self, name) is not None:
+                warnings.warn(
+                    ConfigurationWarning(
+                        f"{getattr(self, name)!r} is ignored: this version of WaveOrder does not execute it; remove it",
+                        field=f"solver.calibration.advanced.{name}",
+                    ),
+                    stacklevel=4,
+                )
+        return self
 
 
 def _default_search() -> list[SearchStageSettings]:

@@ -6,7 +6,7 @@ import yaml
 
 from waveorder.config import V4Config
 from waveorder.config.build import build
-from waveorder.errors import Rejected
+from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import CalibrationResult, GradientSearch, GridSearch, LBFGSSearch, Sampling, load_parameters
 from waveorder.nn.search import NelderMeadSearch
@@ -110,15 +110,24 @@ def test_the_3x_optimizer_names_the_search(advanced, kind, attributes):
             "solver.calibration.advanced.convergence_tol",
         ),
         ({"advanced": {"optimizer": "grid_search", "grid_points": 1}}, "solver.calibration.advanced.grid_points"),
-        (
-            {"advanced": {"optimizer": "adam", "convergence_patience": 3}},
-            "solver.calibration.advanced.convergence_patience",
-        ),
     ],
-    ids=["two_searches", "tol_not_read", "points_not_read", "negative_tol", "one_point", "patience"],
+    ids=["two_searches", "tol_not_read", "points_not_read", "negative_tol", "one_point"],
 )
 def test_a_3x_optimizer_setting_it_cannot_honour_is_refused_at_its_key(calibration, location):
     with pytest.raises(Rejected) as rejected:
         ReconstructionModel.from_config(_raw(**calibration))
     (problem,) = rejected.value.problems
     assert problem.message.startswith(f"{location}: ")
+
+
+def test_the_wo_40_optimizer_settings_this_version_does_not_execute_are_accepted_with_a_located_warning():
+    ignored = {"convergence_patience": 5, "use_gradients": True, "log_dir": "logs"}
+    with pytest.warns(ConfigurationWarning) as caught:
+        model = ReconstructionModel.from_config(_raw(advanced={"optimizer": "adam", **ignored}))
+    located = [warning.message for warning in caught if isinstance(warning.message, ConfigurationWarning)]
+    assert len(located) == len(caught)
+    assert sorted(warning.location or "" for warning in located) == [
+        f"solver.calibration.advanced.{name}" for name in sorted(ignored)
+    ]
+    assert all("is ignored" in str(warning) for warning in located)
+    assert model.search == ReconstructionModel.from_config(_raw(advanced={"optimizer": "adam"})).search
