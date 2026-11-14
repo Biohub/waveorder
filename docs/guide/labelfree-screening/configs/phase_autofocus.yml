@@ -1,0 +1,14 @@
+input_channel_names: [BF]
+reconstruction_dimension: 2
+phase:
+  transfer_function:
+    yx_pixel_size: 0.325
+    z_pixel_size: 2.0
+    wavelength_illumination: 0.450
+    index_of_refraction_media: 1.0
+    numerical_aperture_detection: 0.55
+    numerical_aperture_illumination: 0.4
+    invert_phase_contrast: false
+    z_focus_offset: auto
+  apply_inverse:
+    regularization_strength: 0.001

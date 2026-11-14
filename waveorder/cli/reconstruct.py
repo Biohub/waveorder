@@ -35,6 +35,12 @@ def _reconstruct_cli(
     If any parameter has an `lr` key (OptimizableFloat), an optimization loop
     runs before the standard reconstruction pipeline.
 
+    If `z_focus_offset` is 'auto' (bare, or as an `init`), the in-focus slice is
+    found with a per-slice search over a 3D reconstruction of the first
+    position, and the resolved settings are written alongside the config. As
+    `{init: auto, lr: 0.05}`, the searched slice seeds the optimization loop,
+    which refines it to sub-slice precision.
+
     If `apply_inverse` has an `auto_regularization` block, `regularization_strength`
     is chosen from the data after the transfer function is computed, and the
     resolved settings are written alongside the config.
@@ -57,6 +63,12 @@ def _reconstruct_cli(
     from waveorder.optim import has_optimizable_params
 
     settings = utils.yaml_to_model(config_filepath, ReconstructionSettings)
+
+    # Resolve z_focus_offset: 'auto' before anything consumes the offset (the
+    # optimizer needs a numeric init and the transfer function a numeric
+    # offset), and freeze the resolved value into a sibling config.
+    if _has_auto_z_focus_offset(settings):
+        config_filepath = _run_auto_z_focus_offset(settings, input_position_dirpaths[0], config_filepath)
 
     # Check for optimizable parameters and run optimization if needed
     if has_optimizable_params(settings):
@@ -109,6 +121,55 @@ def _reconstruct_cli(
         write_config_scale_to_output,
         resume,
     )
+
+
+def _has_auto_z_focus_offset(settings) -> bool:
+    """Whether the phase block asks for an automatic focus-offset search.
+
+    3D reconstructions do not use a focus offset, so 'auto' is left for the
+    API to warn about and drop.
+    """
+    from waveorder.api import phase
+
+    return (
+        settings.phase is not None
+        and settings.reconstruction_dimension == 2
+        and phase._z_focus_offset_is_auto(settings.phase.transfer_function)
+    )
+
+
+def _run_auto_z_focus_offset(settings, input_position_dirpath, config_filepath):
+    """Resolve z_focus_offset from the data, then freeze it into a sibling config.
+
+    Returns the path of the resolved config, which the rest of the pipeline uses.
+    """
+    # Deferred imports for the same reason as above
+    from iohub.ngff import open_ome_zarr
+
+    from waveorder.api import phase
+    from waveorder.cli.printing import echo_headline
+    from waveorder.cli.utils import resolve_time_indices
+    from waveorder.io import utils
+
+    echo_headline("\nResolving z_focus_offset with a per-slice focus search...")
+
+    input_dataset = open_ome_zarr(input_position_dirpath, layout="fov", mode="r")
+    try:
+        t_idx = resolve_time_indices(settings.time_indices, input_dataset.data.shape[0])[0]
+        czyx = input_dataset.to_xarray().isel(t=t_idx).sel(c=settings.input_channel_names)
+    finally:
+        input_dataset.close()
+
+    settings.phase = phase.resolve_z_focus_offset(czyx, settings.phase, device=settings.device)
+
+    offset = settings.phase.transfer_function.z_focus_offset
+    typer.echo(typer.style(f"    z_focus_offset = {float(offset):g} (slice units), t={t_idx}", fg="green"))
+
+    resolved_path = config_filepath.parent / (config_filepath.stem + "_autofocus.yml")
+    utils.model_to_yaml(settings, resolved_path)
+    print(f"Auto-focus settings saved to {resolved_path}")
+
+    return resolved_path
 
 
 def _run_optimization(settings, input_position_dirpath, config_filepath):

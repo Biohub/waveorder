@@ -10,6 +10,7 @@ User Guides
 
     guide/QLIPP
     guide/data-schema
+    guide/labelfree-screening/labelfree-screening
     guide/buyers-guide
     guide/microscope-installation-guide
     guide/software-installation-guide

@@ -287,9 +287,18 @@ def _optimize_gradient(
                 if torch.isnan(loss) or torch.isnan(recon).any():
                     raise ValueError("NaN in reconstruction or loss")
 
+                # These parameters produced a finite reconstruction, so they
+                # are safe to roll back to. Checkpointing after the step
+                # would save unvalidated values: a degenerate SVD gradient
+                # can step parameters to non-finite values, and rolling back
+                # to those crashes the final reconstruction.
+                last_good = {name: t.detach().clone() for name, t in param_tensors.items()}
+
                 if use_gradients:
                     loss.backward()
                     optimizer.step()
+                    if any(not torch.isfinite(t).all() for t in param_tensors.values()):
+                        raise ValueError("non-finite parameters after optimizer step")
 
         except (RuntimeError, ValueError):
             # SVD convergence failure or NaN — revert to last good params
@@ -298,8 +307,10 @@ def _optimize_gradient(
                     t.copy_(last_good[name])
             break
 
-        # Checkpoint good params
-        last_good = {name: t.detach().clone() for name, t in param_tensors.items()}
+        # Checkpoint post-step parameters (the lbfgs closure validates them
+        # during the step) only when they are finite.
+        if method == "lbfgs" and all(torch.isfinite(t).all() for t in param_tensors.values()):
+            last_good = {name: t.detach().clone() for name, t in param_tensors.items()}
 
         wall_times.append(time.monotonic() - t_start)
         loss_val = loss.item()
