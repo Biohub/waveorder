@@ -1,10 +1,7 @@
 """Recorded data read as a model prepares it: the lazy view the tile methods wrap their sources in.
 
-A tile method reads its source block by block, so the model's ``prepare`` runs on each block as it is read
-(:class:`Prepared`). What that needs follows the class's ``prepare_scope``: nothing more for a ``prepare`` that acts
-voxel by voxel; the mean of the whole stack, computed once for the volume
-(:func:`stack_means`), for one that normalizes by it, so every block shares one normalization; and a single block
-per volume for one whose result depends on the block it is given.
+What a block needs follows the class's ``prepare_scope``: nothing more for ``"voxel"``, the mean of the whole stack
+(computed once, :func:`stack_means`) for ``"stack_mean"``, and a single block per volume for ``"block"``.
 """
 
 import threading
@@ -24,14 +21,9 @@ _SLAB_VOXELS = 1 << 24
 class Prepared:
     """A recorded ``(C, Z, Y, X)`` or ``(Z, Y, X)`` source read as the model prepares it, for the tile loader.
 
-    Reads go to the source as they are, and each block is passed through the model's ``prepare`` on the host and
-    cast to the model's dtype. By the class's ``prepare_scope``:
-
-    * ``"voxel"``: nothing else is read, and the chunk shape is the source's, so the loader decodes each chunk once;
-    * ``"stack_mean"``: the per-channel means of the whole stack are computed once, at the first read
-      (:func:`stack_means`), and every block is prepared with them; the chunk shape is the source's;
-    * ``"block"``: the view declares no chunks, so a tile is read and prepared in one block (the tile methods refuse
-      a plan of several tiles before they build the view).
+    Each block read passes through the model's ``prepare`` on the host and is cast to the model's dtype. For
+    ``"voxel"`` and ``"stack_mean"`` the chunk shape is the source's, so the loader decodes each chunk once; for
+    ``"block"`` the view declares no chunks, so a tile is read and prepared in one block.
 
     Parameters
     ----------
@@ -39,15 +31,6 @@ class Prepared:
         The recorded data: anything with ``shape`` and numpy-style slicing.
     model : ReconstructionModel
         The model whose ``prepare`` turns recorded data into what its system measures.
-
-    Attributes
-    ----------
-    shape : tuple[int, ...]
-        The source's shape.
-    dtype : torch.dtype
-        The dtype blocks are returned in: the model's.
-    scope : {"voxel", "stack_mean", "block"}
-        The scope of the model's ``prepare``.
     """
 
     def __init__(self, source: ArrayLike, *, model: ReconstructionModel) -> None:
@@ -95,8 +78,7 @@ class Prepared:
 def stack_means(source: ArrayLike) -> Tensor:
     """Return each channel's mean over ``(Z, Y, X)`` of a ``(C, Z, Y, X)`` or ``(Z, Y, X)`` source, ``(C,)`` in float64.
 
-    The source is read slab by slab along z (one chunk of z at a time when it declares chunks) and summed in float64,
-    so a volume larger than memory is never held whole.
+    The source is read slab by slab along z and summed in float64, so it is never held whole.
     """
     *lead, z, y, x = (int(n) for n in source.shape)
     chunks = getattr(source, "chunks", None)

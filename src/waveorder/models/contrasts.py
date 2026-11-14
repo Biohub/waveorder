@@ -1,11 +1,8 @@
 """The models of each contrast: brightfield phase and fluorescence, for a thick and a thin object.
 
-:class:`Phase3D` and :class:`Phase2D` image brightfield phase, :class:`Fluorescence3D` and :class:`Fluorescence2D`
-fluorescence.
-
-The phase models turn recorded brightfield intensities into the contrast ``I / mean(I) - 1`` the phase systems
-measure, as 3.x normalized them: :class:`Phase3D` by the mean of the whole (z-padded) stack, :class:`Phase2D` plane
-by plane. Recorded fluorescence is what the fluorescence systems measure, so it is reconstructed as recorded.
+The phase models turn recorded intensities into the contrast ``I / mean(I) - 1`` their systems measure, as 3.x
+normalized them: :class:`Phase3D` by the mean of the whole (z-padded) stack, :class:`Phase2D` plane by plane. The
+fluorescence models reconstruct the data as recorded.
 """
 
 from collections.abc import Sequence
@@ -34,9 +31,13 @@ from waveorder.nn.parameters import placement
 class Phase3D(ReconstructionModel):
     """Phase of a thick object from a brightfield stack (:class:`~waveorder.nn.ThickPhase3D`).
 
-    The object is the ``phase`` field of each voxel, ``(1, Z, Y, X)``, or phase and absorption with
-    ``absorption="independent"``. The recorded stack is divided by its mean and 1 is subtracted
-    (:meth:`prepare`); the default solver is the closed-form Wiener filter, the 3.x Tikhonov reconstruction::
+    The object is the ``phase`` field ``(1, Z, Y, X)``, or ``phase`` and ``absorption`` with
+    ``absorption="independent"``. :meth:`prepare` turns the stack into the contrast ``I / mean(I) - 1``, so a Gaussian
+    noise ``sigma`` is a fraction of the mean intensity (0.01 is 1 %). The estimate is a scattering potential in
+    um^-2, not radians as :class:`Phase2D` returns: times ``dz * wavelength / (4 pi n_media)`` (lengths in um) it is
+    the phase delay of one voxel in radians. The model is the weak-object (first Born) approximation, which holds
+    while the contrast stays well below 1. The default solver is the Wiener filter (3.x: the Tikhonov
+    reconstruction)::
 
         model = Phase3D(
             Illumination(wavelength=0.532, numerical_aperture=0.5),
@@ -44,19 +45,6 @@ class Phase3D(ReconstructionModel):
             index_of_refraction_media=1.33,
         )
         phase = model.reconstruct(stack, pixel_size=(0.25, 0.1, 0.1)).estimate
-
-    Units and assumptions. The data the system measures is the brightfield contrast ``I / mean(I) - 1``, a
-    fraction of the mean intensity, so a Gaussian noise ``sigma`` is a fraction too (0.01 is 1 % of the mean). The
-    estimate is the ``phase`` field of :class:`~waveorder.nn.ThickPhase3D`: a scattering potential in um^-2, not
-    a phase per voxel and not radians as :class:`Phase2D` returns. wo-4.0 returned the same numbers (its transfer
-    function is this one) but documented them as cycles per voxel. Multiply the estimate by
-    ``dz * wavelength / (4 pi n_media)`` for the phase delay across one voxel in radians (``dz`` the z voxel
-    size and ``wavelength`` in um, ``n_media`` the ``index_of_refraction_media``);
-    :meth:`waveorder.nn.ThickPhase3D.radians_per_voxel` returns the factor for a sampling, and its docstring says
-    how exact the conversion is. The model is the weak-object (first Born) approximation: the
-    contrast is linear in the object, which holds while the light the object scatters is weak against the
-    unscattered light (a contrast well below 1) and the mean of the stack stands for the unscattered intensity.
-    One wavelength and one refractive index of the medium are assumed.
 
     Parameters
     ----------
@@ -72,9 +60,8 @@ class Phase3D(ReconstructionModel):
         Absorption per unit phase (3.x ``absorption_ratio``, default 0: a pure phase object), or ``"independent"``
         for a second object field.
     **parts
-        The parts every model takes: ``object_prior``, ``noise``, ``solver``, ``score``, ``search``,
-        ``z_padding``, ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device``
-        (:class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
+        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -115,17 +102,17 @@ class Phase3D(ReconstructionModel):
     def prepare(self, data: Tensor, *, mean: Tensor | None = None) -> Tensor:
         """Return the contrast ``I / mean(I) - 1`` of recorded intensities, in the dtype the model computes in.
 
-        The mean is one per channel over the whole stack: :meth:`reconstruct` pads z before it prepares, so there
-        it is the mean of the z-padded stack, as 3.x normalized; the tile and position methods compute it once
-        for the volume and pass it with each block. Means are clamped at 1e-12.
+        The mean is one per channel over the whole stack: in :meth:`reconstruct` the z-padded stack, as 3.x
+        normalized; the tile and position methods compute it once per volume and pass it with each block. Means are
+        clamped at 1e-12.
 
         Parameters
         ----------
         data : Tensor
             Recorded intensities ``(C, Z, Y, X)``.
         mean : Tensor, optional
-            The mean of the whole stack per channel, ``(C,)`` (or one number), when ``data`` is only a part of it (a
-            tile); computed from ``data`` by default.
+            The mean of the whole stack per channel, ``(C,)`` or one number, when ``data`` is only a part of it;
+            computed from ``data`` by default.
         """
         data = data.to(dtype=placement(self.system)[0])  # in float32 for a float32 model, as 3.x normalized
         if mean is None:
@@ -144,18 +131,11 @@ class Phase3D(ReconstructionModel):
 class Phase2D(ReconstructionModel):
     """Phase and absorption of a thin object from a brightfield defocus stack (:class:`~waveorder.nn.ThinPhase2D`).
 
-    The object is one plane, ``(2, 1, Y, X)``: phase and absorption. Each recorded plane is divided by its own mean
-    and 1 is subtracted (:meth:`prepare`).
-
-    Units and assumptions. The data the system measures is the contrast ``I / mean(I) - 1`` of each plane, a
-    fraction of that plane's mean intensity, and a Gaussian noise ``sigma`` is such a fraction. The estimated
-    ``phase`` is in radians and ``absorption`` is the log of the amplitude transmittance, both as
-    :class:`~waveorder.nn.ThinPhase2D` defines them. The model is the weak-object approximation of a thin
-    object: the contrast is linear in phase and absorption, which holds while the scattered light is weak
-    against the unscattered light (a contrast well below 1) and the object is much thinner than the depth of
-    field, in a medium of one refractive index. Because every plane is normalized by its own mean, the result
-    of :meth:`prepare` depends on the block it is given (``prepare_scope = "block"``), so the model reconstructs
-    whole volumes: the tile methods refuse to split one.
+    The object is one plane ``(2, 1, Y, X)``: ``phase`` in radians and ``absorption``, the log of the amplitude
+    transmittance. :meth:`prepare` divides each plane by its own mean and subtracts 1, so a Gaussian noise ``sigma``
+    is a fraction of a plane's mean intensity. That result depends on the block it is given
+    (``prepare_scope = "block"``), so the tile methods refuse to split a volume. The model is the weak-object
+    approximation of an object much thinner than the depth of field.
 
     Parameters
     ----------
@@ -171,7 +151,8 @@ class Phase2D(ReconstructionModel):
         Defocus of each plane in um, in data order, for unevenly spaced stacks; by default the planes are evenly
         spaced around the centre slice.
     **parts
-        The parts every model takes (:class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
+        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -224,23 +205,12 @@ class Phase2D(ReconstructionModel):
 class Fluorescence3D(ReconstructionModel):
     """Fluorophore density of a thick object from a fluorescence stack, widefield or confocal.
 
-    Without a pinhole the system is :class:`~waveorder.nn.WidefieldFluorescence3D`; with a pinhole diameter it is
-    :class:`~waveorder.nn.ConfocalFluorescence3D`. The object is the density of each voxel, ``(1, Z, Y, X)``.
-
-    Units and assumptions. The data is reconstructed as recorded (:meth:`prepare` changes nothing), so a Gaussian
-    noise ``sigma`` is in the recorded values (camera counts), and a camera offset left in the data is
-    reconstructed as object. The transfer function passes the mean unchanged, so the estimated density is in the
-    units of the data: the recorded signal each voxel would give in focus. The image is linear in the density (no
-    saturation, bleaching or reabsorption), the point-spread function is the same over the field of view (see
-    ``field_tiles`` otherwise) and the medium has one refractive index. With a pinhole, the excitation
-    point-spread function is taken equal to the detection's, at the emission wavelength (the 3.x model): the
-    excitation wavelength and the Stokes shift do not enter, so the true confocal resolution is slightly better
-    than the model's when the excitation wavelength is shorter.
-
-    Background and calibration. The default object prior is Gaussian with zero mean, and :meth:`prepare` leaves
-    the data as recorded, so a background in the data (a camera offset, a constant haze) is an object the prior
-    does not expect. A calibration by the evidence then moves the free quantities to account for it. Subtract
-    the background from the data before calibrating by the evidence.
+    Without a pinhole the system is :class:`~waveorder.nn.WidefieldFluorescence3D`, with one
+    :class:`~waveorder.nn.ConfocalFluorescence3D`. The object is the density ``(1, Z, Y, X)``, in the units of the
+    data (the transfer function passes the mean unchanged). The data is reconstructed as recorded, so a Gaussian noise
+    ``sigma`` is in camera counts, and a background left in the data (a camera offset, a haze) is reconstructed as
+    object and biases a calibration by the evidence: subtract it first. The confocal excitation point-spread function
+    is taken equal to the detection's, at the emission wavelength (as in 3.x).
 
     Parameters
     ----------
@@ -249,16 +219,12 @@ class Fluorescence3D(ReconstructionModel):
     index_of_refraction_media : float
         Refractive index of the immersion and object medium.
     pinhole_diameter : float or Free, optional
-        Effective confocal pinhole diameter in um, in the object plane (the physical diameter divided by the
-        magnification; ``detection.pinhole.diameter_um`` in a configuration); ``0`` is a point pinhole. ``None``
-        (the default) is widefield detection. The pinhole factor is the 3.x squared jinc, not the transform of a
-        hard disk, which is the unsquared jinc: to second order a hard pinhole of diameter ``D`` acts like
-        ``pinhole_diameter = D / sqrt(2)``, so a calibrated value is about 0.71 times the true diameter (see
-        :class:`~waveorder.nn.ConfocalFluorescence3D`).
+        Effective pinhole diameter in um in the object plane (the physical diameter over the magnification;
+        ``detection.pinhole.diameter_um`` in a configuration); ``0`` is a point pinhole, ``None`` widefield. The
+        pinhole factor is the 3.x squared jinc, so a hard pinhole of diameter ``D`` acts like ``D / sqrt(2)``.
     **parts
-        The parts every model takes: ``object_prior``, ``noise``, ``solver``, ``score``, ``search``,
-        ``z_padding``, ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device``
-        (:class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
+        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -296,21 +262,11 @@ class Fluorescence3D(ReconstructionModel):
 class Fluorescence2D(ReconstructionModel):
     """Fluorophore density of a thin object from a defocus stack (:class:`~waveorder.nn.ThinFluorescence2D`).
 
-    The object is one plane, ``(1, 1, Y, X)``.
-
-    Units and assumptions. The data is reconstructed as recorded (:meth:`prepare` changes nothing), so a Gaussian
-    noise ``sigma`` is in the recorded values (camera counts), and the estimated density is in the units of the
-    data: each plane's transfer function passes the mean unchanged. The object is thin: all of the fluorescence
-    comes from one plane, much thinner than the depth of field, which every plane of the stack images at its own
-    defocus. There is no term for out-of-focus background: light from fluorophores above or below that plane,
-    and a camera offset left in the data, are reconstructed as density in the plane. The image is linear in the
-    density, the point-spread function is the same over the field of view, and the medium has one refractive
-    index. For a thick object use :class:`Fluorescence3D`.
-
-    Background and calibration. The default object prior is Gaussian with zero mean, and :meth:`prepare` leaves
-    the data as recorded, so a background in the data (a camera offset, out-of-focus light) is an object the
-    prior does not expect. A calibration by the evidence then moves the free quantities to account for it.
-    Subtract the background from the data before calibrating by the evidence.
+    The object is one plane ``(1, 1, Y, X)``, in the units of the data. The data is reconstructed as recorded, so a
+    Gaussian noise ``sigma`` is in camera counts. All of the fluorescence is taken to come from one plane, much
+    thinner than the depth of field: out-of-focus light and a camera offset are reconstructed as density in that
+    plane and bias a calibration by the evidence, so subtract the background first. For a thick object use
+    :class:`Fluorescence3D`.
 
     Parameters
     ----------
@@ -322,7 +278,8 @@ class Fluorescence2D(ReconstructionModel):
         Defocus of each plane in um, in data order, for unevenly spaced stacks; by default the planes are evenly
         spaced around the centre slice.
     **parts
-        The parts every model takes (:class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
+        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------

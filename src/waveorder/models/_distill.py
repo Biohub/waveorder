@@ -61,9 +61,9 @@ def distillation(  # noqa: PLR0913 (the model and the student, and one keyword p
 ) -> train.Distillation:
     """Return the task that trains ``student`` to give the estimates of the solver of ``model``.
 
-    ``model`` is the model the recorded targets were made with (the model the reconstructed plate was made with). It
-    supplies ``task.prepare``, the contract and the configuration the bundle records, and the student later runs in
-    it as its solver (``model.solver = Distilled(load_bundle(...))``). Its solver is not run.
+    ``model`` is the model the recorded targets were made with. It supplies ``task.prepare``, the contract and the
+    configuration the bundle records; its solver is not run. The trained student later runs in it as its solver
+    (``model.solver = Distilled(load_bundle(...))``).
 
     Parameters
     ----------
@@ -72,11 +72,10 @@ def distillation(  # noqa: PLR0913 (the model and the student, and one keyword p
     student : RestorationNetwork
         The network to train.
     pixel_size : sequence of three floats or PixelSize
-        Voxel size of the training data along z, y, x in micrometers; recorded in the contract.
+        Voxel size of the training data along z, y, x in um; recorded in the contract.
     fields : sequence of str, optional
-        The names of the model's object fields the target channels hold, in the order of the target channels: a
-        plate with the one channel ``Phase2D`` made by a ``Phase2D`` model, whose system has ``phase`` and
-        ``absorption``, is ``("phase",)``. By default the first ``student.fields`` names of the system's fields.
+        The model's object fields the target channels hold, in order (``("phase",)`` for a ``Phase2D`` target of a
+        system with ``phase`` and ``absorption``); by default the first ``student.fields`` of the system's fields.
     conditions, input_normalizer, target_normalizer, losses, transforms
         As :class:`waveorder.train.Distillation` takes them.
     planes : sequence of int, optional

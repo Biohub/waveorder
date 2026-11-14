@@ -1,10 +1,9 @@
 """Training a distilled model with Lightning: :class:`DistillationModule` and :class:`DistillCLI`.
 
-``wo distill fit|validate|test`` run :class:`DistillCLI`, Lightning's command line, on configuration files
-(``--config``, repeatable and layered), flags and ``--ckpt_path``; ``model.train`` builds the same configuration in
-Python and runs the same classes. A configuration names each part by its class: waveorder's own by their bare names
-(``StridedVolume``, ``L1``), any other by its import path. The resolved configuration the run folder keeps
-(``config.yaml``) and every bundle record full class paths, and absolute paths for the files read.
+``wo distill fit|validate|test`` run :class:`DistillCLI` on layered configuration files (``--config``), flags and
+``--ckpt_path``; ``model.train`` builds the same configuration in Python. A configuration names waveorder's classes by
+their bare names (``StridedVolume``, ``L1``) and any other by its import path; the saved ``config.yaml`` and every
+bundle record full class paths and absolute file paths.
 """
 
 import contextlib
@@ -53,11 +52,9 @@ TRAINER_DEFAULTS: dict[str, object] = {
 class DistillationModule(pl.LightningModule):
     """Train a student to give the estimates of a reconstruction model, from its recorded reconstructions.
 
-    It holds the task (:class:`waveorder.train.Distillation`) and its optimization: AdamW with the schedule, gradient
-    clipping and weight averaging of ``optimization``. Before training it checks the student's shape contract and
-    fits the normalizers on the train split (or copies matching tensors from ``init_from``); a resumed run takes
-    them from its checkpoint. Validation logs ``val/loss``, ``val/loss/<name>``, ``val/ssim`` and
-    ``val/dynamic_range``, each a weighted mean over every rank from float sums and counts; testing logs the same
+    Before training it checks the student's shape contract and fits the normalizers on the train split (or copies
+    matching tensors from ``init_from``); a resumed run takes them from its checkpoint. Validation logs ``val/loss``,
+    ``val/loss/<name>``, ``val/ssim`` and ``val/dynamic_range``, weighted means over every rank; testing logs the same
     under ``test/``.
 
     Parameters
@@ -448,11 +445,11 @@ _DESCRIPTIONS = {
 class DistillCLI(LightningCLI):
     """Lightning's command line for :class:`DistillationModule` and :class:`PatchDataModule`.
 
-    Over Lightning's own it adds: ``data.index`` linked to ``model.index`` and ``seed_everything`` to both seeds; the
-    files read and the loggers' folders made absolute, and the files checked, before the configuration is saved, so
-    a run folder runs again from any directory; one located line instead of the usage or a traceback for a mistake
-    in a configuration; the run's callbacks (the best and last bundles, the run record, ``last.ckpt`` every
-    ``checkpoint_every`` steps and a checkpoint on SIGTERM); and ``checkpoint_every``.
+    It links ``data.index`` to ``model.index`` and ``seed_everything`` to both seeds; makes the files read and the
+    loggers' folders absolute (and checks the files) before the configuration is saved, so a run folder runs again
+    from any directory; prints one located line for a mistake in a configuration; and adds ``checkpoint_every`` and
+    the run's callbacks (best and last bundles, the run record, ``last.ckpt`` every ``checkpoint_every`` steps and a
+    checkpoint on SIGTERM).
 
     Parameters
     ----------

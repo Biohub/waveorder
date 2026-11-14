@@ -1,10 +1,7 @@
 """The base of every user-facing model: an imaging model with the solver that inverts it.
 
-:class:`ReconstructionModel` wraps the torch modules of :mod:`waveorder.nn` (the :class:`~waveorder.nn.ImagingModel`
-of ``g = H f + n``, a solver, and the score and search that calibrate the free quantities) in one object with the
-verbs a user calls. This file holds the class and its verbs. The helpers of the other underscore files take the model
-first and import this class, so they are imported after it: at the end of this file, or, for the position methods
-(whose helpers import iohub), in the methods when they run.
+The helpers of the other underscore files take the model first and import this class, so they are imported at the end
+of this file, or, for the position methods (whose helpers import iohub), inside those methods.
 """
 
 import copy
@@ -112,76 +109,54 @@ class TrainResult[M]:
 class ReconstructionModel:
     """An imaging model with the solver that inverts it and the settings that calibrate it.
 
-    A plain Python class; the torch module tree is :attr:`imaging_model` (its parameters and state are the
-    model's). The verbs: :meth:`reconstruct` estimates the object, :meth:`calibrate` the free quantities (those
-    given as :class:`~waveorder.nn.Free`), :meth:`simulate` makes data, :meth:`train` distils the solver into a
-    network, :meth:`save`, :meth:`load` and :meth:`export` keep the model, :meth:`to` moves it. The tile methods do
-    the same on arrays too large for one solve, the position methods on OME-Zarr positions.
+    :meth:`reconstruct` estimates the object, :meth:`calibrate` the free quantities (those given as
+    :class:`~waveorder.nn.Free`), :meth:`simulate` makes data and :meth:`train` distils the solver into a network. The
+    tile methods do the same on arrays too large for one solve, the position methods on OME-Zarr positions. The torch
+    modules are :attr:`imaging_model`. The parts, :attr:`z_padding`, :attr:`field_tiles`, :attr:`tile_parameters` and
+    :attr:`pixel_size` may be assigned; the value is checked as at construction.
 
-    A calibration of the whole field writes its estimate into the free quantities; a calibration per tile never
-    does (:meth:`calibrate_tiles` returns its table, which :meth:`calibrate_position` keeps as
-    :attr:`tile_parameters` on a model with field tiles).
-
-    A modality subclasses it: it lists the systems it wraps in :attr:`system_types`, builds one in ``__init__``
-    and passes ``**parts: Unpack[Parts]`` on; it overrides :meth:`prepare` (with :attr:`prepare_scope`), the
-    ``default_*`` hooks and :meth:`output_channel_names` where the defaults do not fit. :meth:`for_system` and
-    :meth:`from_config` build the class around a system without calling its ``__init__``, so state beyond the
-    parts is set in :meth:`setup`.
+    A modality subclasses it: it lists the systems it wraps in the class attribute ``system_types`` (no two classes
+    list one type) and builds one in ``__init__``. It may override :meth:`prepare` (with the class attribute
+    ``prepare_scope``: ``"voxel"``, ``"stack_mean"`` or ``"block"``), the ``default_*`` hooks,
+    :meth:`output_channel_names` and :meth:`setup`, where state beyond the parts belongs: :meth:`for_system` and
+    :meth:`from_config` skip ``__init__``.
 
     Parameters
     ----------
     system : ImagingSystem
-        ``H`` and its free quantities. The model holds it, not a copy.
+        ``H`` and its free quantities; the model holds it, not a copy.
     object_prior : ObjectPrior, optional
-        ``p(f)``; by default :meth:`default_object_prior`, or :class:`~waveorder.nn.NoPrior` under a noise that
-        counts photons.
+        ``p(f)``; by default :meth:`default_object_prior`, or :class:`~waveorder.nn.NoPrior` under noise that counts
+        photons.
     noise : Noise, optional
         ``p(n)``; by default :meth:`default_noise`.
     solver : Solver, optional
-        The reconstruction; by default :meth:`default_solver`, which follows the parts as they are assigned. A
-        given solver is checked against the parts (a :class:`~waveorder.nn.Distilled` one also against the system
-        its network was trained for).
+        The reconstruction; by default :meth:`default_solver`, which follows the parts as they change. A given solver is
+        checked against the parts, and a :class:`~waveorder.nn.Distilled` one against the system it was trained for.
     score : Score, optional
-        The calibration objective; :class:`~waveorder.nn.Evidence` by default. A sharpness score given without its
-        solver and cutoff is filled with the model's.
+        The calibration objective; :class:`~waveorder.nn.Evidence` by default. A sharpness score is filled with the
+        model's solver and cutoff.
     search : Sequence[SearchStage], optional
         The calibration stages, in order; by default those of :func:`~waveorder.nn.calibrate`.
     z_padding : int or "auto"
-        Mirrored z slices added around each solve; the estimate keeps the measured slices. ``"auto"`` pads each
-        volume by at least the axial extent of the point-spread function (:meth:`z_padding_for`).
+        Mirrored z slices added at each end before a solve and cropped after; ``"auto"`` pads by at least the axial
+        extent of the point-spread function (:meth:`z_padding_for`).
     field_tiles : FieldTiles, optional
-        The tiles of a system that varies over the field of view; such a model is calibrated and reconstructed per
-        tile (the tile and position methods), and :meth:`reconstruct` and :meth:`calibrate` refuse it.
+        Tiles of a system that varies over the field of view; such a model works per tile (the tile and position
+        methods), and :meth:`reconstruct` and :meth:`calibrate` refuse it.
     pixel_size : float, (z, yx), (z, y, x), {"z", "y", "x"} or "auto", optional
-        Voxel size of the data in um (:data:`~waveorder.models._arguments.PixelSize`; the mappings as the
-        configuration's ``data.pixel_size``). Every method that takes data uses it unless given another for that call;
-        ``None`` or ``"auto"`` leaves it to the data: the position methods read each position's scale, the methods
-        on tensors refuse.
+        Voxel size in um (the mapping as ``data.pixel_size``), used unless a call gives one. ``None`` or ``"auto"``:
+        the position methods read each position's scale, the methods on tensors refuse.
     apodization_rolloff : float
         Fraction of the transverse band over which a Wiener estimate is rolled off to Nyquist
         (:func:`~waveorder.nn.preprocess.apodize`); 0 for none.
     device : str or torch.device, optional
         Where the model lives: ``None`` is where ``system`` is, ``"auto"`` the first of CUDA, MPS and CPU.
 
-    Attributes
-    ----------
-    system_types : tuple[type[ImagingSystem], ...]
-        The systems this class wraps (class attribute); :meth:`for_system` and :meth:`from_config` return the class
-        that lists a system's type. No two classes list the same type.
-    prepare_scope : {"voxel", "stack_mean", "block"}
-        What :meth:`prepare` reads to prepare one voxel (class attribute): only it, also the stack's mean (given as
-        ``mean`` to tiled work), or the whole block (a volume is then never split into tiles). A class that
-        defines ``prepare`` defines it beside it.
-
-    Notes
-    -----
-    The parts, :attr:`z_padding`, :attr:`field_tiles`, :attr:`tile_parameters` and :attr:`pixel_size` may be
-    assigned: the value is checked and moved to the model, as if the model had been built with it.
-
     Raises
     ------
     ParameterError
-        If an argument is not of its type or ``system`` is not one of :attr:`system_types`.
+        If an argument is not of its type or ``system`` is not one of ``system_types``.
     ConfigurationError
         At ``device`` if no such device is available; at ``system`` for the base class given a system another
         class wraps.
@@ -270,9 +245,16 @@ class ReconstructionModel:
     def for_system(cls, system: ImagingSystem, **parts: Unpack[Parts]) -> Self:
         """Build the model of a system you already have, as an instance of the class that wraps it.
 
-        The class is the one whose :attr:`system_types` list the system's type (else one it is an instance of,
-        else the class this is called on). Its ``__init__`` is not called; :meth:`setup` is. The system is taken,
-        not copied: two models of one system share its values and its placement.
+        The class is the one whose ``system_types`` list the system's type (else one it is an instance of, else
+        ``cls``). Its ``__init__`` is skipped; :meth:`setup` runs. The system is held, not copied: two models of one
+        system share its values and its placement.
+
+        Parameters
+        ----------
+        system : ImagingSystem
+            ``H`` and its free quantities.
+        **parts
+            The parts, as :class:`ReconstructionModel` takes them.
         """
         expect_instance(system, ImagingSystem, where=f"{cls.__name__}.for_system", name="system")
         found = _model_class(system)
@@ -499,8 +481,7 @@ class ReconstructionModel:
     def tile_parameters(self) -> dict[str, Tensor] | None:
         """Per-field-tile values of the free quantities, ``{name: (tiles, ...)}``, which tiled solves use.
 
-        Set by :meth:`load_calibration`, by :meth:`calibrate_position` on a model with field tiles, or assigned
-        (``model.calibrate_tiles(...).parameters``).
+        Set by :meth:`load_calibration`, by :meth:`calibrate_position` with field tiles, or assigned.
         """
         return self._tile_parameters
 
@@ -512,10 +493,7 @@ class ReconstructionModel:
 
     @property
     def z_padding(self) -> ZPaddingSetting:
-        """Mirrored z slices added around each solve, or ``"auto"`` (``model.z_padding = 0`` to calibrate unpadded).
-
-        :meth:`z_padding_for` gives the slices of a volume.
-        """
+        """Mirrored z slices added at each end before a solve, or ``"auto"``; :meth:`z_padding_for` resolves it."""
         return self._z_padding
 
     @z_padding.setter
@@ -532,10 +510,16 @@ class ReconstructionModel:
     def z_padding_for(self, shape: ZYX[int], *, pixel_size: PixelSize | None = None) -> int:
         """Return the z slices mirrored at each end of a volume of ``shape`` (z, y, x) before a solve.
 
-        An integer :attr:`z_padding` is that integer. ``"auto"`` is at least the axial extent of the point-spread
-        function, ``n * wavelength / NA**2`` (the medium's index, the detection's wavelength and nominal numerical
-        aperture), in whole z voxels rounded up, then the fewest more slices that make the padded stack a fast FFT
-        length (no prime factor above 7). ``pixel_size`` is as :meth:`reconstruct` takes it.
+        An integer :attr:`z_padding` is returned as is. ``"auto"`` is the axial extent ``n * wavelength / NA**2`` (the
+        medium's index, the detection's wavelength and nominal numerical aperture) in whole z voxels, rounded up, then
+        the fewest more slices that make the padded stack a fast FFT length (no prime factor above 7).
+
+        Parameters
+        ----------
+        shape : tuple[int, int, int]
+            The volume ``(Z, Y, X)``.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
 
         Raises
         ------
@@ -647,8 +631,8 @@ class ReconstructionModel:
     def prepare(self, data: Tensor, *, mean: Tensor | None = None) -> Tensor:
         """Turn recorded data ``(C, Z, Y, X)`` into what the system measures; the base class returns it as recorded.
 
-        ``mean`` is the per-channel mean of the whole stack, given by tiled work to a class whose
-        :attr:`prepare_scope` is ``"stack_mean"``.
+        ``mean`` is the per-channel mean of the whole stack, which tiled work passes when ``prepare_scope`` is
+        ``"stack_mean"``.
         """
         del mean
         return data
@@ -663,7 +647,14 @@ class ReconstructionModel:
     def to(self, device: str | torch.device | None = None, dtype: torch.dtype | None = None) -> Self:
         """Move the model (its modules and :attr:`tile_parameters`) to ``device`` and ``dtype``; return it.
 
-        ``dtype`` is float32 or float64; fixed quantities are filled again from the numbers they were given as.
+        Fixed quantities are filled again from the numbers they were given as.
+
+        Parameters
+        ----------
+        device : str or torch.device, optional
+            The target device; by default the current one.
+        dtype : torch.dtype, optional
+            ``torch.float32`` or ``torch.float64``; by default the current one.
         """
         where = f"{type(self).__name__}.to"
         if isinstance(device, torch.dtype):
@@ -684,11 +675,17 @@ class ReconstructionModel:
         return self
 
     def check(self, shape: ZYX[int], *, pixel_size: PixelSize | None = None, calibration: bool = False) -> None:
-        """Raise if the model cannot run on a volume of ``shape`` (z, y, x), before data is read.
+        """Raise if the model cannot run on a volume of ``shape`` (z, y, x), before any data is read.
 
-        ``calibration=True`` checks what :meth:`calibrate` needs: a free quantity and a score that can judge the
-        model; otherwise what :meth:`reconstruct` needs, which a :class:`~waveorder.nn.priors.Beads` object prior (a
-        calibration prior) does not have. ``pixel_size`` is as :meth:`reconstruct` takes it.
+        Parameters
+        ----------
+        shape : tuple[int, int, int]
+            The volume ``(Z, Y, X)``.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
+        calibration : bool
+            Check what :meth:`calibrate` needs (a free quantity, a score that can judge the model) instead of what
+            :meth:`reconstruct` needs (which a :class:`~waveorder.nn.priors.Beads` object prior lacks).
         """
         where = f"{type(self).__name__}.check"
         size = self._size(pixel_size, where)
@@ -733,7 +730,7 @@ class ReconstructionModel:
         ------
         ParameterError
             If ``data`` is no array, or no voxel size is known: set ``data.pixel_size`` in the configuration or
-            pass ``pixel_size`` to the constructor.
+            pass ``pixel_size``.
         ShapeError
             If ``data`` is complex or not shaped as the system measures.
         ConfigurationError
@@ -773,41 +770,43 @@ class ReconstructionModel:
         prepared: bool = False,
         history: bool = False,
     ) -> CalibrationResult | BeadCalibration:
-        """Estimate the free quantities from recorded data with the model's score and search; updates the model.
+        """Estimate the free quantities from recorded data with the model's score and search; the model takes them.
 
-        The search starts at the model's current values; ``data``, ``pixel_size`` and ``prepared`` are as
-        :meth:`reconstruct` takes them. Parts that start from the data (``Gaussian(sigma="estimate")``) set their
-        start and bounds before the prior is built. Before a :class:`~waveorder.nn.search.sweep.WeightSweep` stage
-        the recorded data is cropped to its most structured 256-pixel square (:func:`~waveorder.nn.preprocess.
-        most_structured_crop`), then padded and prepared alone, as wo-4.0 normalized its crop by the crop's own mean.
-        A :class:`~waveorder.nn.priors.Beads` object prior is calibrated by
-        :func:`~waveorder.nn.search.beads.calibrate_beads`, which returns the beads too.
-
-        A likelihood score (the evidence) compares the data with the noise and the object prior, so both must be in
-        the units of the data after :meth:`prepare`; defaults and z padding bias it, and are warned about.
+        The search starts at the model's current values; parts that start from the data
+        (``Gaussian(sigma="estimate")``) set their start and bounds first. Before a
+        :class:`~waveorder.nn.search.sweep.WeightSweep` stage the data is cropped to its most structured 256-pixel
+        square, which is padded and prepared alone. A :class:`~waveorder.nn.priors.Beads` object prior is fitted by
+        :func:`~waveorder.nn.search.beads.calibrate_beads`. A likelihood score (the evidence) needs the noise and the
+        object prior in the units of the data after :meth:`prepare`; a default part or z padding biases it and is
+        warned about (``CalibrationWarning``).
 
         Parameters
         ----------
+        data : array-like
+            The recorded data ``(C, Z, Y, X)``, or ``(Z, Y, X)`` for one channel, in any real dtype.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um for this call; by default the model's :attr:`pixel_size`.
         prior : ParameterPrior or TfStore, optional
-            Prior over the free quantities; a calibration store's values become the prior centres. By default the
-            one the quantities' tolerances declare.
+            Prior over the free quantities; a store's values become the prior centres. By default the prior the
+            quantities' tolerances declare.
+        prepared : bool
+            The data is already what the system measures, so :meth:`prepare` is skipped.
         history : bool
-            Also return what the stages saw: the objective at each gradient step, the last grid over every free
-            quantity, and a weight sweep's result with the crop it scored (:class:`~waveorder.nn.CalibrationResult`).
-            A bead calibration always returns its trace.
+            Also return the objective at each gradient step, the last grid over the free quantities, and a weight
+            sweep's result with its crop. A bead calibration always returns its trace.
+
+        Returns
+        -------
+        CalibrationResult or BeadCalibration
+            The estimates; a bead calibration also returns the beads.
 
         Raises
         ------
         ParameterError
-            As :meth:`reconstruct`; if the model has no free quantity.
+            As :meth:`reconstruct`; if the model has no free quantity, or a ``prior`` is given with a Beads prior.
         ConfigurationError
-            For a model with :attr:`field_tiles`; a bead calibration of a model that is no fluorescence model, has
-            no Gaussian noise, or searches by other stages than one gradient search.
-
-        Warns
-        -----
-        CalibrationWarning
-            If a likelihood score meets a default noise or object prior (:attr:`defaulted`), or z padding.
+            For a model with :attr:`field_tiles`; for a bead calibration of a system that is no 3D fluorescence
+            system, without Gaussian noise, or with other stages than one gradient search.
         """
         where = f"{type(self).__name__}.calibrate"
         recorded, sampling = self._recorded(where, data, pixel_size)
@@ -863,7 +862,7 @@ class ReconstructionModel:
                 part.start_from(data)
 
     def _expect_beads(self, prior: object, *, where: str) -> None:
-        """Refuse a bead calibration the bead fit cannot run, with wo-4.0's reasons."""
+        """Refuse a bead calibration the bead fit cannot run."""
         if not isinstance(self.system, WidefieldFluorescence3D):  # confocal included: it subclasses widefield
             raise self._refused(
                 "imaging_system.contrast",
@@ -897,34 +896,35 @@ class ReconstructionModel:
         seed: int | torch.Generator | None = None,
         pixel_size: PixelSize | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """Return data ``H f + n`` that the model's imaging model gives for an object, and the object.
+        """Return data ``H f + n`` for an object, and the object.
 
         Without ``obj`` the object is a zero-mean, unit-variance Gaussian random field of power spectrum
-        ``(|k|^2 + k0^2)^(-exponent/2)`` per field (``k`` in cycles per voxel, ``k0 = 1 / max(shape)``; the exponent
-        of the configuration's ``object.source.gaussian_spectrum``, else 2). The noise is the model's, or, from a
-        configuration with a ``simulate`` block, Gaussian at ``noise.gaussian.snr_db`` below the clean data's
-        standard deviation, or Poisson of ``noise.poisson.photons`` mean counts of the clean data shifted to 0. The
-        draws come from one CPU generator: object, then noise.
+        ``(|k|^2 + k0^2)^(-exponent/2)`` per field (``k`` in cycles per voxel, ``k0 = 1 / max(shape)``, the exponent
+        from the configuration's ``object.source.gaussian_spectrum``, else 2). The noise is the model's or, from a
+        configuration with a ``simulate`` block, Gaussian ``noise.gaussian.snr_db`` below the clean data's standard
+        deviation, or Poisson with ``noise.poisson.photons`` mean counts of the clean data shifted to a minimum of 0.
+        Object, then noise, are drawn from one CPU generator.
 
         Parameters
         ----------
         obj : Tensor, optional
             The object ``(F, Z, Y, X)`` in the units of the system's object.
         shape : tuple[int, int, int], optional
-            The data grid ``(Z, Y, X)`` of a drawn object; by default the configuration's ``simulate.shape``.
+            The data grid ``(Z, Y, X)`` of a drawn object, by default the configuration's ``simulate.shape``; with
+            ``obj``, only its Z is read (the object's Z by default).
         noise : bool
             Draw the noise; without it the data is ``H f``.
         seed : int or torch.Generator, optional
             Seed of the draws, or the generator to draw from; by default the configuration's ``simulate.seed``,
             else a fresh seed.
         pixel_size : float, (z, yx) or (z, y, x), optional
-            As :meth:`reconstruct` takes it.
+            Voxel size in um; by default the model's :attr:`pixel_size`.
 
         Returns
         -------
         tuple[Tensor, Tensor]
-            The data ``(C, Z, Y, X)`` as the system measures it (no :meth:`prepare` inverse) and the object
-            ``(F, Z', Y, X)``, both on the model's device in its dtype.
+            The data ``(C, Z, Y, X)`` as the system measures it (the inverse of :meth:`prepare` is not applied) and
+            the object ``(F, Z', Y, X)``, both on the model's device in its dtype.
         """
         where = f"{type(self).__name__}.simulate"
         config = self.config
@@ -980,12 +980,9 @@ class ReconstructionModel:
     ) -> TrainResult[Self]:
         """Distil the model's solver into a network on recorded pairs; return the run and a model that runs it.
 
-        A thin wrapper over ``wo distill fit``: the model is written to ``out/model``, the configuration a file
-        would hold is built from the arguments, and :class:`~waveorder.models.DistillCLI` builds the same
-        :class:`~waveorder.models.DistillationModule`, :class:`~waveorder.train.lightning.PatchDataModule` and
-        trainer the command does. The run folder is the command's: ``config.yaml``, ``run.json``, ``best/``,
-        ``last/`` and ``checkpoints/``. The model is not changed; ``result.model`` is a copy whose solver is the
-        trained :class:`~waveorder.nn.Distilled` network.
+        Runs what ``wo distill fit`` runs (:class:`~waveorder.models.DistillCLI`) on the configuration the arguments
+        describe, with the model written to ``out/model``. The run folder holds ``config.yaml``, ``run.json``,
+        ``best/``, ``last/`` and ``checkpoints/``. The model is not changed.
 
         Parameters
         ----------
@@ -1006,6 +1003,12 @@ class ReconstructionModel:
         module, data, trainer : Mapping, optional
             Any other argument of the ``model``, ``data`` and ``trainer`` blocks of a configuration, by name; a part
             may be given as an object (``{"losses": {"l1": L1(), "ssim": SSIM(window=7)}}``).
+
+        Returns
+        -------
+        TrainResult
+            The bundle, the last metrics, the run folder and a copy of the model whose solver is the trained
+            :class:`~waveorder.nn.Distilled` network.
 
         Raises
         ------
@@ -1061,7 +1064,12 @@ class ReconstructionModel:
         )
 
     def export(self, path: str | Path) -> Path:
-        """Write the network of a model whose solver is a network as an ONNX file (:func:`waveorder.train.export_onnx`).
+        """Write the solver's network as an ONNX file (:func:`waveorder.train.export_onnx`); return the file.
+
+        Parameters
+        ----------
+        path : str or Path
+            The ONNX file to write.
 
         Raises
         ------
@@ -1086,9 +1094,16 @@ class ReconstructionModel:
     ) -> TilePlan:
         """Plan tiles of a ``(Z, Y, X)`` volume, with the halo that keeps 99 % of the solver's filter per axis.
 
-        ``tile`` is the voxel count of a tile core and ``overlap`` the voxels each core is widened by and cross-faded
-        with its neighbours; ``pixel_size`` is as :meth:`reconstruct` takes it. The halo is computed at the sampling of
-        one tile's read region.
+        Parameters
+        ----------
+        shape : tuple[int, int, int]
+            The volume ``(Z, Y, X)``.
+        tile : tuple[int, int, int]
+            Voxels of a tile core along z, y and x.
+        overlap : tuple[int, int, int]
+            Voxels each core is widened by and cross-faded with its neighbours.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
         """
         where = f"{type(self).__name__}.tile_plan"
         size = _arguments.pixel_size(pixel_size, where=where, default=self.pixel_size)
@@ -1132,11 +1147,31 @@ class ReconstructionModel:
     ) -> TileCalibration:
         """Calibrate the free quantities on every tile of ``plan`` independently; the model does not take the estimates.
 
-        ``source`` is any array with ``shape`` and numpy slicing, read tile by tile through :meth:`prepare`.
-        ``start`` holds per-tile start values ``{name: (tiles,)}``, ``chunk_size`` the tiles calibrated at once;
-        ``prior`` (one row, or one per tile), ``prepared`` and ``pixel_size`` are as :meth:`calibrate` takes them. As in
-        :meth:`calibrate`, parts that start from the data (``Gaussian(sigma="estimate")``) set their start and bounds
-        from all the tiles before the prior is built. Pass the result's ``parameters`` to :meth:`reconstruct_tiles`.
+        Each tile is read through :meth:`prepare` unless ``prepared``. Parts that start from the data
+        (``Gaussian(sigma="estimate")``) set their start and bounds from all the tiles first. The model's
+        :attr:`z_padding` must be 0.
+
+        Parameters
+        ----------
+        source : array-like
+            The recorded ``(C, Z, Y, X)`` data: any array with ``shape`` and numpy slicing.
+        plan : TilePlan
+            The tiles, from :meth:`tile_plan` or :meth:`field_tile_plan`.
+        start : dict[str, Tensor], optional
+            Per-tile start values ``{name: (tiles,)}``; quantities not listed start at the model's value.
+        chunk_size : int, optional
+            Tiles calibrated at once, bounding memory; all by default.
+        prior : ParameterPrior or TfStore, optional
+            As :meth:`calibrate` takes it, with one row or one per tile.
+        prepared : bool
+            The source is already what the system measures.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
+
+        Returns
+        -------
+        TileCalibration
+            The estimates per tile; pass its ``parameters`` to :meth:`reconstruct_tiles`.
         """
         where = f"{type(self).__name__}.calibrate_tiles"
         pixel_size = _arguments.pixel_size(pixel_size, where=where, default=self.pixel_size)
@@ -1180,10 +1215,24 @@ class ReconstructionModel:
     ) -> TileStats:
         """Reconstruct volumes too large for one solve, tile by tile; return the time spent on each step.
 
-        ``volumes`` are ``(source, sink)`` pairs, one per volume: the recorded ``(C, Z, Y, X)`` array and the array
-        that receives the ``(F, Z, Y, X)`` estimate. ``options`` are the loader's settings, ``parameters`` per-tile
-        values (by default the model's :attr:`tile_parameters` on a model with field tiles). A z-padded model reads
-        each source with its mirrored slices and crops each estimate back, as a whole stack is padded.
+        A z-padded model reads each source with its mirrored slices and crops each estimate back, so its tiles must
+        span z.
+
+        Parameters
+        ----------
+        volumes : sequence of (source, sink)
+            One pair per volume: the recorded ``(C, Z, Y, X)`` array and the array that receives the ``(F, Z, Y, X)``
+            estimate.
+        plan : TilePlan
+            The tiles, from :meth:`tile_plan` or :meth:`field_tile_plan`.
+        options : TileOptions, optional
+            The loader's settings.
+        parameters : TileParameters, optional
+            Per-tile values of the free quantities; by default :attr:`tile_parameters` on a model with field tiles.
+        prepared : bool
+            The sources are already what the system measures.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
         """
         where = f"{type(self).__name__}.reconstruct_tiles"
         pixel_size = _arguments.pixel_size(pixel_size, where=where, default=self.pixel_size)
@@ -1243,17 +1292,15 @@ class ReconstructionModel:
     ) -> ReconstructionReport:
         """Reconstruct the selected time points of OME-Zarr positions into an output plate, over the devices.
 
-        The unit of work is one (position, time). Every check runs first and all problems are raised together
-        (``Rejected``); then the plate is created and the units reconstructed with the model's current values (per
-        field tile with :attr:`tile_parameters`). A unit that fails raises ``ReconstructionFailed`` with the report
-        so far, unless ``keep_going``. iohub records each finished unit under a fingerprint of the reconstruction,
-        which ``resume`` skips.
+        The unit of work is one (position, time). Every check runs first and all problems are raised together; then
+        the plate is created and the units reconstructed with the model's current values (per field tile with
+        :attr:`tile_parameters`). iohub records each finished unit, which ``resume`` skips.
 
         Parameters
         ----------
         positions : str, Path, iohub Position or Plate, or a sequence of them
-            One OME-Zarr position, several, quoted globs, a plate, or open iohub nodes (a ``Plate`` stands for its
-            positions); each is opened read-only through iohub once, and the nodes given are left open.
+            One OME-Zarr position, several, quoted globs, a plate (its positions), or open iohub nodes, which are
+            left open.
         output : str or Path
             The output plate; never an input position or inside one.
         channels : Sequence[str]
@@ -1280,6 +1327,11 @@ class ReconstructionModel:
             Skip the units an interrupted run of the same reconstruction finished (iohub's progress record).
         write_pixel_size : bool
             Record the stated ``pixel_size`` as the output's scale instead of each input's.
+
+        Returns
+        -------
+        ReconstructionReport
+            The run's status and one result per unit.
 
         Raises
         ------
@@ -1348,15 +1400,27 @@ class ReconstructionModel:
         start: TfStore | str | Path | None = None,
         dry_run: bool = False,
     ) -> TfStore | None:
-        """Calibrate on one time point (``time``, the first by default) of a position; return the store, unsaved.
+        """Calibrate on one time point of a position; return the store of what it found, unsaved.
 
-        ``position`` takes what :meth:`reconstruct_positions` takes; the first position it names is calibrated, and
-        nodes the call opens are closed when it returns. ``channels`` and ``pixel_size`` are as
-        :meth:`reconstruct_positions` takes them. The model takes the estimates, or with field tiles the per-tile
-        table as :attr:`tile_parameters`. ``prior`` is a previous calibration (a store or its path) whose values
-        become the prior centres, ``start`` one whose values start the search; ``dry_run`` only checks and returns
-        ``None``. The store holds parameters only, no transfer function. Warns
-        (:class:`~waveorder.errors.StoreWarning`) of each quantity that ended on a bound.
+        The model takes the estimates, or with field tiles the per-tile table as :attr:`tile_parameters`. The store
+        holds the values only, no transfer function. A ``StoreWarning`` names each quantity that ended on a bound.
+
+        Parameters
+        ----------
+        position : str, Path, iohub Position or Plate, or a sequence of them
+            As :meth:`reconstruct_positions` takes it; the first position it names is calibrated.
+        channels : Sequence[str]
+            The input channel names, one per channel the system measures.
+        pixel_size : float, (z, yx), (z, y, x) or "auto", optional
+            As :meth:`reconstruct_positions` takes it.
+        time : int, optional
+            The absolute time index; the first by default.
+        prior : TfStore, str or Path, optional
+            A previous calibration (a store or its path) whose values become the prior centres.
+        start : TfStore, str or Path, optional
+            A previous calibration whose values start the search.
+        dry_run : bool
+            Run the checks only and return ``None``.
 
         Raises
         ------
@@ -1384,9 +1448,15 @@ class ReconstructionModel:
     def load_calibration(self, store: TfStore | str | Path) -> None:
         """Load a calibration store made for this model's imaging system.
 
-        Its row sets the free quantities; its rows per field tile, :attr:`tile_parameters`. A stored quantity the
-        model fixes outside the imaging system keeps the model's value, with a warning. Its transfer function on a
-        grid is then used instead of computed where it applies (an INFO line says where, and why not elsewhere).
+        The store's row sets the free quantities, or its rows per field tile set :attr:`tile_parameters`. A stored
+        quantity the model fixes outside the imaging system keeps the model's value, with a warning. The store's
+        transfer functions are used instead of computed on the grids they fit (an INFO log line says where, and why
+        not elsewhere).
+
+        Parameters
+        ----------
+        store : TfStore, str or Path
+            The store, or the path of a ``tf.zarr`` store.
 
         Raises
         ------
@@ -1418,9 +1488,16 @@ class ReconstructionModel:
     def to_tf_store(self, *, shapes: Sequence[ZYX[int]] = (), pixel_size: PixelSize | None = None) -> TfStore:
         """Return the current values of the free quantities as a store, with the transfer function on each shape.
 
-        Kind ``"nominal"`` when every free quantity is at its nominal value, else ``"parameters"``; one row, or one
-        per field tile. The transfer functions are on each shape after z padding (none for field tiles), for
-        :meth:`load_calibration`. A model with field tiles takes one shape, which places its tiles.
+        The store's kind is ``"nominal"`` when every free quantity is at its nominal value, else ``"parameters"``; it
+        has one row, or one per field tile. :meth:`load_calibration` reads it back.
+
+        Parameters
+        ----------
+        shapes : sequence of (z, y, x)
+            Volume shapes to store the transfer function on, after z padding. A model with field tiles takes exactly
+            one, which places its tiles, and stores no transfer function.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um; by default the model's :attr:`pixel_size`.
 
         Raises
         ------
@@ -1437,11 +1514,20 @@ class ReconstructionModel:
 
     @classmethod
     def from_config(cls, config: V4Config | Mapping[str, object] | str | Path) -> Self:
-        """Build the model a configuration (or its mapping, or its YAML path) describes, as the class of its system.
+        """Build the model a configuration describes, as the class that wraps its system.
 
-        ``data.pixel_size`` becomes the model's :attr:`pixel_size` and ``solver.apodization_rolloff`` its roll-off;
-        the ``calibrated`` block is loaded into the free quantities. The model keeps the configuration
-        (:attr:`config`). Problems are raised together, at their config paths (``Rejected``).
+        ``data.pixel_size`` becomes :attr:`pixel_size`, ``solver.apodization_rolloff`` :attr:`apodization_rolloff`,
+        and the ``calibrated`` block sets the free quantities. The model keeps the configuration (:attr:`config`).
+
+        Parameters
+        ----------
+        config : V4Config, mapping, str or Path
+            The configuration, its mapping, or the path of its YAML file.
+
+        Raises
+        ------
+        Rejected
+            With every problem, each at its config path.
         """
         return _config.from_config(cls, config)
 
@@ -1452,20 +1538,47 @@ class ReconstructionModel:
         pixel_size: PixelSize | None = None,
         times: Sequence[int] | int | None = None,
     ) -> V4Config | dict[str, object]:
-        """Return the configuration the model was built from with its ``calibrated`` block.
+        """Return the configuration the model was built from, with its ``calibrated`` block.
 
-        A model built in Python returns its description (each part as ``{name: arguments}``). The arguments replace
-        the ``data`` block.
+        A model built in Python returns its description instead (each part as ``{name: arguments}``).
+
+        Parameters
+        ----------
+        channels : Sequence[str], optional
+            Input channel names, written as ``data.input_channel_names``.
+        pixel_size : float, (z, yx) or (z, y, x), optional
+            Voxel size in um, written as ``data.pixel_size``; by default the model's :attr:`pixel_size`.
+        times : Sequence[int] or int, optional
+            Time indices, written as ``data.time_indices``.
         """
         return _config.to_config(self, channels=channels, pixel_size=pixel_size, times=times)
 
     def save(self, path: str | Path, *, overwrite: bool = False) -> Path:
-        """Write the model as a folder that :meth:`load` reads (``model.json``); return the folder."""
+        """Write the model as a folder that :meth:`load` reads (``model.json``); return the folder.
+
+        Parameters
+        ----------
+        path : str or Path
+            The folder.
+        overwrite : bool
+            Replace a model already saved there.
+
+        Raises
+        ------
+        Rejected
+            At ``path``, with nothing written, if it holds a saved model and ``overwrite`` is false, or is a file.
+        """
         return _config.save(self, path, overwrite=overwrite)
 
     @classmethod
     def load(cls, source: str | Path | Mapping[str, object]) -> Self:
-        """Return the model :meth:`save` wrote to a folder, or the one a description holds, on the CPU in float32."""
+        """Return the model :meth:`save` wrote, on the CPU in float32.
+
+        Parameters
+        ----------
+        source : str, Path or mapping
+            The saved folder, or a description (the content of its ``model.json``).
+        """
         return _config.load(cls, source)
 
     # --- shared machinery ------------------------------------------------------------------------------------------

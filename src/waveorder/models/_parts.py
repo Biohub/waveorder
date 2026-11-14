@@ -29,27 +29,24 @@ PREPARE_SCOPES: tuple[PrepareScope, ...] = ("voxel", "stack_mean", "block")
 class FieldTiles:
     """The tiles a shift-variant system is calibrated and reconstructed on, one parameter set per tile.
 
-    The settings of ``imaging_system.field_dependence: tiled``. Each tile spans the whole z extent. Within a tile
-    the system is treated as shift-invariant, and each tile is calibrated on its own: its values come from its own
-    data alone, with no smoothness across tiles, and the reconstructions of neighbouring tiles are cross-faded in
-    their overlap.
+    The settings of ``imaging_system.field_dependence: tiled``. Each tile spans z, is treated as shift-invariant and
+    is calibrated on its own data alone; neighbouring reconstructions are cross-faded in their overlap.
 
     Parameters
     ----------
     size_yx : tuple[int, int]
         Tile size in pixels along y and x.
     overlap_yx : tuple[int, int], optional
-        Pixels each tile is widened by on each side and cross-faded with its neighbours; at most half of
-        ``size_yx`` along each axis. By default 32 pixels, or half the tile where that is less
-        (``min(32, size // 2)`` per axis).
+        Pixels each tile is widened by on each side and cross-faded with its neighbours, at most half of ``size_yx``;
+        by default ``min(32, size // 2)`` per axis.
     blend : {"linear", "cosine"}
         The cross-fade in the overlaps.
 
     Raises
     ------
     ParameterError
-        If ``size_yx`` is not two positive ints, ``overlap_yx`` not two non-negative ints or above half of
-        ``size_yx`` (``path`` is ``overlap_yx.<axis>``), or ``blend`` unknown; ``path`` names the field.
+        If ``size_yx`` is not two positive ints, ``overlap_yx`` not two non-negative ints at most half of
+        ``size_yx``, or ``blend`` is unknown; ``path`` names the field.
     """
 
     size_yx: tuple[int, int]

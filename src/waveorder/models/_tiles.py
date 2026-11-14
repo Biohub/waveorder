@@ -1,8 +1,7 @@
 """The pieces of a model's tile methods: sources read as the model prepares them, per-tile values, z padding.
 
-A source is read through the model's ``prepare`` unless ``prepared`` (:class:`waveorder.models._prepare.Prepared`).
-A z-padded model reconstructs tiles that span z: each source is read with its mirrored slices (:class:`_ZPadded`)
-and each estimate cropped back (:class:`_ZCropped`), as a whole stack is padded.
+A z-padded model reads each source with its mirrored slices (:class:`_ZPadded`) and crops each estimate back
+(:class:`_ZCropped`), as a whole stack is padded.
 """
 
 import dataclasses

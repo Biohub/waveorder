@@ -1,10 +1,7 @@
 """A model and its configuration: build a model from one, describe a model, and save and load a model as a folder.
 
-A model built from a configuration keeps it (``model.config``); its calibrated values are recorded beside it, in
-the configuration's ``calibrated`` block, and applied again by :func:`from_config`. A model built in Python is
-described part by part by the registry (:func:`waveorder.registry.describe`), which is also what :func:`save`
-writes and :func:`load` reads. The model's ``from_config``, ``to_config``, ``save`` and ``load`` call these and
-document the arguments.
+A model built from a configuration keeps it, with its calibrated values in the ``calibrated`` block. A model built
+in Python is described part by part by :func:`waveorder.registry.describe`, which is what :func:`save` writes.
 """
 
 import json

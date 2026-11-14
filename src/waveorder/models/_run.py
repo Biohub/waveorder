@@ -38,9 +38,8 @@ def placed[M: nn.Module](module: M, *, device: torch.device, dtype: torch.dtype)
 def running(model: ReconstructionModel, verb: str, *, reported: bool = True) -> Generator[None]:
     """Run a method's body between ``run.start`` and ``run.end`` (method ``model.<verb>``) if reported.
 
-    ``run.end`` first delivers the events waiting for device values (:func:`waveorder.observe.flush`): the
-    method is the outer boundary they are read back at. It reports ``"status"`` ``"ok"`` or ``"error"`` (with
-    the exception's message) and the method's wall time.
+    ``run.end`` first flushes the events waiting for device values (:func:`waveorder.observe.flush`), then reports
+    ``"status"`` ``"ok"`` or ``"error"`` (with the exception's message) and the method's wall time.
     """
     method = f"model.{verb}"
     if not (reported and observing()):
@@ -78,10 +77,7 @@ def _run_start(model: ReconstructionModel, method: str) -> dict[str, object]:
 
 
 def bind(model: ReconstructionModel, sampling: Sampling, *, stored: bool = False) -> LinearOperator:
-    """Bind the model's system to ``sampling`` for its current values, in the range ``model.bind``.
-
-    With ``stored`` (a reconstruction's bind), the loaded store's transfer is used where it fits (_stores module).
-    """
+    """Bind the model's system to ``sampling``; with ``stored``, a loaded store's fitting transfer is used."""
     with running(model, "bind", reported=False):
         if stored:
             seed_stored_transfer(model, sampling)
@@ -91,6 +87,9 @@ def bind(model: ReconstructionModel, sampling: Sampling, *, stored: bool = False
 def calibration_score(model: ReconstructionModel, *, where: str, stacklevel: int = 3, warn: bool = True) -> Score:
     """Return the score a calibration minimizes: the model's, or the evidence when it has none.
 
+    With ``warn``, a likelihood score warns once (``CalibrationWarning``) if the noise or the object prior is the
+    default of a model built without one, and once if the model pads z: both bias the estimate.
+
     Parameters
     ----------
     model : ReconstructionModel
@@ -98,9 +97,9 @@ def calibration_score(model: ReconstructionModel, *, where: str, stacklevel: int
     where : str
         The calibrating method, for the messages.
     stacklevel : int
-        How many frames above this function the caller of the method is, for the warning.
+        How many frames above this function the method's caller is, for the warnings.
     warn : bool
-        Emit the warnings of a calibration; a check that only asks whether a calibration could run passes ``False``.
+        Emit the warnings; a check that only asks whether a calibration could run passes ``False``.
 
     Raises
     ------
@@ -108,14 +107,6 @@ def calibration_score(model: ReconstructionModel, *, where: str, stacklevel: int
         At ``imaging_system``, for a model built from a configuration in which no quantity is free.
     ParameterError
         For a model built in Python in which no quantity is free.
-
-    Warns
-    -----
-    CalibrationWarning
-        Once, if the score is a likelihood while the noise or the object prior is the default of a model built
-        without one: the likelihood then compares the data with a noise level and an object power that were not
-        chosen for it. Once more, if the score is a likelihood and the model pads z: the mirrored slices are
-        scored as data, which biases the estimate.
     """
     if not free_specs(model.imaging_model):
         elsewhere = _free_elsewhere(model)

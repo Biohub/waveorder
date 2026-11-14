@@ -80,11 +80,10 @@ def read_store(source: StoreSource, argument: str) -> TfStore:
 
 
 def _system_block(model: ReconstructionModel) -> dict[str, object] | None:
-    """Return :func:`waveorder.registry.describe` of the model's system, free quantities as ``free``, and its tiles.
+    """Return the registry's description of the system (free quantities as ``free``) and its tiles, or ``None``.
 
-    The system's ``cache`` argument says how transfers are kept, not what they are, and is left out, as is a
-    ``pupil_aberrations`` of ``None`` (an aberration-free pupil), so the hash is the one stores recorded before
-    detections took that argument. ``None`` when a part of the system has no plain-data form (it is not registered).
+    ``cache`` is left out (it says how transfers are kept, not what they are), as is a ``pupil_aberrations`` of
+    ``None``, so stores written before that argument keep their hash. ``None`` for a system with no plain-data form.
     """
     from waveorder import registry
 

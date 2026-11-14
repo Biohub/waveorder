@@ -158,13 +158,7 @@ class _Estimates:
 
 
 def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> _Estimates:
-    """Calibrate a shift-invariant model on the whole volume; the model takes the estimates.
-
-    A bead fit estimates the system's quantities, and the noise level (reported in the log). When the noise level is
-    free the store records it beside them and the model takes it, held to its bounds (the data's spread). The score
-    arrays ``outputs`` asks for are kept, and a weight sweep's report and montage are written where the
-    configuration's ``object.weight.auto`` says.
-    """
+    """Calibrate on the whole volume; the model takes the estimates, and a bead fit's noise level when it is free."""
     search = plan.search
     if search.start is not None:
         load_parameters(model.imaging_model, search.start.row())

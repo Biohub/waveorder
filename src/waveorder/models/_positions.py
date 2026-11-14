@@ -88,10 +88,8 @@ class Work:
 def transfer_kept(model: ReconstructionModel) -> Generator[None]:
     """Keep the system's transfer function from the checks to the units of one run, then drop it.
 
-    The checks bind the system on each grid to refuse what cannot run before any data is read, and the units bind
-    it again; the parameters do not change in between, so with the system's ``cache="auto"`` for the run the
-    transfer function is computed (or read from a loaded store) once per grid (a calibration writes the parameters,
-    which the cache sees). Worker processes receive the model with the same setting, without the cached transfer.
+    The checks and the units bind the same grids with the same parameters, so ``cache="auto"`` for the run computes
+    (or reads from a loaded store) each transfer function once per grid. Workers receive the model without it.
     """
     system = model.system
     if not isinstance(system, ShiftInvariantSystem) or system.cache == "auto":
