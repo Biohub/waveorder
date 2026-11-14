@@ -160,8 +160,8 @@ scripts/
 !.skills/**/scripts/**
 .skills/**/__pycache__/
 
-# benchmark results
-runs/
+# benchmark results (at the repo root; src/waveorder/runs and tests/runs are code)
+/runs/
 
 # Claude Code session state (but keep shared project skills symlink)
 .claude/*
