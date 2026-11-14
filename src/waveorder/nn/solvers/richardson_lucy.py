@@ -18,7 +18,7 @@ from torch import Tensor
 from waveorder.errors import ConfigurationWarning, IncompatibleModelError, ParameterError
 from waveorder.nn.functional import abs2, from_half_spectrum, is_complex_matrix, matrix_vector, to_half_spectrum
 from waveorder.nn.model import ImagingModel
-from waveorder.nn.parameters import Quantity, can_read_back, repr_parts, value_range
+from waveorder.nn.parameters import Quantity, can_read_back, read_flag, repr_parts, value_range
 from waveorder.nn.sampling import Data, Object
 from waveorder.nn.solvers.base import IterativeSolver, Loop
 from waveorder.nn.verbs import InverseProblem
@@ -226,12 +226,13 @@ _UNMATCHED_ITERATIONS = 5
 
 @dataclass(frozen=True, slots=True)
 class RichardsonLucyState:
-    """Iterate ``x``, signal ``s``, sensitivity ``B 1`` and back projector ``B`` (``None`` for the adjoint)."""
+    """Iterate ``x``, signal ``s``, sensitivity ``B 1``, back projector ``B`` (``None``: adjoint), RLGC all frozen."""
 
     x: Tensor
     signal: Tensor
     sensitivity: Tensor
     back_projector: Tensor | None
+    frozen: bool = False
 
 
 @register("richardson_lucy", kind="solver")
@@ -258,7 +259,8 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
         ``None`` uses 3.x's defaults.
     gradient_consensus : bool
         Use the RLGC update (3.x ``rlgc``): split the photons into two binomial halves each iteration, from a
-        generator seeded with 0 per solve, and freeze voxels where the halves disagree. Needs ``"matched"``.
+        generator seeded with 0 per solve, and freeze voxels where the halves disagree. The solve ends as
+        ``"converged"`` once every voxel is frozen, as 3.x's did. Needs ``"matched"``.
     start : {"mean", "ones"}
         The first estimate: the uniform object ``mean(s) - b`` (default), or 1, 3.x's start.
 
@@ -380,17 +382,28 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
         )
         back = self._back_project(state.signal / rates, problem, state.back_projector)
         if self.gradient_consensus:
-            x = self._consensus_step(state, problem, rates=rates, back=back)
+            x, step_size = self._consensus_step(state, problem, rates=rates, back=back)
+            frozen = not read_flag(step_size.ne(0).any())  # RLGC runs eagerly, so this read is allowed
         else:
             x = state.x * back / state.sensitivity
+            frozen = False
         return RichardsonLucyState(
-            x=x.clamp_min(0.0), signal=state.signal, sensitivity=state.sensitivity, back_projector=state.back_projector
+            x=x.clamp_min(0.0),
+            signal=state.signal,
+            sensitivity=state.sensitivity,
+            back_projector=state.back_projector,
+            frozen=frozen,
         )
+
+    @override
+    def stopped(self, state: RichardsonLucyState) -> bool:
+        """Whether RLGC froze every voxel, where 3.x stopped: every later step would draw new halves and unfreeze."""
+        return state.frozen
 
     def _consensus_step(
         self, state: RichardsonLucyState, problem: InverseProblem, *, rates: Tensor, back: Tensor
-    ) -> Tensor:
-        """Return the RLGC update (3.x ``rlgc.scaled_gradient_step``): freeze voxels where photon halves disagree."""
+    ) -> tuple[Tensor, Tensor]:
+        """Return the RLGC update and its step size (3.x ``rlgc.scaled_gradient_step``): zero where halves disagree."""
         operator = problem.operator
         gradient = back - operator.adjoint(torch.ones_like(rates))
         heads = torch.binomial(
@@ -400,7 +413,7 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
         tails_gradient = gradient - heads_gradient
         agreement = operator.adjoint(operator.apply(heads_gradient * tails_gradient))
         step_size = torch.where(agreement <= 0, torch.zeros_like(state.x), state.x / state.sensitivity)
-        return state.x + gradient * step_size
+        return state.x + gradient * step_size, step_size
 
     def _back_projector(self, problem: InverseProblem) -> Tensor:
         fourier = problem.operator.as_fourier()

@@ -191,6 +191,14 @@ class IterativeSolver[S](Solver):
         """Return the objective this solver minimizes at ``state``; the model's MAP objective by default."""
         return problem.objective(self.estimate(state))
 
+    def stopped(self, state: S) -> bool:
+        """Return whether ``state`` is a fixed point, so the solve ends there as ``"converged"``; never by default.
+
+        Checked after every step; an override reads the state back, so only a solver that runs eagerly has one.
+        """
+        del state
+        return False
+
     @final
     @override
     def run(self, problem: InverseProblem) -> SolveResult:
@@ -211,6 +219,8 @@ class IterativeSolver[S](Solver):
             previous = self.estimate(state) if history.on or loop.tolerance is not None else None
             state = self.step(state, problem)
             history.add(previous, self.estimate(state))
+            if self.stopped(state):
+                return state, iteration, "converged", history.tensor()
             if loop.tolerance is None or previous is None:
                 continue
             if iteration % loop.check_every == 0 or iteration == loop.iterations:

@@ -93,6 +93,43 @@ def test_richardson_lucy_variants_match_3x_at_equal_iterations(kind, iterations,
     torch.testing.assert_close(estimate, reference, rtol=0, atol=1e-12 * reference.abs().max().item())
 
 
+def test_rlgc_stops_where_3x_does_once_every_voxel_is_frozen(monkeypatch):
+    # 3.x stops once every voxel is frozen (at iteration 5 here); without that stop, 200 iterations differ by 18%.
+    model = ImagingModel(make_system(1.0), NoPrior(), Poisson()).double()
+    data = _poisson_data(model, SMALL)
+    otf = _full_otf(model, SMALL)
+
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        return torch.real(torch.fft.ifftn(torch.fft.fftn(x, dim=(-3, -2, -1)) * otf, dim=(-3, -2, -1)))
+
+    def transpose(y: torch.Tensor) -> torch.Tensor:
+        return torch.real(torch.fft.ifftn(torch.fft.fftn(y, dim=(-3, -2, -1)) * otf.conj(), dim=(-3, -2, -1)))
+
+    steps: list[int] = []
+    step = legacy_rl.scaled_gradient_step
+
+    def counted(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        steps.append(len(steps) + 1)
+        return step(*args, **kwargs)
+
+    monkeypatch.setattr(legacy_rl, "scaled_gradient_step", counted)
+    measured = data[0].clamp_min(0)
+    reference = legacy_rl.richardson_lucy(
+        measured,
+        forward,
+        transpose,
+        num_iterations=200,
+        method="RLGC",
+        guess=torch.full_like(measured, measured.mean().item()),
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert len(steps) < 200
+    with torch.no_grad():
+        result = RichardsonLucy(loop=Loop(200), gradient_consensus=True)(data, model, SMALL)
+    assert (result.iterations, result.status) == (len(steps), "converged")
+    torch.testing.assert_close(result.estimate[0], reference, rtol=0, atol=1e-12 * reference.abs().max().item())
+
+
 @pytest.mark.parametrize(
     ("kind", "iterations"), [("matched", 50), ("wiener_butterworth", 2), ("gaussian", 2)], ids=["rl", "wb", "gaussian"]
 )
