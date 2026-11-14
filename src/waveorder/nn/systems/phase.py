@@ -19,7 +19,8 @@ from waveorder.nn.functional import (
     axial_nyquist,
     axial_spectrum,
     complex_multiply,
-    crop_lateral,
+    crop_full_lateral,
+    half_of_hermitian_part,
     lateral_frequencies,
     plane_slabs,
     transverse_nyquist,
@@ -125,29 +126,13 @@ def _greens_denominator(oblique: Tensor, support: Tensor, edge: PupilEdge) -> Te
     return torch.where(oblique > 0, oblique, torch.ones_like(oblique))
 
 
-def _half(full: Tensor, nx: int) -> Tensor:
-    """Keep the half-spectrum columns of an ``nx``-wide grid from a full spectrum stored ``(..., X, 2)``.
-
-    For even ``nx`` the Nyquist column is taken at ``-nx / 2``, as 3.x's crop did.
-    """
-    columns = torch.arange(nx // 2 + 1, device=full.device)
-    if nx % 2 == 0:
-        columns[-1] = full.shape[-2] - nx // 2
-    return full.index_select(-2, columns)
-
-
-def _crop_full(full: Tensor, shape: ZYX[int]) -> Tensor:
-    """Keep the lateral half-spectrum frequencies of a ``shape`` grid from full spectra ``(..., P, Y', X', 2)``."""
-    return crop_lateral(_half(full, shape[2]), shape)
-
-
 @register("thick_phase_3d", kind="system")
 class ThickPhase3D(ShiftInvariantSystem):
     """Brightfield phase contrast of a thick object: the 3D weak-object transfer function (3.x ``phase_thick_3d``).
 
     The fields are scattering potentials in um^-2. ``phase`` is ``(2 pi / wavelength)^2 (n_object^2 - n_media^2)``;
-    times :meth:`radians_per_voxel` it is the phase delay of one voxel in radians. ``absorption`` (with
-    ``absorption="independent"``) is the imaginary part; times the same factor it is the log of the amplitude
+    times ``dz wavelength / (4 pi n_media)`` (um^2) it is the phase delay of one voxel in radians. ``absorption``
+    (with ``absorption="independent"``) is the imaginary part; times the same factor it is the log of the amplitude
     transmittance of one voxel, negative where the object absorbs. The data are one channel of normalized contrast
     over the whole stack, ``(1, Z, Y, X)``.
 
@@ -190,7 +175,8 @@ class ThickPhase3D(ShiftInvariantSystem):
     on a grid oversampled along z, y and x for the largest reachable apertures, then cropped to the data's
     frequencies. ``z = k dz + z_focus_offset dz_data`` for plane ``k`` in FFT order, and ``w`` is a Hann window
     centred on ``k = 0``, as in 3.x. The oversampling ignores an illumination tilt, so a tilted transfer function
-    aliases, as in 3.x.
+    aliases, as in 3.x, and the crop ``H_c`` need not be Hermitian; the half spectrum kept is that of
+    ``0.5 (H_c(k) + conj H_c(-k))``, which defines 3.x's operator ``real(ifftn(H_c fftn(f)))``.
     """
 
     illumination: Illumination
@@ -270,32 +256,14 @@ class ThickPhase3D(ShiftInvariantSystem):
             axial_step=axial_nyquist(wavelength, na_det, self.index_of_refraction_media),
         )
 
-    def radians_per_voxel(self, sampling: Sampling) -> float:
-        """Return the factor that turns the ``phase`` field into radians of phase delay per voxel on ``sampling``.
-
-        ``estimate[0] * system.radians_per_voxel(sampling)`` is the phase each voxel adds; its sum over z is the
-        unit of a :class:`ThinPhase2D` phase. The ``absorption`` field takes the same factor.
-
-        Parameters
-        ----------
-        sampling : Sampling
-            The grid of the estimate; only its z step enters.
-
-        Returns
-        -------
-        float
-            ``dz * wavelength / (4 pi n_media)`` in um^2.
-        """
-        dz = sampling.pixel_size[0]
-        return dz * self.illumination.wavelength / (4 * math.pi * self.index_of_refraction_media)
-
     def potential_transfers(self, sampling: Sampling) -> Tensor:
         """Return the 3.x real- and imaginary-potential transfer functions on ``sampling``, before projection.
 
         Returns
         -------
         Tensor
-            Half spectra stored real, shape ``(2, Z, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]``.
+            Half spectra stored real, shape ``(2, Z, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]``, each the
+            half of the Hermitian part of 3.x's cropped transfer function (see Notes).
         """
         reference = self.detection.numerical_aperture
         dtype, device = reference.dtype, reference.device
@@ -328,19 +296,21 @@ class ThickPhase3D(ShiftInvariantSystem):
             scattered = _fft(complex_multiply(pupil, greens), dim=lateral)
             del propagation, greens
             first = _fft(complex_multiply(_conjugate(illuminated), scattered), dim=lateral, inverse=True)
-            first = _crop_full(first, shape)
+            first = crop_full_lateral(first, shape)
             second = _fft(complex_multiply(illuminated, _conjugate(scattered)), dim=lateral, inverse=True)
-            second = _crop_full(second, shape)
+            second = crop_full_lateral(second, shape)
             del illuminated, scattered
             weight = (weight * scale)[:, None, None, None]
             return torch.stack(((first + second) * weight, _times_i(first - second) * weight))
 
         # Everything but the transform along z is per plane, so it runs in slabs of planes. The window, the transform
         # along z and the scale act on each lateral frequency alone, so cropping to the data grid's lateral frequencies
-        # right after the lateral transforms gives the same result as cropping after the transform along z.
+        # right after the lateral transforms gives the same result as cropping after the transform along z. Both
+        # signs of x are kept until the Hermitian part is taken: on an even axis, the Nyquist frequency of the crop
+        # pairs with itself, so its -k comes from the other side of the oversampled grid.
         plane = oblique.numel()
         slabs = zip(plane_slabs(z, plane), plane_slabs(window, plane), strict=True)
-        return axial_spectrum([slab(part, weight) for part, weight in slabs], shape)
+        return half_of_hermitian_part(axial_spectrum([slab(part, weight) for part, weight in slabs], shape))
 
     @override
     def compute_transfer(self, sampling: Sampling) -> HalfTransfer:
@@ -404,7 +374,8 @@ class ThinPhase2D(ImagingSystem):
         H_absorption(q; z) = (h1 + h2) / B_z
 
     and the plane at defocus ``z`` is ``FFT(contrast_z) = H_phase FFT(phase) + H_absorption FFT(absorption)``. Only y
-    and x are oversampled, as in 3.x.
+    and x are oversampled, as in 3.x. As in :class:`ThickPhase3D`, the half spectrum kept per plane is that of the
+    Hermitian part of the cropped transfer function, which defines 3.x's operator ``real(ifft2(H_c fft2(f)))``.
     """
 
     operator_type: type[LinearOperator] = ReshapedFourierDiagonal
@@ -493,7 +464,8 @@ class ThinPhase2D(ImagingSystem):
         Returns
         -------
         Tensor
-            Half spectra stored real, shape ``(Z, 2, 1, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]`` per plane.
+            Half spectra stored real, shape ``(Z, 2, 1, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]`` per plane,
+            each the half of the Hermitian part of 3.x's cropped transfer function (see Notes).
         """
         self.check_sampling(sampling)
         reference = self.detection.numerical_aperture
@@ -528,10 +500,11 @@ class ThinPhase2D(ImagingSystem):
             direct = (source * abs2(detected)).sum(dim=(-2, -1), keepdim=True)[..., None]
             del detected
             first = _fft(complex_multiply(_conjugate(illuminated), transmitted), dim=lateral, inverse=True)
-            first = _crop_full(first, sampling.shape)
+            first = crop_full_lateral(first, sampling.shape)
             second = _fft(complex_multiply(illuminated, _conjugate(transmitted)), dim=lateral, inverse=True)
-            second = _crop_full(second, sampling.shape)
-            return torch.stack((_times_i(first - second) / direct, (first + second) / direct), dim=1)
+            second = crop_full_lateral(second, sampling.shape)
+            planes = torch.stack((_times_i(first - second) / direct, (first + second) / direct), dim=1)
+            return half_of_hermitian_part(planes, axes=2)
 
         # In slabs of planes, each cropped at once: the planes are independent.
         slabs = plane_slabs(self.plane_positions(sampling), oblique.numel())

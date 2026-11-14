@@ -64,9 +64,15 @@ def _optics(
     return illumination, detection
 
 
+def _hermitian_part(full: Tensor) -> Tensor:
+    """``0.5 (H(k) + conj H(-k))`` of full spectra over the last three axes: what ``real(ifftn(H F))`` applies."""
+    dims = (-3, -2, -1)
+    return 0.5 * (full + torch.roll(torch.flip(full, dims), (1, 1, 1), dims).conj())
+
+
 def _stored_half(full: Tensor, nx: int) -> Tensor:
-    """A 3.x full transfer as the 4.x operator sees it: half columns, stored real, Hermitian-projected."""
-    return hermitian_half(torch.view_as_real(full[..., : nx // 2 + 1].contiguous()), nx)
+    """A 3.x full transfer as the operator ``real(ifftn(H F))`` sees it: the half of its Hermitian part, stored real."""
+    return torch.view_as_real(_hermitian_part(full)[..., : nx // 2 + 1].contiguous())
 
 
 def _relative(actual: Tensor, expected: Tensor) -> float:
@@ -255,19 +261,23 @@ def test_3x_invert_flip_is_a_negation_plus_one_slice_of_focus() -> None:
     assert _relative(system.transfer(sampling)[0, 0], _stored_half(flipped, 10)) > 0.5
 
 
-def test_on_axis_transfer_is_hermitian_and_tilted_is_not() -> None:
+def test_on_axis_3x_transfer_is_hermitian_tilted_is_not_and_the_stored_half_always_is() -> None:
     """Physics on axis. Tilted and oversampled, the cropped 3.x transfer is not Hermitian: the tilted cap reaches
-    past the oversampled band and aliases. The port keeps that (only its Hermitian projection acts on real data)."""
+    past the oversampled band and aliases. 4.x stores the half of its Hermitian part, the one ``real(ifftn(H F))``
+    applies, so the stored half needs no projection."""
     sampling = Sampling(shape=(7, 12, 12), pixel_size=(0.4, 0.25, 0.25))
 
-    def asymmetry(zenith: float) -> float:
+    def asymmetries(zenith: float) -> tuple[float, float]:
         system = ThickPhase3D(*_optics(zenith=zenith, azimuth=0.8), index_of_refraction_media=INDEX).double()
         assert system.upsampling(sampling) == (1, 2, 2)
+        crop_3x, _ = _thick_reference(system, sampling)
         raw = system.potential_transfers(sampling)[0]
-        return _relative(raw, hermitian_half(raw, 12))
+        return _relative(crop_3x, _hermitian_part(crop_3x)), _relative(raw, hermitian_half(raw, 12))
 
-    assert asymmetry(0.0) <= 1e-12
-    assert asymmetry(-0.65) >= 0.1
+    on_axis, tilted = asymmetries(0.0), asymmetries(-0.65)
+    assert max(on_axis) <= 1e-12
+    assert tilted[0] >= 0.1
+    assert tilted[1] <= 1e-15
 
 
 # --- thin -------------------------------------------------------------------------------------------------------------
@@ -330,8 +340,61 @@ def test_thin_ramp_edge_gap_to_unmodified_3x_is_pinned() -> None:
 
 
 def _plane_half(full: Tensor, nx: int) -> Tensor:
-    """``_stored_half`` per plane: the plane index is not a frequency axis, so project over y alone."""
+    """``_stored_half`` per plane: the plane index is not a frequency axis, so the Hermitian part is over y and x."""
     return _stored_half(full[:, None], nx)[:, 0]
+
+
+def _apply_3x(obj: Tensor, transfer: Tensor, dims: tuple[int, ...]) -> Tensor:
+    """3.x's operator ``real(ifftn(H fftn(f)))`` on its cropped full transfer ``H``."""
+    return torch.fft.ifftn(torch.fft.fftn(obj, dim=dims) * transfer, dim=dims).real
+
+
+# Tilted cases where the 3.x crop is not Hermitian (even y or z oversampled), and odd or unoversampled ones.
+OPERATOR_CASES = [
+    pytest.param((7, 12, 12), (0.4, 0.25, 0.25), -0.65, (1, 2, 2), id="even-oversampled-yx"),
+    pytest.param((6, 12, 12), (1.0, 0.25, 0.25), -0.65, (2, 2, 2), id="even-oversampled-zyx"),
+    pytest.param((6, 8, 8), (1.0, 0.15, 0.15), 0.0, (2, 1, 1), id="even-oversampled-z-on-axis"),
+    pytest.param((5, 9, 9), (0.6, 0.45, 0.45), -0.3, (1, 3, 3), id="odd-oversampled-by-3"),
+    pytest.param((6, 8, 8), (0.3, 0.15, 0.15), 0.2, (1, 1, 1), id="even-not-oversampled"),
+    pytest.param((5, 9, 9), (0.3, 0.15, 0.15), 0.2, (1, 1, 1), id="odd-not-oversampled"),
+]
+
+
+@pytest.mark.parametrize(("shape", "pixel_size", "zenith", "upsampling"), OPERATOR_CASES)
+def test_thick_operator_is_the_3x_operator(shape, pixel_size, zenith, upsampling) -> None:
+    """The forward operator, not only the stored half: ``real(ifftn(H fftn(f)))`` on 3.x's cropped transfers."""
+    sampling = Sampling(shape=shape, pixel_size=pixel_size)
+    optics = _optics(zenith=zenith, azimuth=0.8, edge="sigmoid")
+    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX, absorption="independent").double()
+    assert system.upsampling(sampling) == upsampling
+    real_tf, imag_tf = _thick_reference(system, sampling)
+    obj = torch.randn(2, *shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    dims = (-3, -2, -1)
+    expected = _apply_3x(obj[0], real_tf, dims) + _apply_3x(obj[1], imag_tf, dims)
+    actual = system.bind(sampling).apply(obj)[0]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12 * expected.abs().max().item())
+
+
+@pytest.mark.parametrize(
+    ("ny", "nx", "lateral", "zenith", "upsampling"),
+    [
+        pytest.param(10, 10, (0.2, 0.2), 0.25, (1, 2, 2), id="even-oversampled"),
+        pytest.param(12, 12, (0.2, 0.2), 0.3, (1, 2, 2), id="even-oversampled-steeper"),
+        pytest.param(9, 9, (0.45, 0.45), 0.25, (1, 3, 3), id="odd-oversampled-by-3"),
+        pytest.param(10, 10, (0.15, 0.15), 0.25, (1, 1, 1), id="even-not-oversampled"),
+        pytest.param(9, 9, (0.15, 0.15), 0.25, (1, 1, 1), id="odd-not-oversampled"),
+    ],
+)
+def test_thin_operator_is_the_3x_operator(ny, nx, lateral, zenith, upsampling) -> None:
+    sampling = Sampling(shape=(5, ny, nx), pixel_size=(0.5, *lateral))
+    illumination, detection = _optics(zenith=zenith, azimuth=0.7, offset=0.3, edge="sigmoid")
+    system = ThinPhase2D(illumination, detection, index_of_refraction_media=INDEX).double()
+    assert system.upsampling(sampling) == upsampling
+    absorption_tf, phase_tf = _thin_reference(system, sampling)
+    obj = torch.randn(2, 1, ny, nx, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    expected = legacy.thin_forward(obj[1, 0], obj[0, 0], absorption_tf, phase_tf)
+    actual = system.bind(sampling).apply(obj)[0]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12 * expected.abs().max().item())
 
 
 def _thin_scene(zenith: float, *, edge: PupilEdge = "ramp") -> tuple[ThinPhase2D, Sampling, Tensor, Tensor]:
@@ -477,21 +540,6 @@ def test_thick_slab_matches_the_thin_model_at_low_aperture(index, dz) -> None:
     expected = thin_images * _slab_in_thin_units(sampling, index=index)
     assert _relative(thick_images[0], expected[0]) < 1.5e-2  # phase
     assert _relative(thick_images[1], expected[1]) < 5e-3  # absorption
-
-
-@pytest.mark.parametrize(("index", "dz"), [(1.0, 0.15), (1.33, 0.25), (1.52, 0.3)])
-def test_radians_per_voxel_is_the_conversion_the_slab_tests_measure(index, dz) -> None:
-    sampling = Sampling(shape=(15, 20, 22), pixel_size=(dz, 0.12, 0.12))
-    thick = ThickPhase3D(*_slab_optics(zenith=0.0, azimuth=0.0, offset=0.0), index_of_refraction_media=index)
-    factor = thick.radians_per_voxel(sampling)
-    assert isinstance(factor, float)
-    assert factor == pytest.approx(dz * WAVELENGTH / (4 * math.pi * index), rel=1e-15)
-    # The slab's own slice, where the window is 1: the factor the two slab tests pin against the thin model.
-    assert _slab_in_thin_units(sampling, index=index)[15 // 2].item() == pytest.approx(factor, rel=1e-12)
-    # A potential of 8 pi^2 n delta_n / wavelength^2 is the delay 2 pi delta_n dz / wavelength of one voxel.
-    delta_n = 0.01
-    potential = 8 * math.pi**2 * index * delta_n / WAVELENGTH**2
-    assert potential * factor == pytest.approx(2 * math.pi * delta_n * dz / WAVELENGTH, rel=1e-12)
 
 
 @pytest.mark.parametrize(("edge", "zenith"), [("sigmoid", 0.0), ("ramp", 0.2)])

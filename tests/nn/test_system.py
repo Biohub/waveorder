@@ -38,7 +38,7 @@ from waveorder.nn import (
     evaluate,
     free_specs,
 )
-from waveorder.nn.functional import half_spectrum_frequencies, hermitian_half
+from waveorder.nn.functional import defocused_intensity, half_spectrum_frequencies, hermitian_half
 from waveorder.nn.optics import PupilGrid
 from waveorder.nn.parameters import repr_parts
 from waveorder.nn.systems.base import CacheMode
@@ -81,13 +81,21 @@ def test_a_declared_real_otf_drops_only_a_zero_imaginary_part(sampling):
 
 
 def test_even_crops_with_aberrations_stay_hermitian():
-    # Coarse even-sized grid with coma and defocus: the crop drops Nyquist conjugates. The PSF clamp of
-    # compute_transfer goes through the real point-spread function on the data's grid, which restores them.
+    # Coarse even-sized grid with coma and defocus: the plain crop of the oversampled OTF is not Hermitian on the
+    # Nyquist frequencies. The build keeps the half of its Hermitian part: the transform of real(ifftn(crop)).
     coarse = Sampling(shape=(6, 8, 10), pixel_size=(0.4, 0.15, 0.15))
     system = make_system(1.2, z_focus_offset=0.7, pupil_aberrations=ZernikeAberration({"coma_x": 0.1}))
     nx = coarse.shape[-1]
+    pupil, kz, z = system._pupil_planes(coarse)  # noqa: SLF001
+    psf = defocused_intensity(pupil, kz, z)
+    crop = torch.fft.fftn(psf / psf.sum())
+    for dim, size in zip((-3, -2, -1), coarse.shape, strict=True):
+        full = crop.shape[dim]
+        crop = crop.index_select(dim, torch.cat([torch.arange((size + 1) // 2), torch.arange(full - size // 2, full)]))
+    plain = torch.view_as_real(crop[..., : nx // 2 + 1].contiguous())
+    assert not torch.allclose(plain, hermitian_half(plain, nx), atol=1e-6), "must exercise the Nyquist frequencies"
     cropped = system._cropped_otf(coarse)  # noqa: SLF001
-    assert not torch.allclose(cropped, hermitian_half(cropped, nx), atol=1e-6), "must exercise the projection"
+    torch.testing.assert_close(cropped, torch.view_as_real(torch.fft.rfftn(torch.fft.ifftn(crop).real)))
     raw = system.compute_transfer(coarse)
     torch.testing.assert_close(raw, hermitian_half(raw, nx))
     H = system.transfer(coarse)

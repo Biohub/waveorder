@@ -15,9 +15,10 @@ from torch import Tensor, nn
 from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn.functional import (
     axial_nyquist,
-    crop_lateral,
+    crop_full_lateral,
     defocused_intensity,
     from_half_spectrum,
+    half_of_hermitian_part,
     intensity_otf,
     irfftn,
     plane_slabs,
@@ -331,7 +332,8 @@ class ThinFluorescence2D(ImagingSystem):
         -------
         Tensor
             Half spectra, shape ``(Z, 1, 1, Y, X // 2 + 1)`` stored real when :attr:`real_transfer` is set, else
-            ``(Z, 1, 1, Y, X // 2 + 1, 2)``.
+            ``(Z, 1, 1, Y, X // 2 + 1, 2)``: per plane, the half of the Hermitian part of the cropped transfer
+            function (:func:`~waveorder.nn.functional.half_of_hermitian_part`).
         """
         self.check_sampling(sampling)
         reference = self.detection.numerical_aperture
@@ -344,9 +346,9 @@ class ThinFluorescence2D(ImagingSystem):
 
         def spectra(part: Tensor) -> Tensor:
             intensity = defocused_intensity(pupil, kz, part)  # (P, Y', X')
-            # The zero frequency of rfft2(I) is sum(I): normalizing I first makes it 1 on every plane.
-            spectrum = torch.view_as_real(torch.fft.rfft2(intensity / intensity.sum(dim=(-2, -1), keepdim=True)))
-            return crop_lateral(spectrum, sampling.shape)
+            # The zero frequency of fft2(I) is sum(I): normalizing I first makes it 1 on every plane.
+            spectrum = torch.view_as_real(torch.fft.fft2(intensity / intensity.sum(dim=(-2, -1), keepdim=True)))
+            return half_of_hermitian_part(crop_full_lateral(spectrum, sampling.shape), axes=2)
 
         # In slabs of planes, each cropped at once: the planes are independent.
         slabs = plane_slabs(self.plane_positions(sampling), kz.numel())
