@@ -13,7 +13,7 @@ from typing import Annotated
 
 import typer
 
-from waveorder.cli import bench, calibrate, config, gui_widget, reconstruct, simulate
+from waveorder.cli import bench, calibrate, config, gui_widget, reconstruct, simulate, view
 from waveorder.cli.options import WoCommand
 from waveorder.cli.render import RootGroup
 
@@ -86,6 +86,12 @@ app.command(
     short_help="[green]\\[gui][/green] Open the reconstruction GUI (waveorder\\[visual])",
 )(gui_widget.gui)
 app.command("gui", hidden=True)(gui_widget.gui)  # wo-4.0's shortcut
+app.command(
+    "view",
+    rich_help_panel="Visualize",
+    short_help="[green]\\[v][/green] Open OME-Zarr datasets or transfer-function stores (waveorder\\[visual])",
+)(view.view)
+app.command("v", hidden=True)(view.view)
 
 
 def main() -> None:

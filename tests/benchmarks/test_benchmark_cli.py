@@ -19,10 +19,6 @@ def test_help(argv):
     assert result.exit_code == 0, result.output
 
 
-def test_view_is_gone():
-    assert CliRunner().invoke(app, ["bm", "view"]).exit_code != 0
-
-
 def test_wo40s_migrate_configs_flag_is_accepted_and_hidden():
     # wo-4.0's bm run migrated the cases only with --migrate-configs; every case is migrated here.
     result = CliRunner().invoke(app, ["bm", "run", "--migrate-configs", "--help"])

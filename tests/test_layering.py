@@ -20,7 +20,7 @@ LAYERS: dict[str, frozenset[str]] = {
     "config": frozenset({"io", "nn"}),
     "models": frozenset({"config", "tiling", "io", "nn"}),
     "cli": frozenset({"config", "models", "tiling", "io", "nn", "integrations", "plugin"}),
-    "plugin": frozenset({"config"}),
+    "plugin": frozenset({"config", "io"}),
     "integrations": frozenset(),
     "testing": frozenset({"nn"}),
     "calibrate": frozenset({"models", "io", "nn"}),

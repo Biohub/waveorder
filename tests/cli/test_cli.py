@@ -49,7 +49,7 @@ def test_help_and_version():
         ["rec"], ["reconstruct"], ["compute-tf"], ["compute-transfer-function"], ["apply-inv-tf"],
         ["apply-inverse-transfer-function"], ["calibrate-tf"], ["calibrate-transfer-function"], ["simulate"], ["sim"],
         ["config", "new"], ["config", "check"], ["config", "show"], ["config", "migrate"], ["migrate-config"], ["mc"],
-        ["benchmark"], ["bm"], ["interactive"], ["gui"],
+        ["benchmark"], ["bm"], ["bm", "view"], ["interactive"], ["gui"], ["view"], ["v"],
     ],
     ids=" ".join,
 )  # fmt: skip
@@ -63,7 +63,7 @@ def test_rec_help_shows_resume_and_tile():
     assert all(flag in shown for flag in ("--resume", "--tile", "--tile-overlap", "--wandb", "--num-processes"))
 
 
-@pytest.mark.parametrize("command", [["view"], ["tile-stitch"], ["create-output"], ["config", "schema"], ["distill"]])
+@pytest.mark.parametrize("command", [["tile-stitch"], ["create-output"], ["config", "schema"], ["distill"]])
 def test_commands_not_in_4_are_unknown(command):
     result = runner.invoke(app, [*command, "-h"])
     assert result.exit_code == 2

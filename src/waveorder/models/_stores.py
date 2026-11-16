@@ -20,7 +20,7 @@ from waveorder.io.tf_store import FORMAT, TfStore, TransferArray, canonical_json
 from waveorder.models._arguments import shown_shape, zyx
 from waveorder.models._base import ReconstructionModel
 from waveorder.models._parts import FieldTiles
-from waveorder.nn import Free, ParameterPrior, Sampling, ZPadding, free_specs
+from waveorder.nn import Free, ParameterPrior, Sampling, ThinFluorescence2D, ThinPhase2D, ZPadding, free_specs
 from waveorder.nn.parameters import shortest_decimal
 from waveorder.nn.systems.base import ShiftInvariantSystem
 from waveorder.tiling import TilePlan
@@ -570,23 +570,34 @@ def made_by(model: ReconstructionModel) -> dict[str, object]:
 
 
 def _transfer_at(model: ReconstructionModel, shape: ZYX, pixel_size: PixelSize) -> TransferArray | None:
-    """Return the model's transfer on ``shape`` after z padding as reconstructions compute it; ``None`` for no such."""
+    """Return the model's transfer on ``shape`` after z padding as reconstructions compute it; ``None`` for no such.
+
+    A thin (2D) system's transfer is its plane transfers, one per focal plane: shown by ``wo view``, never reused.
+    """
     system = model.system
-    if not isinstance(system, ShiftInvariantSystem):
-        log.info("%s has no single transfer function; none is stored", type(system).__name__)
-        return None
     slices = model.z_padding_for(shape, pixel_size=pixel_size)
     sampling = ZPadding(slices).sampling(Sampling(shape=shape, pixel_size=pixel_size))
+    if isinstance(system, ShiftInvariantSystem):
+        compute, real = system.transfer, system.real_transfer
+        layout = ["channel", "field", "z", "y", "x_half"]
+        fft = "data = irfftn(sum over fields of H[c, f] * rfftn(object[f])) over (z, y, x); x keeps X // 2 + 1"
+    elif isinstance(system, ThinPhase2D | ThinFluorescence2D):
+        compute, real = system.plane_transfers, isinstance(system, ThinFluorescence2D) and system.real_transfer
+        layout = ["plane", "field", "z", "y", "x_half"]
+        fft = "data[0, p] = irfft2(sum over fields of H[p, f, 0] * rfft2(object[f, 0])) over (y, x); x keeps X // 2 + 1"
+    else:
+        log.info("%s has no single transfer function; none is stored", type(system).__name__)
+        return None
     with torch.no_grad():
-        values = system.transfer(sampling).detach().cpu()
+        values = compute(sampling).detach().cpu()
     attrs: dict[str, object] = {
-        "layout": ["channel", "field", "z", "y", "x_half"],
-        "fft": "data = irfftn(sum over fields of H[c, f] * rfftn(object[f])) over (z, y, x); x keeps X // 2 + 1",
-        "real": system.real_transfer,
+        "layout": layout,
+        "fft": fft,
+        "real": real,
         **transfer_record(model, sampling),
         "z_padding": slices,
     }
-    transfer = values if system.real_transfer else torch.view_as_complex(values.contiguous())
+    transfer = values if real else torch.view_as_complex(values.contiguous())
     return TransferArray(shape=sampling.shape, attrs=attrs, transfer=transfer)
 
 

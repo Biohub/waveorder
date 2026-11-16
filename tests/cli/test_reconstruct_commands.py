@@ -1,5 +1,6 @@
 """``wo rec``, ``wo apply-inv-tf`` and ``wo compute-tf`` end to end on tiny CPU plates."""
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -98,6 +99,25 @@ def test_rec_thin_phase_writes_one_plane_with_phase_and_absorption(plate, tmp_pa
     assert names == ["Phase2D", "Absorption2D"]
     assert image.shape == (2, 2, 1, 32, 32)
     assert "waveorder-Phase2D" in attrs
+
+
+def test_compute_tf_stores_a_thin_systems_plane_transfers_which_apply_inv_tf_recomputes(plate, tmp_path):
+    config = _config(tmp_path, THIN_PHASE, "thin.yml")
+    planes = tmp_path / "planes.zarr"
+    result = runner.invoke(app, ["compute-tf", "-i", str(plate / "A/1/0"), "-c", str(config), "-o", str(planes)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0] == f"{planes}: nominal parameters; transfer functions at 8x32x32"
+    (item,) = TfStore.load(planes).transfers
+    assert item.attrs["layout"] == ["plane", "field", "z", "y", "x_half"]
+    bare = dataclasses.replace(TfStore.load(planes), transfers=()).save(tmp_path / "bare.zarr")  # as written before
+    images = []
+    for store in (planes, bare):
+        output = tmp_path / f"{store.stem}_out.zarr"
+        applied = _rec(plate, config, output, "-t", str(store), command="apply-inv-tf")
+        assert applied.exit_code == 0, applied.output
+        assert "transfer function on" not in applied.stderr  # a thin system computes its plane transfers
+        images.append(read_output(output, "A/1/1")[1])
+    assert torch.equal(*images)
 
 
 def test_apply_inverse_transfer_function_uses_a_store_calibrate_tf_wrote(plate, tmp_path):

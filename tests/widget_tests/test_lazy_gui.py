@@ -1,4 +1,4 @@
-"""``import waveorder`` and the command line need no Qt; ``wo interactive --help`` needs no display."""
+"""``import waveorder`` and the command line need no Qt; ``--help`` of the napari commands needs no display."""
 
 import os
 import subprocess
@@ -32,3 +32,17 @@ def test_interactive_help_needs_no_display():
         )
         assert result.returncode == 0, result.stderr
         assert "reconstruction GUI" in result.stdout
+
+
+def test_view_help_needs_no_display():
+    environment = {key: value for key, value in os.environ.items() if key not in ("DISPLAY", "QT_QPA_PLATFORM")}
+    for command in (["view"], ["v"], ["bm", "view"]):
+        result = subprocess.run(
+            [sys.executable, "-m", "waveorder.cli", *command, "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "in napari" in result.stdout

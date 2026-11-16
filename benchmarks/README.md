@@ -40,6 +40,11 @@ dependencies (`make_thumbnails.py` also needs matplotlib).
     wo bm compare [RUN_A RUN_B]
         Diff metrics between two runs (default: the two newest).
 
+    wo bm view [PATH [PATH_B]]
+        Open a run (default: latest) or RUN/CASE in napari: raw input,
+        phantom and reconstruction. With PATH_B, the two reconstructions
+        side by side with linked contrast limits (needs waveorder[visual]).
+
 ## Adding a benchmark case
 
 1. Add a reconstruction config to `benchmarks/configs/`.

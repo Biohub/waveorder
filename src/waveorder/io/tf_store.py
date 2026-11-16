@@ -6,6 +6,7 @@ Layout ``waveorder.tf/2`` (zarr v3 through ``tensordict.PersistentTensorDict``; 
       format, parameter_names (dotted, column order), tile_grid, provenance
       parameters             (T, P) float64: every free quantity of the model, one row per tile
       transfer_function/<Z>x<Y>x<X>/{transfer, metadata}   optional: the transfer on that grid, reused by later runs
+                             (a thin system's plane transfers are for wo view; reconstructions recompute them)
       score_trace            optional (N,) float64: the objective at each gradient step of the calibration
       score_grid             optional (N, G + 1) float64: each grid point's G values, then its objective
 
@@ -116,7 +117,8 @@ class TransferArray:
     attrs : dict
         Layout, FFT convention and what it was computed for (``waveorder.models._stores.transfer_record``).
     transfer : Tensor, optional
-        The ``(C, F, Z, Y, X // 2 + 1)`` half spectrum; ``None`` when listed by :meth:`TfStore.load`
+        The ``(C, F, Z, Y, X // 2 + 1)`` half spectrum, or for a thin (2D) system its ``(Z, F, 1, Y, X // 2 + 1)``
+        plane transfers (``attrs["layout"]`` says which); ``None`` when listed by :meth:`TfStore.load`
         (:func:`read_transfer` reads it).
     """
 

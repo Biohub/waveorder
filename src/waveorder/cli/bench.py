@@ -11,9 +11,14 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import typer
+
+if TYPE_CHECKING:  # the napari plugin's numpy loads only when wo bm view runs
+    from waveorder.plugin.view import LayerData
+
+type _Layer = LayerData
 
 app = typer.Typer(
     name="benchmark",
@@ -247,6 +252,140 @@ def compare(
         for metric, va, vb in pairs:
             typer.echo(f"  {label:21s} {metric:>10s} {_fmt(va)} {_fmt(vb)} {_fmt(vb - va)}")
             label = ""
+
+
+# the docstring is the command's help, where Rich would read an unescaped [visual] as markup
+@app.command()
+def view(
+    path: Annotated[
+        Path | None,
+        typer.Argument(metavar="PATH", help="latest (the default) or a run name, optionally followed by /case_name."),
+    ] = None,
+    path_b: Annotated[
+        Path | None, typer.Argument(metavar="PATH_B", help="A second run (or run/case) to compare with PATH.")
+    ] = None,
+    output_dir: OutputDir = None,
+) -> None:
+    r"""Open benchmark results in napari.
+
+    With one PATH, that run's (or case's) raw input, phantom and reconstruction. With two, side by side: the raw
+    input once, from PATH, and both reconstructions, their contrast limits linked. Needs pip install
+    waveorder\[visual].
+
+    Example: wo bm view latest/phase_3d_beads
+    """
+    root = _resolve_output_dir(output_dir)
+    target_a = _resolve_view_target(root, path)
+    target_b = None if path_b is None else _resolve_view_target(root, path_b)
+    if target_a is None or (path_b is not None and target_b is None):
+        return
+    from waveorder.plugin.view import show
+
+    layers, reconstructions = _case_layers(*target_a, label="" if target_b is None else "a/", raw=True)
+    linked: list[tuple[str, str]] = []
+    title = target_a[0].name
+    if target_b is not None:
+        layers_b, reconstructions_b = _case_layers(*target_b, label="b/", raw=False)
+        layers += layers_b
+        linked = list(zip(reconstructions, reconstructions_b, strict=False))
+        title += f" vs {target_b[0].name}"
+    if not layers:
+        typer.echo("Nothing to show.")
+        return
+    show(layers, title=f"wo bm view: {title}", command="wo bm view", linked=linked)
+
+
+def _resolve_view_target(root: Path, path: Path | None) -> tuple[Path, str | None] | None:
+    """Return the run directory and case ``path`` names: ``None`` or ``latest`` (newest run), ``run`` or ``run/case``.
+
+    Echoes why and returns ``None`` if the run, its cases or the case are not found.
+    """
+    run_name, _, case = ("latest" if path is None else path.as_posix()).partition("/")
+    if run_name == "latest":
+        runs = _list_run_dirs(root)
+        if not runs:
+            typer.echo("No benchmark runs found.")
+            return None
+        run_dir = runs[-1]
+    else:
+        run_dir = root / run_name
+        if not run_dir.is_dir():
+            typer.echo(f"Run not found: {run_dir}")
+            return None
+    if not (run_dir / "cases").is_dir():
+        typer.echo(f"No cases in run {run_dir.name}.")
+        return None
+    if case and not (run_dir / "cases" / case).is_dir():
+        typer.echo(f"Case not found: {run_dir / 'cases' / case}")
+        return None
+    return run_dir, case or None
+
+
+def _case_layers(run_dir: Path, case: str | None, *, label: str, raw: bool) -> tuple[list[_Layer], list[str]]:
+    """Return the layers of a run's case (or every case) and the names of its reconstruction layers.
+
+    Per case: the raw input (with ``raw``; a synthetic case's ``simulated.zarr``, else the experiment's input position
+    and crop), ``phantom.zarr`` and ``reconstruction.zarr``, each at the first time point. Layers are named
+    ``<label><case>/{raw,phantom,recon}/<channel>``.
+    """
+    from waveorder.plugin.view import ome_zarr_layers
+
+    experiment = None
+    if (run_dir / "experiment.yml").is_file():
+        _checkout()
+        from benchmarks.config import load_experiment
+
+        experiment = load_experiment(run_dir / "experiment.yml")
+    case_dirs = [run_dir / "cases" / case] if case else sorted(p for p in (run_dir / "cases").iterdir() if p.is_dir())
+    layers: list[_Layer] = []
+    reconstructions: list[str] = []
+    for case_dir in case_dirs:
+        name = case_dir.name
+        stores: list[tuple[str, Path, list[str] | None, tuple[slice, slice, slice] | None]] = []
+        if raw:
+            source = _raw_source(case_dir, experiment)
+            if source is None:
+                typer.echo(f"  {name}: no raw input found")
+            else:
+                stores.append(("raw", source[0], _input_channel_names(case_dir), source[1]))
+        if (case_dir / "phantom.zarr").is_dir():
+            stores.append(("phantom", case_dir / "phantom.zarr", None, None))
+        for kind, path, channels, crop in stores:
+            prefix = f"{label}{name}/{kind}/"
+            layers += ome_zarr_layers(path, prefix=prefix, channels=channels, time=0, crop=crop, windowed=False)
+        if (case_dir / "reconstruction.zarr").is_dir():
+            prefix = f"{label}{name}/recon/"
+            added = ome_zarr_layers(case_dir / "reconstruction.zarr", prefix=prefix, time=0, windowed=False)
+            layers += added
+            reconstructions += [kwargs["name"] for _, kwargs in added]
+        else:
+            typer.echo(f"  {name}: no reconstruction.zarr (removed above 25 MB unless wo bm run --save-all)")
+    return layers, reconstructions
+
+
+def _raw_source(case_dir: Path, experiment: Any) -> tuple[Path, tuple[slice, slice, slice] | None] | None:  # noqa: ANN401 (benchmarks.config.ExperimentConfig, imported lazily)
+    """Return the raw input of a case and the z, y, x box to read; ``None`` when it cannot be found.
+
+    A synthetic case's ``simulated.zarr``, else the ``input`` position of an hpc case in the run's experiment.
+    """
+    if (case_dir / "simulated.zarr").is_dir():
+        return case_dir / "simulated.zarr", None
+    case = None if experiment is None else experiment.cases.get(case_dir.name)
+    if case is None or case.type != "hpc" or not case.input or not case.position:
+        return None
+    path = Path(case.input) / case.position
+    if not path.is_dir():
+        return None
+    return path, None if case.crop is None else case.crop.slices()
+
+
+def _input_channel_names(case_dir: Path) -> list[str] | None:
+    """Return ``input_channel_names`` of the case's 3.x ``config.yml``, or ``None``."""
+    import yaml
+
+    path = case_dir / "config.yml"
+    names = yaml.safe_load(path.read_text()).get("input_channel_names") if path.is_file() else None
+    return list(names) if names else None
 
 
 def _list_run_dirs(output_dir: Path) -> list[Path]:
