@@ -1,11 +1,18 @@
 """Integration tests that click the Reconstruction tab's buttons as a user does."""
 
+import shutil
+import warnings
+from pathlib import Path
+
 import pytest
+import yaml
 
 pytest.importorskip("napari")
 pytest.importorskip("pytestqt")
 
 from waveorder.config import dump, load
+from waveorder.errors import ConfigurationWarning
+from waveorder.models import ReconstructionModel
 from waveorder.plugin import forms
 from waveorder.plugin.tab_recon import NOT_IN_THIS_VERSION, template
 
@@ -133,3 +140,31 @@ def test_load_round_trips_a_v4_file(recon_tab, tmp_path):
     config, problems = recon_tab.validated(entry)
     assert problems == []
     assert dump(config) == dump(load(path))
+
+
+def test_validate_runs_the_build_as_wo_config_check_does(recon_tab, messages, tmp_path):
+    # The schema takes object.prior: none with closed_form; the build refuses it, and Validate says so.
+    raw = template("phase")
+    raw["object"] = {"prior": "none", "dimension": raw["object"]["dimension"]}
+    raw["solver"]["reconstruction"] = "closed_form"
+    path = tmp_path / "none.yml"
+    path.write_text(yaml.safe_dump(raw))
+    (entry,) = recon_tab.open_model_files([str(path)])
+    assert recon_tab.validated(entry)[1] == []  # the schema's check alone passes
+    assert recon_tab.validate_model(entry) is None
+    assert "solver.reconstruction: " in messages[-1][0]
+    assert entry.box.title.endswith("⚠️")
+
+
+@pytest.mark.parametrize("name", ["bead_short", "bead_text", "sim_poisson_short", "sim_poisson_text"])
+def test_a_wo40_file_loaded_into_the_form_builds(recon_tab, messages, tmp_path, name):
+    # The form writes every field, so solver.reconstruction: closed_form too, as wo-4.0 wrote it.
+    del messages  # a refused load would open a message box
+    source = Path(__file__).parents[1] / "config" / "data" / "wo40" / f"{name}.yml"
+    (entry,) = recon_tab.open_model_files([str(shutil.copy(source, tmp_path / f"{name}.yml"))])
+    config, problems = recon_tab.validated(entry)
+    assert problems == []
+    assert config is not None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConfigurationWarning)
+        ReconstructionModel.from_config(load(forms.read_form(entry.form)))

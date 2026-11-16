@@ -24,6 +24,7 @@ from qtpy.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSlider,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -64,6 +65,19 @@ def _load_asset_pixmap(name: str) -> QPixmap:
     if not pixmap.loadFromData(data):
         raise ValueError(f"Unable to load bundled image: {name}")
     return pixmap
+
+
+def _disable_beside(kept: QWidget, *, within: QWidget) -> None:
+    """Disable, with why, every widget under ``within`` but ``kept``, its ancestors and the tab bars that show it."""
+    widget = kept
+    while widget is not within:
+        parent = widget.parentWidget()
+        assert parent is not None, f"{kept.objectName()} is not under {within.objectName()}"
+        for sibling in parent.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly):
+            if sibling is not widget and not isinstance(sibling, QTabBar):
+                sibling.setEnabled(False)
+                sibling.setToolTip(CALIBRATION_UNAVAILABLE)
+        widget = parent
 
 
 class _NoWheel(QObject):
@@ -159,7 +173,10 @@ class MainWidget(QWidget):
                 combo.installEventFilter(self._no_wheel)
 
     def _disable_calibration(self) -> None:
-        """Show the LC Calibration tab and Connect to MM disabled, with why; the calibration notes too."""
+        """Show the LC Calibration tab and Connect to MM disabled, with why; the calibration notes too.
+
+        The tab's Advanced page, the log box and its level, stays enabled: the reconstructions log there.
+        """
         calibration = self._get(QWidget, "Calibration")
         grid = calibration.layout()
         assert isinstance(grid, QGridLayout)
@@ -170,8 +187,7 @@ class MainWidget(QWidget):
         self.calibration_message.setStyleSheet("color: rgb(252,190,3);")
         grid.addWidget(self.calibration_message, 0, 0)
         grid.addWidget(scroll, 1, 0)
-        scroll.setEnabled(False)
-        scroll.setToolTip(CALIBRATION_UNAVAILABLE)
+        _disable_beside(self._get(QWidget, "tab_advanced"), within=self._get(QWidget, "scrollAreaWidgetContents"))
         connect = self._get(QPushButton, "qbutton_connect_to_mm")
         connect.setEnabled(False)
         connect.setToolTip(CALIBRATION_UNAVAILABLE)

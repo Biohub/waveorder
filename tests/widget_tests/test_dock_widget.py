@@ -26,7 +26,14 @@ def test_tabs_and_the_disabled_calibration(main_widget):
     connect = main_widget.ui.findChild(QPushButton, "qbutton_connect_to_mm")
     assert not connect.isEnabled()
     assert connect.toolTip() == CALIBRATION_UNAVAILABLE
-    assert not main_widget.ui.findChild(QWidget, "scrollArea").isEnabled()
+    assert not main_widget.ui.findChild(QWidget, "cb_calib_mode").isEnabled()
+    assert not main_widget.ui.findChild(QWidget, "tab_plot").isEnabled()
+    # the reconstructions log to the Advanced page of that tab, which stays reachable
+    for name in ("tab_advanced", "te_log", "cb_loglevel"):
+        assert main_widget.ui.findChild(QWidget, name).isEnabled(), name
+    inner = main_widget.ui.findChild(QTabWidget, "tabWidget_2")
+    assert inner.isEnabled()
+    assert inner.isTabEnabled(inner.indexOf(main_widget.ui.findChild(QWidget, "tab_advanced")))
     assert NOT_IN_THIS_VERSION in main_widget.calibration_message.text()
     modes = main_widget.ui.findChild(QComboBox, "cb_calib_mode")
     assert [modes.itemText(index) for index in range(modes.count())] == ["MM-Retardance", "MM-Voltage", "DAC"]

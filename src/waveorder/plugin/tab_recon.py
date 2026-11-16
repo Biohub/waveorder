@@ -13,6 +13,7 @@ import functools
 import json
 import logging
 import subprocess
+import tempfile
 import uuid
 import warnings
 from collections import Counter
@@ -717,13 +718,36 @@ class ReconTab(QWidget):
         self._highlighted.clear()
 
     def validate_model(self, entry: ModelEntry) -> V4Config | None:
-        """Check ``entry``'s configuration (**Validate**): its title gets ✅, or ⚠️ and a message of its problems."""
+        """Check ``entry``'s configuration as ``wo config check`` does (**Validate**).
+
+        Its title gets ✅, or ⚠️ and a message of its problems: the schema's, else what the build of the model refuses.
+        """
         self._reset_highlights()
         config, problems = self.validated(entry)
+        if config is not None:
+            problems = self.build_problems(entry, config)
+            config = None if problems else config
         entry.box.set_title(f"{entry.title} {_validate_ok if config is not None else _validate_alert}")
         if config is None:
             self.message_box(f"{entry.title}:\n" + "\n".join(problems))
         return config
+
+    def build_problems(self, entry: ModelEntry, config: V4Config) -> list[str]:
+        """Return what ``wo config check`` refuses in ``config`` beyond its schema, each key framed in yellow."""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / f"{entry.mode}.yml"
+            path.write_text(dump_yaml(config))
+            checked = subprocess.run(
+                [*WO, "config", "check", str(path)], capture_output=True, text=True, check=False, timeout=600
+            )
+        if checked.returncode == 0:
+            return []
+        marker = f"error: {path}: "
+        problems = [line.partition(marker)[2] for line in checked.stderr.splitlines() if marker in line]
+        for problem in problems:
+            key, _, message = problem.partition(": ")
+            self._highlight(entry, key.split("."), message)
+        return problems or [checked.stderr.strip()]
 
     def delete_model(self, entry: ModelEntry, *, silent: bool = False) -> None:
         """Remove ``entry`` (**Delete Model**), after the user confirms."""
