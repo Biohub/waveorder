@@ -43,9 +43,12 @@ classifiers = [
 ]
 dependencies = [
     "iohub>=0.4.1,<0.5",
-    "numpy>=2.5.4",
+    "natsort>=8.4",  # position order (io/positions.py)
+    "numpy>=2.5.4",  # Tensor.numpy() when tensors are written to zarr; torch does not require numpy
+    "pillow>=13",  # the sweep report's images (io/sweep_report.py)
     "pydantic>=2.14.3",
     "pyyaml>=6.0.3",
+    "rich>=15",  # the command line's tables and progress (cli/render.py)
     "tensordict>=0.15.6",
     "torch>=2.15",
     "typer>=0.29.1,<0.30",
