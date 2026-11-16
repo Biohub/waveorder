@@ -57,8 +57,7 @@ class Unit:
 class PositionWork:
     """How one position reconstructs: its input, voxel size, channel indices in and out, path and fingerprint.
 
-    ``tiles`` is the tile plan the checks made on the ``"tiles"`` and ``"field_tiles"`` paths: planning computes
-    the solver's filter on two grids to size the halo, so a unit reuses it instead of planning again.
+    ``tiles`` is the tile plan the checks made on the ``"tiles"`` and ``"field_tiles"`` paths, which a unit reuses.
     """
 
     source: str

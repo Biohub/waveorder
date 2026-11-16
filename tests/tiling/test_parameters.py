@@ -10,7 +10,7 @@ from waveorder.tiling.run import stack_tiles
 SHAPE = (8, 32, 24)
 PIXEL = (0.5, 0.25, 0.25)
 # No overlap: each core is written by its own tile alone, so a tile's values decide its core exactly.
-PLAN = TilePlan(shape=SHAPE, tile=(8, 16, 12), overlap=(0, 0, 0), halo=(0, 4, 4))
+PLAN = TilePlan(shape=SHAPE, tile=(8, 16, 12), overlap=(0, 0, 0))
 SIGMAS = torch.tensor([0.2, 0.5, 0.8, 1.1])
 
 

@@ -703,7 +703,7 @@ class _Run:
             solve = self._bind(tile)
             bound = time.perf_counter()
             begin = self._event()
-            # The region the solver's data covers within the field: the tile's read region, halo included.
+            # The region the solver's data covers within the field: the tile's read region.
             _, (y0, y1), (x0, x1) = tile.region.read
             context = solve_context(field_shape=self.loader.plan.shape[1:], region=(slice(y0, y1), slice(x0, x1)))
             with context:

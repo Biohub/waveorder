@@ -6,7 +6,6 @@ import torch
 from tests.models.plates import PIXEL_SIZE, SHAPE, fluorescence_model, write_plate
 from waveorder.errors import ParameterError
 from waveorder.nn import ImagingModel, InverseProblem, SolveContext, Solver, current_context, solve_context
-from waveorder.nn.sampling import ZYX
 from waveorder.nn.solvers import SolveResult
 
 SEEN: list[SolveContext] = []
@@ -18,9 +17,6 @@ class Recording(Solver):
 
     def check(self, model: ImagingModel) -> None:
         del model
-
-    def tile_halo(self) -> ZYX[int]:
-        return (0, 2, 2)
 
     def run(self, problem: InverseProblem) -> SolveResult:
         SEEN.append(current_context())

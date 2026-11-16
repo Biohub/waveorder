@@ -1,10 +1,9 @@
-"""The tile planner: which region each tile reads, which it contributes to, with what weights, and how much halo.
+"""The tile planner: which region each tile reads, which it contributes to, and with what weights.
 
 Along each axis a tile has three nested regions: the **core**, one cell of a non-overlapping grid that is written
 exactly once; the **blend region**, the core widened by ``overlap`` on each side, cross-faded with its neighbours; and
-the **read region**, the blend region widened by ``halo``, aligned to storage chunks and lengthened to an FFT-friendly
-size. A tile is reconstructed on its read region and only its blend region is kept. The halo does not cover the
-volume's outer edge, where a whole-volume circular solve wraps: compare on an interior mask.
+the **read region**, the blend region aligned to storage chunks and brought to one FFT-friendly length for every tile.
+A tile is reconstructed on its read region and only its blend region is kept.
 """
 
 import math
@@ -19,12 +18,7 @@ import torch
 from torch import Tensor
 
 from waveorder.errors import ParameterError
-from waveorder.nn.model import ImagingModel
-from waveorder.nn.parameters import placement
-from waveorder.nn.sampling import ZYX, Sampling
-from waveorder.nn.solvers import Solver
-from waveorder.nn.systems.base import ImagingSystem
-from waveorder.observe import operation
+from waveorder.nn.sampling import ZYX
 
 type Blend = Literal["linear", "cosine"]
 """Cross-fade across an overlap: a linear ramp, or a raised-cosine (``sin^2``) ramp."""
@@ -94,16 +88,15 @@ class _Axis:
     reads: tuple[Span, ...]
 
 
-def _plan_axis(n: int, *, tile: int, overlap: int, halo: int, chunk: int) -> _Axis:
+def _plan_axis(n: int, *, tile: int, overlap: int, chunk: int) -> _Axis:
     cores = tuple((start, min(start + tile, n)) for start in range(0, n, tile))
     if len(cores) == 1:
         whole = ((0, n),)
         return _Axis(cores, whole, whole)
     blends = tuple((max(a - overlap, 0), min(b + overlap, n)) for a, b in cores)
-    wanted = [(max(a - halo, 0), min(b + halo, n)) for a, b in blends]
-    aligned = [(a // chunk * chunk, min(-(-b // chunk) * chunk, n)) for a, b in wanted]
-    # One read length for every tile, so one bound operator serves the whole plan; a tile near the high edge shifts
-    # inward instead of shrinking, which only gives it more support.
+    aligned = [(a // chunk * chunk, min(-(-b // chunk) * chunk, n)) for a, b in blends]
+    # One read length for every tile, so one bound operator serves the whole plan; a tile at an edge of the volume
+    # shifts inward instead of shrinking.
     length = _smooth_length(max(b - a for a, b in aligned), limit=n, step=chunk)
     reads = tuple((min(a, n - length), min(a, n - length) + length) for a, _ in aligned)
     return _Axis(cores, blends, reads)
@@ -180,8 +173,6 @@ class TilePlan:
     overlap : tuple[int, int, int]
         Voxels each blend region extends past its core on each side; at most ``tile // 2`` where an axis has several
         tiles.
-    halo : tuple[int, int, int]
-        Voxels of extra support read beyond the blend region on each side, then discarded; see :func:`halo_for`.
     chunks : tuple[int, int, int], optional
         Source chunk shape along z, y, x; read regions are aligned outward to it. ``None`` for an unchunked source.
     blend : {"linear", "cosine"}
@@ -196,7 +187,6 @@ class TilePlan:
     shape: ZYX[int]
     tile: ZYX[int]
     overlap: ZYX[int] = (0, 0, 0)
-    halo: ZYX[int] = (0, 0, 0)
     chunks: ZYX[int] | None = None
     blend: Blend = "cosine"
     _axes: tuple[_Axis, ...] = field(init=False, repr=False, compare=False)
@@ -205,10 +195,9 @@ class TilePlan:
         shape = _triple(self.shape, name="shape", minimum=1)
         tile = _triple(self.tile, name="tile", minimum=1)
         overlap = _triple(self.overlap, name="overlap", minimum=0)
-        halo = _triple(self.halo, name="halo", minimum=0)
         chunks = None if self.chunks is None else _triple(self.chunks, name="chunks", minimum=1)
         # Lists are stored as tuples, so plans hash and compare as values.
-        for name, value in (("shape", shape), ("tile", tile), ("overlap", overlap), ("halo", halo), ("chunks", chunks)):
+        for name, value in (("shape", shape), ("tile", tile), ("overlap", overlap), ("chunks", chunks)):
             object.__setattr__(self, name, value)
         if self.blend not in ("linear", "cosine"):
             raise ParameterError(f"TilePlan blend must be 'linear' or 'cosine', got {self.blend!r}", path="blend")
@@ -220,8 +209,8 @@ class TilePlan:
                     path=f"overlap.{name}",
                 )
         axes = tuple(
-            _plan_axis(n, tile=t, overlap=o, halo=h, chunk=c)
-            for n, t, o, h, c in zip(shape, tile, overlap, halo, chunks or (1, 1, 1), strict=True)
+            _plan_axis(n, tile=t, overlap=o, chunk=c)
+            for n, t, o, c in zip(shape, tile, overlap, chunks or (1, 1, 1), strict=True)
         )
         object.__setattr__(self, "_axes", axes)
 
@@ -338,83 +327,3 @@ def peak_chunk_bytes(reads: Sequence[tuple[int, Region]], *, chunks: ZYX[int], c
         peak = max(peak, live)
         live -= ends[index - ahead]
     return peak * chunk_bytes
-
-
-def _responses(target: ImagingSystem | ImagingModel, sampling: Sampling, *, solver: Solver | None) -> Tensor:
-    """Return the summed ``|response|`` ``(Z, Y, X)`` to a unit impulse at the origin of each input volume."""
-    system = target.system if isinstance(target, ImagingModel) else target
-    dtype, device = placement(system)
-    total = torch.zeros(sampling.shape, dtype=torch.float64, device=device)
-
-    def impulse(shape: tuple[int, ...], index: int) -> Tensor:
-        delta = torch.zeros(shape, dtype=dtype, device=device)
-        delta[index, 0, 0, 0] = 1
-        return delta
-
-    with torch.no_grad(), operation():  # probes, not reconstructions: they report no events
-        if solver is None:
-            operator = system.bind(sampling)
-            for index in range(len(system.fields)):
-                total += operator.apply(impulse(system.object_shape(sampling), index)).abs().sum(0)
-            return total
-        if not isinstance(target, ImagingModel):
-            raise ParameterError(
-                "halo_for: a solver needs the ImagingModel it reconstructs with, not only its system", path="solver"
-            )
-        for channel in range(system.channel_count):
-            data = impulse(system.data_shape(sampling), channel)
-            total += solver(data, target, sampling).estimate.abs().sum(0)
-    return total
-
-
-def _expect_energy(energy: float, *, where: str) -> None:
-    if not 0 < energy < 1:
-        raise ParameterError(f"{where}: energy must be in (0, 1), got {energy}", path="energy")
-
-
-def halo_for(
-    target: ImagingSystem | ImagingModel, sampling: Sampling, *, energy: float = 1 - 1e-3, solver: Solver | None = None
-) -> ZYX[int]:
-    """Return the halo, in voxels along z, y, x, that keeps a fraction ``energy`` of the kernel's L1 mass per axis.
-
-    Without ``solver`` the kernel is the point-spread function of ``target``, a lower bound for a deconvolution. With
-    ``solver`` it is the reconstruction's impulse response; the bound holds for a linear shift-invariant solver
-    (:class:`~waveorder.nn.Wiener`). A solver that states its own halo (:meth:`~waveorder.nn.Solver.tile_halo`) gets it.
-
-    Parameters
-    ----------
-    target : ImagingSystem or ImagingModel
-        The system, or the model to reconstruct with (required with ``solver``).
-    sampling : Sampling
-        One tile's read region (the plan's ``read_shape``). The halo never exceeds half of it.
-    energy : float
-        Fraction of the kernel's L1 mass, in (0, 1), to keep within the halo along each axis.
-    solver : Solver, optional
-        Use the reconstruction's impulse response instead of the point-spread function.
-
-    Returns
-    -------
-    tuple[int, int, int]
-        Halo along z, y, x in voxels.
-
-    Raises
-    ------
-    ParameterError
-        If ``energy`` is not in (0, 1), or ``solver`` is given with a bare system; ``path`` names the argument.
-    """
-    _expect_energy(energy, where="halo_for")
-    declared = None if solver is None else solver.tile_halo()
-    if declared is not None:
-        z, y, x = (min(h, n // 2) for h, n in zip(declared, sampling.shape, strict=True))
-        return (z, y, x)
-    magnitude = _responses(target, sampling, solver=solver)
-    halo = []
-    for axis, n in enumerate(sampling.shape):
-        profile = magnitude.sum(tuple(a for a in range(3) if a != axis))
-        index = torch.arange(n, device=profile.device)
-        distance = torch.minimum(index, n - index)  # circular distance to the kernel centre at index 0
-        mass = torch.zeros(n // 2 + 1, dtype=profile.dtype, device=profile.device).index_add_(0, distance, profile)
-        reached = torch.nonzero(torch.cumsum(mass, 0) / profile.sum() >= energy)
-        halo.append(int(reached[0]) if len(reached) else n // 2)
-    z, y, x = halo
-    return (z, y, x)

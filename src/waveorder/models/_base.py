@@ -73,15 +73,12 @@ from waveorder.nn.search.beads import BeadCalibration, calibrate_beads
 from waveorder.nn.search.sweep import WeightSweep
 from waveorder.nn.systems.fluorescence import WidefieldFluorescence3D
 from waveorder.nn.systems.tiled import TileParameters
-from waveorder.tiling import TileOptions, TilePlan, TileStats, halo_for, reconstruct_series
+from waveorder.tiling import TileOptions, TilePlan, TileStats, reconstruct_series
 from waveorder.tiling.merge import ArrayLike, WritableArray
 from waveorder.tiling.run import expect_volumes, stack_tiles
 
 _BEAD_ITERATIONS = 200
 """Gradient steps of a bead calibration whose search holds no :class:`~waveorder.nn.GradientSearch`."""
-
-_HALO_ENERGY = 0.99
-"""The fraction of the solver's filter (L1 mass per axis) a tile's halo keeps (:func:`~waveorder.tiling.halo_for`)."""
 
 
 class ReconstructionModel:
@@ -944,7 +941,7 @@ class ReconstructionModel:
     def tile_plan(
         self, shape: ZYX[int], *, tile: ZYX[int], overlap: ZYX[int] = (0, 0, 0), pixel_size: PixelSize | None = None
     ) -> TilePlan:
-        """Plan tiles of a ``(Z, Y, X)`` volume, with the halo that keeps 99 % of the solver's filter per axis.
+        """Plan tiles of a ``(Z, Y, X)`` volume: each is reconstructed on its core widened by ``overlap``.
 
         Parameters
         ----------
@@ -962,15 +959,9 @@ class ReconstructionModel:
         volume = zyx(shape, where=where, name="shape", minimum=1)
         core = zyx(tile, where=where, name="tile", minimum=1)
         widened = zyx(overlap, where=where, name="overlap", minimum=0)
-
-        def read(halo: ZYX[int]) -> Sampling:
-            z, y, x = (min(n, t + 2 * (o + h)) for n, t, o, h in zip(volume, core, widened, halo, strict=True))
-            return Sampling(shape=(z, y, x), pixel_size=size)
-
-        self.imaging_model.check(self.solver, read((0, 0, 0)))  # the grid is judged before a filter is computed on it
-        halo = halo_for(self.imaging_model, read((0, 0, 0)), energy=_HALO_ENERGY, solver=self.solver)
-        halo = halo_for(self.imaging_model, read(halo), energy=_HALO_ENERGY, solver=self.solver)
-        return TilePlan(shape=volume, tile=core, overlap=widened, halo=halo)
+        z, y, x = (min(n, t + 2 * o) for n, t, o in zip(volume, core, widened, strict=True))
+        self.imaging_model.check(self.solver, Sampling(shape=(z, y, x), pixel_size=size))
+        return TilePlan(shape=volume, tile=core, overlap=widened)
 
     def field_tile_plan(self, shape: ZYX[int], *, pixel_size: PixelSize | None = None) -> TilePlan:
         """Plan the :attr:`field_tiles` over a ``(Z, Y, X)`` volume, as :meth:`tile_plan` plans tiles; each spans z."""

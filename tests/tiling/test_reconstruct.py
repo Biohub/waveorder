@@ -47,7 +47,7 @@ def test_identity_reconstruction_stitches_exactly(blend, overlap):
     assert stats.tiles == len(plan.regions)
 
 
-def test_blur_stitching_error_falls_with_the_halo_and_is_small_with_enough():
+def test_blur_stitching_error_falls_as_the_overlap_grows():
     # Zero data near the lateral boundary keeps the whole-volume reference free of its own wrap-around error there.
     data, model = _data(), blur_model(1.5)
     data[..., :MARGIN, :] = 0
@@ -56,21 +56,21 @@ def test_blur_stitching_error_falls_with_the_halo_and_is_small_with_enough():
     data[..., -MARGIN:] = 0
     reference = _interior(_whole(data, model))
     errors = []
-    for halo in (0, 4, 8, 24):
-        plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(halo, halo, halo))
+    for overlap in (0, 4, 8, 16):  # one tile along z: only the lateral seams are stitched
+        plan = TilePlan(shape=SHAPE, tile=(24, 32, 32), overlap=(0, overlap, overlap))
         sink, _ = _tiled(data, model, plan)
         errors.append((_interior(sink) - reference).abs().max().item())
     scale = reference.abs().max().item()
     assert all(later < earlier for earlier, later in itertools.pairwise(errors))
-    assert errors[0] > 1e-1 * scale  # without a halo, seams are visible
-    assert errors[-1] < 1e-5 * scale
+    assert errors[0] > 1e-1 * scale  # without an overlap, seams are visible
+    assert errors[-1] < 5e-3 * scale  # half a tile of cross-fade leaves 0.2%
 
 
 def test_operator_is_bound_once_per_sampling_and_rebound_after_a_parameter_changes():
     data, model = _data(), blur_model(1.0)
     system = model.system
     assert isinstance(system, Blur)
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(2, 4, 4))
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4))
     assert len(plan.regions) > 1
     _tiled(data, model, plan)
     assert system.computed == 1
@@ -92,7 +92,7 @@ def test_operator_is_bound_once_per_sampling_and_rebound_after_a_parameter_chang
 def test_array_like_source_and_sink_with_chunks_and_parallel_writes():
     data, model = _data(), blur_model(1.0)
     chunks = (6, 16, 16)
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(2, 8, 8), chunks=chunks)
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), chunks=chunks)
     source = ArraySource(data[0], chunks=chunks)
     sink = ArraySink(SHAPE, chunks=(12, 32, 16))
     _, stats = _tiled(source, model, plan, sink=sink, options=TileOptions(write_workers=3, read_workers=3))
@@ -122,7 +122,7 @@ def test_parallel_writes_into_partial_chunks_are_refused():
 
 
 def test_memory_budget_refuses_plans_that_do_not_fit():
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(2, 4, 4))
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4))
     budget = 1 << 16
     options = TileOptions(memory_budget=budget)
     needed = estimate_memory(plan, channels=1, fields=1, source_itemsize=4, options=options).host
@@ -134,12 +134,12 @@ def test_memory_budget_refuses_plans_that_do_not_fit():
 
 
 def test_memory_estimate_counts_one_staging_slot_per_pinned_slot():
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), halo=(2, 4, 4))
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4))
     read = 2 * _numel(plan.regions[0].read_shape)  # uint16
     small = estimate_memory(plan, channels=1, fields=1, source_itemsize=2, options=TileOptions(pinned_slots=1))
     large = estimate_memory(plan, channels=1, fields=1, source_itemsize=2, options=TileOptions(pinned_slots=3))
     assert large.staging - small.staging == 2 * read
-    # The estimate reports the shape every tile reads. Along z the halo is clipped at the volume edge: 12 + 2 = 14
+    # The estimate reports the shape every tile reads. Along z the overlap is clipped at the volume edge: 12 + 2 = 14
     # = 2 * 7; laterally 32 + 2 * 4 = 40 = 2^3 * 5 (both already FFT-friendly).
     assert small.read_shape == plan.read_shape == (14, 40, 40)
 
@@ -208,7 +208,6 @@ def test_public_surface_is_the_plan_options_stats_and_entry_points():
         "TileOptions",
         "TileStats",
         "estimate_memory",
-        "halo_for",
         "reconstruct_series",
         "recover_zernikes",
     }
@@ -216,7 +215,7 @@ def test_public_surface_is_the_plan_options_stats_and_entry_points():
 
 def test_zarr_arrays_round_trip(tmp_path):
     data, model = _data(), blur_model(1.0)
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(2, 8, 8), chunks=(6, 16, 16))
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), chunks=(6, 16, 16))
     source = zarr.open_array(tmp_path / "source.zarr", mode="w", shape=SHAPE, chunks=(6, 16, 16), dtype="uint16")
     source[...] = (data[0] * 100 + 1000).round().to(torch.int32).numpy()
     sink = zarr.open_array(tmp_path / "sink.zarr", mode="w", shape=SHAPE, chunks=(12, 32, 32), dtype="float32")
@@ -236,7 +235,7 @@ def test_zarr_arrays_round_trip(tmp_path):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_matches_cpu():
     data = _data()
-    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4), halo=(2, 8, 8))
+    plan = TilePlan(shape=SHAPE, tile=(12, 32, 32), overlap=(2, 4, 4))
     source = (data * 100 + 1000).round().to(torch.uint16)
     model = blur_model(1.0).cuda()
     sink, stats = _tiled(source, model, plan, device="cuda", options=TileOptions())

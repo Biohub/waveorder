@@ -28,7 +28,7 @@ def plate(tmp_path):
 
 
 def _plan():
-    return TilePlan(shape=SHAPE, tile=(12, 16, 16), overlap=(0, 4, 4), halo=(0, 4, 4), chunks=(6, 16, 16))
+    return TilePlan(shape=SHAPE, tile=(12, 16, 16), overlap=(0, 4, 4), chunks=(6, 16, 16))
 
 
 def test_reconstructs_selected_channels_and_times_of_an_hcs_position(plate, tmp_path):

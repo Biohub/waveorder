@@ -32,7 +32,7 @@ def test_errors_tiling_and_testing_are_attributes_in_a_fresh_interpreter():
         import waveorder as wo
         assert issubclass(wo.errors.Rejected, wo.errors.WaveorderError)
         assert "torch" not in sys.modules, "waveorder.errors imported torch"
-        assert callable(wo.tiling.halo_for)
+        assert callable(wo.tiling.reconstruct_series)
         assert callable(wo.testing.check_system)
         assert {"errors", "tiling", "testing"} <= set(wo.__all__) <= set(dir(wo))
         """

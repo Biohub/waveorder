@@ -26,7 +26,7 @@ noise: {gaussian: {sigma: 0.01}}
 solver:
   calibration: {score: evidence, search: [{grid: {points: 3}}]}
 """
-SHAPE = (8, 32, 256)  # 8 tiles along x; each reads 96 voxels (halo 30), so the outer three see one aperture
+SHAPE = (8, 32, 256)  # 8 tiles along x; with no overlap each reads its own 32 voxels, so each sees one aperture
 PIXEL_SIZE = (0.25, 0.1, 0.1)  # data.pixel_size of CONFIG
 NA = "system.detection.numerical_aperture"
 

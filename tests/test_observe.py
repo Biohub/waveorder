@@ -35,7 +35,7 @@ from waveorder.nn import (
 from waveorder.nn.verbs import InverseProblem
 from waveorder.observe import context, emit
 from waveorder.testing import assert_no_host_sync
-from waveorder.tiling import TilePlan, halo_for, reconstruct_series
+from waveorder.tiling import TilePlan, reconstruct_series
 
 SAMPLING = Sampling(shape=(8, 32, 32), pixel_size=(0.25, 0.1, 0.1))
 NA = "system.detection.numerical_aperture"
@@ -269,13 +269,6 @@ def test_a_tiled_reconstruction_reports_one_tiles_end():
     (stats,) = recorder.payloads("tiles.end")
     assert stats["tiles"] == len(plan.regions)
     assert {"read_s", "gpu_s", "bytes_written", "nonfinite", "wall_s"} <= set(stats)
-
-
-def test_halo_probe_solves_report_nothing():
-    model, recorder = blur_model(0.5), Recorder()
-    with observe(recorder, iterations=True):
-        halo_for(model, Sampling(shape=(8, 24, 20), pixel_size=(1.0, 1.0, 1.0)), solver=FISTA(loop=Loop(2)))
-    assert recorder.names == []
 
 
 # --- iteration histories ------------------------------------------------------------------------------------------

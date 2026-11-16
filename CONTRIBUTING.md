@@ -146,8 +146,7 @@ Notes per kind:
   computed.
 - **Solvers and scores** are `Verb`s: `forward` is final and runs the model's check, builds an `InverseProblem` and
   calls `run`, where `problem.operator` is `H` bound on first use. A solver that never reads it overrides
-  `needs_operator` to return `False`; a solver that is not linear in the data returns its halo from `tile_halo()`.
-  One file per solver in `nn/solvers/`; scores in `nn/scores.py`.
+  `needs_operator` to return `False`. One file per solver in `nn/solvers/`; scores in `nn/scores.py`.
 - **Search stages** keep their points inside `objective.prior`'s bounds and their tensors on the device, so stages
   chain without a host sync. Files in `nn/search/`.
 

@@ -19,7 +19,7 @@ def _source(shape=(2, 12, 40, 36), *, dtype=torch.int32, seed=0):
 
 
 def _plan(shape=(12, 40, 36)):
-    return TilePlan(shape=shape, tile=(6, 16, 16), overlap=(1, 2, 2), halo=(1, 3, 3))
+    return TilePlan(shape=shape, tile=(6, 16, 16), overlap=(1, 2, 2))
 
 
 def _loader(source, *, plan=None, device="cpu", dtype=torch.float32, **options):

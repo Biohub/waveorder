@@ -9,14 +9,14 @@ import torch
 from tests.tiling.conftest import ArraySource, Blur, blur_model
 from waveorder.errors import ParameterError
 from waveorder.nn import ImagingModel, Sampling, Wiener
-from waveorder.tiling import TileOptions, TilePlan, estimate_memory, halo_for, reconstruct_series
+from waveorder.tiling import TileOptions, TilePlan, estimate_memory, reconstruct_series
 from waveorder.tiling.plan import chunk_keys
 from waveorder.tiling.run import ChunkCache, OperatorCache, TileLoader
 
 SHAPE = (16, 64, 48)
 PIXEL = (1.0, 1.0, 1.0)
 CHUNKS = (8, 16, 16)
-PLAN = TilePlan(shape=SHAPE, tile=(16, 8, 12), overlap=(0, 4, 6), halo=(0, 2, 3))  # tiles smaller than chunks
+PLAN = TilePlan(shape=SHAPE, tile=(16, 8, 12), overlap=(0, 4, 6))  # tiles smaller than chunks
 
 
 def _data(seed=0, shape=SHAPE):
@@ -178,66 +178,6 @@ def test_invalid_output_dtype_names_the_field():
     with pytest.raises(ParameterError, match=r"TileOptions output_dtype") as caught:
         TileOptions(output_dtype=torch.int32)
     assert caught.value.path == "output_dtype"
-
-
-def test_halo_for_the_psf_of_a_gaussian_blur_is_about_three_sigma():
-    sigma = 1.5
-    halo = halo_for(Blur(sigma), Sampling(shape=(32, 64, 64), pixel_size=PIXEL), energy=1 - 1e-3)
-    # A Gaussian keeps 1 - 1e-3 of its mass within 3.29 sigma.
-    assert all(math.floor(3.29 * sigma) - 1 <= h <= math.ceil(3.29 * sigma) + 1 for h in halo)
-    assert halo_for(Blur(sigma), Sampling(shape=(32, 64, 64), pixel_size=PIXEL)) == halo  # energy 1 - 1e-3 default
-
-
-@pytest.mark.parametrize("tail", [1e-3, 1e-5])
-def test_half_the_halo_of_halo_for_stitches_with_a_larger_error(tail):
-    shape, margin = (24, 96, 80), 16
-    data = torch.randn(1, *shape, generator=torch.Generator().manual_seed(0))
-    for axis in (2, 3):  # zero data near the lateral boundary: the whole-volume reference wraps there
-        data.narrow(axis, 0, margin).zero_()
-        data.narrow(axis, shape[axis - 1] - margin, margin).zero_()
-    model, solver = blur_model(1.5), Wiener()
-    sampling = Sampling(shape=shape, pixel_size=PIXEL)
-    whole = solver(data, model, sampling).estimate[:, 8:-8, margin:-margin, margin:-margin]
-    halo = halo_for(model, sampling, energy=1 - tail, solver=solver)
-
-    def error(h):
-        plan = TilePlan(shape=shape, tile=(12, 32, 32), overlap=(2, 4, 4), halo=h)
-        sink = torch.full((1, *shape), float("nan"))
-        _reconstruct(data, sink, model, plan)
-        return (sink[:, 8:-8, margin:-margin, margin:-margin] - whole).abs().max().item()
-
-    assert error(tuple(h // 2 for h in halo)) > error(halo)
-
-
-def test_a_smaller_tail_of_halo_for_at_the_tiles_sampling_stitches_with_a_smaller_error():
-    # halo_for measures the kernel of one tile's read region; that region grows with the halo, so iterate.
-    shape, margin = (24, 96, 80), 16
-    data = torch.randn(1, *shape, generator=torch.Generator().manual_seed(0))
-    for axis in (2, 3):
-        data.narrow(axis, 0, margin).zero_()
-        data.narrow(axis, shape[axis - 1] - margin, margin).zero_()
-    model, solver = blur_model(1.5), Wiener()
-    whole = solver(data, model, Sampling(shape=shape, pixel_size=PIXEL)).estimate
-    errors = []
-    for tail in (1e-2, 1e-3, 1e-5):
-        halo, plan = (0, 0, 0), None
-        for _ in range(6):
-            plan = TilePlan(shape=shape, tile=(12, 32, 32), overlap=(2, 4, 4), halo=halo)
-            tile = Sampling(shape=plan.read_shape, pixel_size=PIXEL)
-            if (halo := halo_for(model, tile, energy=1 - tail, solver=solver)) == plan.halo:
-                break
-        assert plan is not None
-        assert plan.halo == halo
-        sink = torch.full((1, *shape), float("nan"))
-        _reconstruct(data, sink, model, plan)
-        error = (sink - whole)[:, 8:-8, margin:-margin, margin:-margin].abs().max().item()
-        errors.append(error)
-    assert errors[0] > errors[1] > errors[2]
-
-
-def test_halo_for_rejects_a_solver_without_a_model():
-    with pytest.raises(ParameterError, match="ImagingModel"):
-        halo_for(Blur(1.0), Sampling(shape=SHAPE, pixel_size=PIXEL), solver=Wiener())
 
 
 def test_operator_cache_binds_afresh_when_the_operator_would_carry_gradients():

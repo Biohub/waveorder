@@ -11,7 +11,7 @@ from torch import Tensor
 
 from waveorder.errors import ConvergenceWarning, IncompatibleModelError, ParameterError
 from waveorder.nn.parameters import can_read_back, read_flag, repr_parts
-from waveorder.nn.sampling import ZYX, Object, Status
+from waveorder.nn.sampling import Object, Status
 from waveorder.nn.verbs import InverseProblem, Verb
 from waveorder.observe import emit, recording
 from waveorder.registry import VALUE, register
@@ -75,15 +75,6 @@ class Solver(Verb[SolveResult]):
     A module, so a solver defined outside this package (with trainable weights, say) subclasses it and implements
     :meth:`run` (and :meth:`check` if it cannot run on every model).
     """
-
-    def tile_halo(self) -> ZYX[int] | None:
-        """Return the voxels of context along z, y, x a tile needs on each side, when the solver knows them.
-
-        ``None`` (the default) lets :func:`waveorder.tiling.halo_for` measure it from the impulse response, which
-        holds for a solver linear in the data; no solver in this package overrides it, and a nonlinear solver defined
-        outside the package can return its own.
-        """
-        return None
 
     @override
     def report(self, problem: InverseProblem, result: object) -> None:

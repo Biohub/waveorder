@@ -26,8 +26,8 @@ class SolveContext:
     field_shape : tuple[int, int] or None
         Pixels of the whole field of view along y and x.
     region : tuple[slice, slice] or None
-        The y and x extent, within the field, of the data the solver is given: for a tile, its read region, halo
-        included. ``None`` means the data is the whole field.
+        The y and x extent, within the field, of the data the solver is given: for a tile, its read region.
+        ``None`` means the data is the whole field.
     """
 
     position: str | None = None

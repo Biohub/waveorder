@@ -76,10 +76,7 @@ def _fits(problems: Problems, model: ReconstructionModel, plan: dict) -> tuple[T
         if model.field_tiles is None:
             return None, True
         if model.z_padding:
-            problems.add(
-                f"z_padding is {model.z_padding}, but field tiles are calibrated unpadded (their halos treat the "
-                "boundaries); set it to 0"
-            )
+            problems.add(f"z_padding is {model.z_padding}, but field tiles are calibrated unpadded; set it to 0")
             return None, False
         return model.field_tile_plan(shape, pixel_size=pixel_size), True
     except Rejected as error:

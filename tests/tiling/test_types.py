@@ -3,23 +3,15 @@ from typing import Any
 import pytest
 import torch
 
-from tests.tiling.conftest import Blur, blur_model
+from tests.tiling.conftest import blur_model
 from waveorder.errors import ParameterError, ShapeError
-from waveorder.nn import Sampling, Wiener
-from waveorder.tiling import TilePlan, halo_for, reconstruct_series
+from waveorder.nn import Wiener
+from waveorder.tiling import TilePlan, reconstruct_series
 from waveorder.tiling.run import expect_volumes
 
 SHAPE = (8, 32, 32)
 PIXEL = (1.0, 1.0, 1.0)
-SAMPLING = Sampling(shape=SHAPE, pixel_size=PIXEL)
 PLAN = TilePlan(shape=SHAPE, tile=(8, 16, 16))
-
-
-def test_halo_for_checks_the_energy():
-    for energy in (0.0, 1.0, 1.5):
-        with pytest.raises(ParameterError, match=r"energy must be in \(0, 1\)") as caught:
-            halo_for(Blur(1.0), SAMPLING, energy=energy)
-        assert caught.value.path == "energy"
 
 
 def _series(**overrides):
