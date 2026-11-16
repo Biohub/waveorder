@@ -18,9 +18,20 @@ from waveorder.nn import (
     Tikhonov,
     TotalVariation,
 )
-from waveorder.nn.functional import from_half_spectrum
+from waveorder.nn.functional import (
+    abs2,
+    add_diagonal,
+    cholesky_hermitian,
+    cholesky_solve,
+    forward_differences,
+    forward_differences_adjoint,
+    from_half_spectrum,
+    gram,
+    to_half_spectrum,
+)
 from waveorder.nn.noise import PoissonGaussian
 from waveorder.nn.solvers import ADMM, BACK_PROJECTORS, Loop
+from waveorder.nn.solvers import admm as admm_module
 from waveorder.nn.solvers.richardson_lucy import back_projector
 from waveorder.testing import check_noise, check_solver
 
@@ -275,6 +286,45 @@ def test_admm_passes_the_solver_kit():
     model = ImagingModel(make_system(1.0), TotalVariation(0.05), Gaussian(0.1)).double()
     data = torch.randn(1, *SMALL.shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
     check_solver(ADMM(loop=Loop(3), rho=0.1), data=data, model=model, sampling=SMALL)
+
+
+def _admm_refactoring_every_step(data, model, sampling, *, steps: int, rho: float, damping: float) -> torch.Tensor:
+    """ADMM as it was before the factor moved into the state: the f-update's system built and factored per step."""
+    fourier = model.system.bind(sampling).as_fourier()
+    backprojection = fourier.adjoint(data.reshape(fourier.data_shape))
+    x = torch.zeros_like(backprojection)
+    z = torch.zeros_like(forward_differences(x))
+    u = z.clone()
+    for _ in range(steps):
+        rhs = backprojection + rho * forward_differences_adjoint(z - u)
+        differences = admm_module._difference_transfers(sampling.shape, like=fourier.transfer)  # noqa: SLF001
+        diagonal = rho * abs2(differences).sum(dim=0) + damping
+        factor = cholesky_hermitian(add_diagonal(gram(fourier.transfer), diagonal))
+        x = from_half_spectrum(cholesky_solve(factor, to_half_spectrum(rhs)), sampling.shape)
+        gradient = forward_differences(x)
+        z = admm_module._shrink(gradient + u, model.object_prior.weight / rho)  # noqa: SLF001
+        u = u + gradient - z
+    return x
+
+
+@pytest.mark.parametrize(("channels", "fields"), [(1, 1), (3, 2)])
+def test_admm_factors_once_and_matches_refactoring_every_step_bit_for_bit(channels, fields, monkeypatch):
+    transfer = 0.3 * random_transfer(channels, fields, SMALL.shape, dtype=torch.float64)
+    system = MatrixSystem(transfer, fields=("a", "b")[:fields])
+    model = ImagingModel(system, TotalVariation(0.05), Gaussian(0.3)).double()
+    data = torch.randn(channels, *SMALL.shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    with torch.no_grad():
+        expected = _admm_refactoring_every_step(data, model, SMALL, steps=6, rho=0.1, damping=1e-2)
+    factored = []
+
+    def counting(matrix):
+        factored.append(matrix.shape)
+        return cholesky_hermitian(matrix)
+
+    monkeypatch.setattr(admm_module, "cholesky_hermitian", counting)
+    estimate = ADMM(loop=Loop(6), rho=0.1, damping=1e-2)(data, model, SMALL).estimate
+    assert len(factored) == 1
+    assert torch.equal(estimate, expected)
 
 
 @pytest.mark.parametrize(

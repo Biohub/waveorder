@@ -1,8 +1,8 @@
 """Where a solve happens: the position, time point and region within the field that a solver's data covers.
 
-The position methods and the tile driver set it; a solver that needs it (e.g. one that varies with the place of its
-data in the field) reads it with :func:`current_context`. It is a :class:`contextvars.ContextVar`, so it follows the
-thread and task that set it.
+The position methods and the tile driver set it. No solver in this package reads it: it is the hook for a solver
+defined outside the package whose result depends on where its data lies in the field, which reads it with
+:func:`current_context`. It is a :class:`contextvars.ContextVar`, so it follows the thread and task that set it.
 """
 
 from collections.abc import Generator

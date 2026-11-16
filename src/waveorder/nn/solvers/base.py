@@ -72,15 +72,16 @@ def _described(value: object) -> str:
 class Solver(Verb[SolveResult]):
     """Estimates the object: ``solver(data, model, sampling, *, operator=None) -> SolveResult``.
 
-    A module, so a learned network is a solver too: subclass and implement :meth:`run` (and :meth:`check` if it
-    cannot run on every model).
+    A module, so a solver defined outside this package (with trainable weights, say) subclasses it and implements
+    :meth:`run` (and :meth:`check` if it cannot run on every model).
     """
 
     def tile_halo(self) -> ZYX[int] | None:
         """Return the voxels of context along z, y, x a tile needs on each side, when the solver knows them.
 
         ``None`` (the default) lets :func:`waveorder.tiling.halo_for` measure it from the impulse response, which
-        holds for a solver linear in the data; a nonlinear solver (a learned network) returns its own.
+        holds for a solver linear in the data; no solver in this package overrides it, and a nonlinear solver defined
+        outside the package can return its own.
         """
         return None
 

@@ -19,9 +19,10 @@ from torch.func import vmap
 
 from waveorder.errors import IncompatibleModelError, ParameterError, PlacementError, ShapeError
 from waveorder.nn.model import ImagingModel
+from waveorder.nn.noise import Gaussian
 from waveorder.nn.operators import LinearOperator
 from waveorder.nn.optics import ZernikeAberration
-from waveorder.nn.parameters import ParameterPrior, evaluate, free_specs, same_device
+from waveorder.nn.parameters import ParameterPrior, evaluate, free_specs, read_flag, same_device
 from waveorder.nn.sampling import ZYX, Sampling
 from waveorder.nn.scores import Score
 from waveorder.nn.search.base import (
@@ -34,6 +35,7 @@ from waveorder.nn.search.base import (
     expect_searchable,
     on_bounds,
     score_candidates,
+    start_from_data,
     warn_undetermined,
 )
 from waveorder.nn.search.descent import GradientSearch
@@ -136,8 +138,10 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
 
     Each tile is calibrated as :func:`~waveorder.nn.calibrate` would calibrate it alone. A stage with
     ``reads_back = False`` (grid, random, gradient search) runs on a chunk of tiles at once; one that reads back
-    (L-BFGS, Nelder-Mead) runs tile by tile. ``model`` is not modified. ``model``, ``sampling``, ``score`` and
-    ``search`` are those of :func:`~waveorder.nn.calibrate`.
+    (L-BFGS, Nelder-Mead) runs tile by tile. A ``Gaussian("estimate")`` noise starts from each tile's own data, its
+    start and bounds set by :meth:`~waveorder.nn.Gaussian.start_from` as ``calibrate`` sets them; since the bounds
+    then differ between tiles, such a model is calibrated one tile at a time. ``model`` is not modified. ``model``,
+    ``sampling``, ``score`` and ``search`` are those of :func:`~waveorder.nn.calibrate`.
 
     Parameters
     ----------
@@ -149,8 +153,8 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
         Prior over the free quantities; by default the one their specs declare. One row is shared by every tile; a
         prior of ``T`` rows gives each tile its own.
     start : Mapping[str, Tensor], optional
-        A ``(T,)`` start per dotted name, such as a previous :attr:`TileCalibration.parameters`; names not listed
-        start at the model's value.
+        A finite ``(T,)`` start per dotted name, such as a previous :attr:`TileCalibration.parameters`; names not
+        listed start at the model's value, or a ``Gaussian("estimate")`` sigma at its tile's estimate.
     chunk_size : int, optional
         Tiles calibrated at once, bounding memory; all by default.
 
@@ -162,7 +166,8 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
     ------
     ParameterError
         As :func:`~waveorder.nn.calibrate`, or for ``tiles`` without a tile axis, a ``start`` entry that names no
-        free quantity or is not ``(T,)``, a ``chunk_size`` below 1, or a prior whose rows are neither 1 nor ``T``.
+        free quantity, is not ``(T,)`` or is not finite, a ``chunk_size`` below 1, or a prior whose rows are neither
+        1 nor ``T``.
     ShapeError
         If a tile does not have the system's data shape on ``sampling`` or is complex.
     PlacementError
@@ -177,7 +182,6 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
             )
         search = expect_searchable(tiles[0], model, sampling, search=search, where=_WHERE)
         count = tiles.shape[0]
-        size = count if chunk_size is None else chunk_size
         if chunk_size is not None:
             _expect_count(chunk_size, where=_WHERE, name="chunk_size", minimum=1)
         work = copy.deepcopy(model)
@@ -193,35 +197,47 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
                 f"{_WHERE} prior holds {prior.tiles} tiles for {count} tiles of data; give one row or one per tile",
                 path="prior",
             )
+        estimated = [
+            f"{prefix}.sigma" for prefix, part in work.named_modules() if isinstance(part, Gaussian) and part.estimated
+        ]
+        started = [name for name in estimated if start is None or name not in start]
+        size = 1 if estimated else count if chunk_size is None else chunk_size
         names = list(specs)
         estimates: list[Estimate] = []
         levels: list[list[Tensor]] = []
+        flags: list[Tensor] = []
         for first in range(0, count, size):
             rows = slice(first, min(first + size, count))
+            rows_prior = prior.select(range(rows.start, rows.stop))
+            rows_origin = {name: value[rows] for name, value in origin.items()}
+            if estimated:  # one tile: its noise starts from its own data, as calibrate starts it
+                rows_prior = start_from_data(work, tiles[first], rows_prior)
+                rows_origin |= {name: work.get_parameter(name).detach().reshape(1).clone() for name in started}
             objective = _TileObjective(
                 data=tiles[rows],
                 model=work,
                 sampling=sampling,
                 score=score,
-                prior=prior.select(range(rows.start, rows.stop)),
-                origin={name: value[rows] for name, value in origin.items()},
+                prior=rows_prior,
+                origin=rows_origin,
             )
             best, reached = _search(objective, search, length=rows.stop - rows.start)
             estimates.append(best)
             levels.append(reached)
+            flags.append(on_bounds(free_specs(work), best.point))
         point = {name: torch.cat([estimate.point[name] for estimate in estimates]) for name in names}
         trace = tuple(
             (type(stage).__name__, torch.cat([chunk[k] for chunk in levels])) for k, stage in enumerate(search)
         )
         # One read-back: the trace and which quantities ended on a bound, per tile.
         steps = [level.tolist() for _, level in trace]
-        flags = on_bounds(specs, point).tolist()
+        bounded = torch.cat(flags, dim=1).tolist()
         objective = torch.cat([estimate.objective for estimate in estimates])
         results = tuple(
             CalibrationResult(
                 {name: point[name][index] for name in names},
                 objective[index],
-                tuple(name for name, row in zip(names, flags, strict=True) if row[index]),
+                tuple(name for name, row in zip(names, bounded, strict=True) if row[index]),
                 tuple((name, step[index]) for (name, _), step in zip(trace, steps, strict=True)),
             )
             for index in range(count)
@@ -248,6 +264,8 @@ def _start_table(start: Mapping[str, Tensor] | None, model: ImagingModel, *, cou
             raise PlacementError(
                 f"{_WHERE} {path} is {value.dtype} on {value.device} but {name} is {target.dtype} on {target.device}"
             )
+        if not read_flag(torch.isfinite(value).all()):
+            raise ParameterError(f"{_WHERE} {path} must be finite on every tile, got {value.tolist()}", path=path)
         table[name] = value.detach().clone()
     return table
 
@@ -303,7 +321,7 @@ def expect_tile_parameters(
     ------
     ParameterError
         If a key is not a free parameter of ``model``, or a value does not have shape
-        ``(tiles, *parameter.shape)``; ``path`` is ``parameters.<name>``.
+        ``(tiles, *parameter.shape)`` or is not finite; ``path`` is ``parameters.<name>``.
     PlacementError
         If a value's dtype or device differs from its parameter's.
     """
@@ -327,6 +345,8 @@ def expect_tile_parameters(
                 f"{where}: {path} is {value.dtype} on {value.device} but the parameter is {parameter.dtype} on "
                 f"{parameter.device}; move it with .to(dtype=..., device=...)"
             )
+        if not read_flag(torch.isfinite(value).all()):
+            raise ParameterError(f"{where}: {path} must be finite on every tile", path=path)
         table[name] = value
     return table
 

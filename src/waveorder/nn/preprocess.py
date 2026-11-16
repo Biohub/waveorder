@@ -141,7 +141,7 @@ class Focus:
         ``None`` for a single slice.
     peak_fwhm : float or None
         Width in slices of the raw power's peak at half its prominence (scipy ``peak_widths``, as 3.x measured it);
-        ``None`` for a single slice.
+        ``0.0`` when the peak has no prominence, which warns; ``None`` for a single slice.
     power : Tensor
         Band power per slice, ``(Z,)``, differentiable in the stack.
     """
@@ -198,8 +198,10 @@ def focus_from_transverse_band(
     Warns
     -----
     WaveorderWarning
-        For a single slice, returned as in focus (``index = 0``) without statistics; or if the polynomial fit is rank
-        deficient (``polynomial_order`` at least ``Z``).
+        For a single slice, returned as in focus (``index = 0``) without statistics; if the polynomial fit is rank
+        deficient (``polynomial_order`` at least ``Z``); or if the peak has a prominence of 0 (an extreme on an end
+        slice, a ``mode="min"`` pick, a fitted extreme that is no peak of the power, a flat power), so its width is 0,
+        as 3.x warned through scipy's ``PeakPropertyWarning``.
     """
     _expect_focus_arguments(stack, mode=mode, polynomial_order=polynomial_order)
     power = band.power(stack)
@@ -212,7 +214,15 @@ def focus_from_transverse_band(
     continuous = subpixel and polynomial_order is not None
     peak = _extreme(curve, mode=mode, polynomial_order=polynomial_order, subpixel=continuous)
     # The nearest slice of a continuous extreme in [Z - 0.5, Z) is the last one, not Z (3.x raised there).
-    fwhm = _peak_width(curve.tolist(), min(round(peak), len(curve) - 1) if continuous else int(peak))
+    nearest = min(round(peak), len(curve) - 1) if continuous else int(peak)
+    fwhm = _peak_width(curve.tolist(), nearest)
+    if fwhm == 0:
+        warnings.warn(
+            f"focus_from_transverse_band: the band power at slice {nearest} has a prominence of 0, so its peak width "
+            "is 0" + (f" and no slice is in focus (threshold_fwhm = {threshold_fwhm})" if threshold_fwhm > 0 else ""),
+            WaveorderWarning,
+            stacklevel=2,
+        )
     return Focus(peak if fwhm >= threshold_fwhm else None, int(peak), fwhm, power)
 
 
@@ -352,7 +362,7 @@ def _first_extreme(values: list[float], *, mode: FocusMode) -> int:
 
 def _polyfit(x: Tensor, y: Tensor, order: int) -> Tensor:
     """``numpy.polyfit(x, y, order)``: column-scaled Vandermonde least squares, highest power first."""
-    vandermonde = torch.linalg.vander(x, N=order + 1).flip(-1)
+    vandermonde = x[:, None] ** torch.arange(order, -1, -1, dtype=x.dtype)
     scale = torch.sqrt((vandermonde * vandermonde).sum(dim=0))
     rcond = x.shape[0] * torch.finfo(x.dtype).eps
     fit = torch.linalg.lstsq(vandermonde / scale, y[:, None], rcond=rcond, driver="gelsd")

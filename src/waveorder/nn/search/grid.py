@@ -143,7 +143,12 @@ def _product_text(shape: tuple[int, ...]) -> str:
 @register("random", kind="search")
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RandomSearch:
-    """Score ``samples`` uniformly random points of the same spans as :class:`GridSearch` and keep the best.
+    """Score ``samples`` random points of the free quantities and keep the best.
+
+    As wo-4.0 drew them: a quantity with a tolerance is drawn from its prior, ``nominal + tolerance * N(0, 1)``,
+    clamped to its bounds if it has them; one without a tolerance is drawn uniformly over its bounds (log-uniformly
+    on a geometric span, :func:`search_spans`). Draws are float64 from one CPU generator, sample by sample and within
+    a sample in the order of the specs, so a seed gives wo-4.0's points.
 
     Parameters
     ----------
@@ -175,18 +180,27 @@ class RandomSearch:
         """
         spans = search_spans(specs)
         generator = torch.Generator().manual_seed(self.seed)
+        columns: dict[str, list[float]] = {name: [] for name in specs}
+        for _ in range(self.samples):
+            for name, spec in specs.items():
+                low, high = spans[name]
+                if spec.tolerance is None:
+                    unit = float(torch.rand((), generator=generator, dtype=torch.float64))
+                    value = low * (high / low) ** unit if _geometric(low, high) else low + (high - low) * unit
+                else:
+                    normal = float(torch.randn((), generator=generator, dtype=torch.float64))
+                    value = spec.nominal + spec.tolerance * normal
+                    if spec.bounds is not None:
+                        value = min(max(value, low), high)
+                columns[name].append(value)
         drawn = {}
-        for name, (low, high) in spans.items():
-            unit = torch.rand(self.samples, generator=generator, dtype=like.dtype)
+        for name, values in columns.items():
+            column = torch.tensor(values, dtype=torch.float64).to(like.dtype)
             if like.device.type == "cuda":
                 # Drawn on the CPU generator for the same points on every device; pinned, the copy does not sync.
-                unit = unit.pin_memory().to(like.device, non_blocking=True)
+                drawn[name] = column.pin_memory().to(like.device, non_blocking=True)
             else:
-                unit = unit.to(like.device)
-            if _geometric(low, high):
-                drawn[name] = low * (high / low) ** unit
-            else:
-                drawn[name] = low + (high - low) * unit
+                drawn[name] = column.to(like.device)
         size = self.samples if self.chunk_size is None else self.chunk_size
         return (
             {name: values[first : first + size] for name, values in drawn.items()}

@@ -62,9 +62,12 @@ class GradientSearch:
     iterations : int
         Optimizer steps, at least 1; 200 by default (the config's ``max_iter``).
     learning_rate : float
-        Step size as a fraction of each quantity's span, or in log units for a geometric span; positive and finite.
+        Step size as a fraction of each quantity's span (:func:`~waveorder.nn.search.search_spans`: Adam's first step
+        moves a quantity by about ``learning_rate * (high - low)``), or in log units for a geometric span; positive
+        and finite.
     learning_rates : Mapping[str, float]
-        Step sizes by dotted name, in the same units, overriding ``learning_rate``.
+        Step sizes by dotted name, overriding ``learning_rate``: absolute, in the quantity's own units (log units for
+        a geometric span) and not scaled by its span, as wo-4.0's ``Adam(lr=...)``.
     optimizer : {"adam", "nadam", "adamw", "sgd"}
         The torch optimizer; ``"adam"`` by default.
     loss_scale : float

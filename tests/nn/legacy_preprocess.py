@@ -17,12 +17,19 @@ Changes from the originals, none of which alters a result beyond rounding:
   ``len(x) * eps``; the scaling picks the minimum-norm solution when the fit is underdetermined), ``np.roots`` by the
   eigenvalues of the same companion matrix, ``np.poly1d`` by Horner's rule;
 - the ``float32`` casts are dropped so the reference runs in the input's dtype (float64 for the tight checks);
-- the diagnostic plot and the input warnings are dropped;
+- the diagnostic plot and the input warnings are dropped; scipy's ``PeakPropertyWarning`` for a prominence or a
+  width of 0, which 3.x passed on, is kept;
 - the uniform filter averages each window directly where scipy keeps a running sum.
 """
 
+import warnings
+
 import torch
 from torch import Tensor
+
+
+class PeakPropertyWarning(RuntimeWarning):
+    """scipy ``signal.PeakPropertyWarning``: a peak property is degenerate."""
 
 
 def gen_coordinate_frequencies(img_dim: tuple[int, int], ps: float, *, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
@@ -72,7 +79,10 @@ def peak_prominences(x: list[float], peak: int) -> tuple[float, int, int]:
             right_min = x[i]
             right_base = i
         i += 1
-    return x[peak] - max(left_min, right_min), left_base, right_base
+    prominence = x[peak] - max(left_min, right_min)
+    if prominence == 0:
+        warnings.warn("some peaks have a prominence of 0", PeakPropertyWarning, stacklevel=2)
+    return prominence, left_base, right_base
 
 
 def peak_widths(x: list[float], peak: int, rel_height: float = 0.5) -> tuple[float, float, float, float]:
@@ -91,6 +101,8 @@ def peak_widths(x: list[float], peak: int, rel_height: float = 0.5) -> tuple[flo
     right_ip = float(i)
     if x[i] < height:
         right_ip -= (height - x[i]) / (x[i - 1] - x[i])
+    if right_ip - left_ip == 0:
+        warnings.warn("some peaks have a width of 0", PeakPropertyWarning, stacklevel=2)
     return right_ip - left_ip, height, left_ip, right_ip
 
 

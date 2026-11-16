@@ -41,6 +41,7 @@ from waveorder.testing import (
     assert_operator_norm,
     assert_operator_normal,
     assert_preserves_nonnegativity,
+    assert_prox_optimal,
     assert_solver_descends,
     assert_state_roundtrip,
     assert_vmap_matches_loop,
@@ -267,6 +268,58 @@ def test_prior_suite_names_both_the_prox_and_the_penalty_when_they_disagree():
     obj = torch.randn(1, 4, 6, 5, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
     with pytest.raises(AssertionError, match=r"_HalfPenalty\.prox and _HalfPenalty\.penalty disagree"):
         check_prior(_HalfPenalty(0.5).double(), obj)
+
+
+class _ForgetsScale(Tikhonov):
+    """Shrinks by ``1 + step * weight``, ignoring the prior's ``scale``."""
+
+    def prox(self, obj, step, *, scale):
+        del scale
+        return self.project(obj / (1 + step * self.weight))
+
+
+class _Identity(TotalVariation):
+    """Returns the projection: no shrinkage at all."""
+
+    def prox(self, obj, step, *, scale):
+        del step, scale
+        return self.project(obj)
+
+
+class _HalfStrengthTV(TotalVariation):
+    """Solves the problem of half the step."""
+
+    def prox(self, obj, step, *, scale):
+        return super().prox(obj, 0.5 * step, scale=scale)
+
+
+SIZES = [(1, 4, 6, 5), (1, 16, 32, 32)]
+
+
+@pytest.mark.parametrize("shape", SIZES, ids=["small", "realistic"])
+def test_correct_proxes_pass_at_every_size(shape):
+    obj = torch.randn(*shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    for prior in (Tikhonov(0.5), Tikhonov(0.5, nonnegative=True), TotalVariation(0.3, inner_iterations=300)):
+        assert_prox_optimal(prior.double(), obj, step=0.7, scale=1.3)
+
+
+@pytest.mark.parametrize("shape", SIZES, ids=["small", "realistic"])
+@pytest.mark.parametrize(
+    "prior",
+    [
+        _ForgetsScale(0.5),
+        _Identity(0.3),
+        _HalfStrengthTV(0.3, inner_iterations=300),
+        TotalVariation(0.3, inner_iterations=1),
+    ],
+    ids=["forgets_scale", "identity", "half_strength_tv", "one_inner_iteration"],
+)
+def test_a_wrong_prox_fails_at_every_size(prior, shape):
+    # Random perturbations of 1e-2 |x| are nearly orthogonal to the gradient on a realistic array, so only the
+    # directed probes along x and v - x catch these there.
+    obj = torch.randn(*shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    with pytest.raises(AssertionError, match=r"prox and \w+\.penalty disagree"):
+        assert_prox_optimal(prior.double(), obj, step=0.7, scale=1.3)
 
 
 class _SyncingProx(Tikhonov):

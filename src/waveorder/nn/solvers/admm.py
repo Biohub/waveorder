@@ -9,6 +9,7 @@ from torch import Tensor
 
 from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn.functional import (
+    HermitianFactor,
     abs2,
     add_diagonal,
     cholesky_hermitian,
@@ -33,12 +34,17 @@ _DEFAULT_LOOP = Loop(10)
 
 @dataclass(frozen=True, slots=True)
 class ADMMState:
-    """Iterate ``x``, split gradient ``z``, scaled dual ``u`` (both ``(3, F, Z, Y, X)``) and ``H* g``."""
+    """Iterate ``x``, split gradient ``z``, scaled dual ``u`` (both ``(3, F, Z, Y, X)``), ``H* g`` and ``factor``.
+
+    ``factor`` is the Cholesky factor of ``H* H + rho grad* grad + damping I`` per frequency, the f-update's system,
+    computed once by :meth:`ADMM.start`.
+    """
 
     x: Tensor
     z: Tensor
     u: Tensor
     backprojection: Tensor
+    factor: HermitianFactor
 
 
 @register("admm", kind="solver")
@@ -105,15 +111,16 @@ class ADMM(IterativeSolver[ADMMState]):
         backprojection = fourier.adjoint(problem.data.reshape(fourier.data_shape))
         x = torch.zeros_like(backprojection)
         split = torch.zeros_like(forward_differences(x))
-        return ADMMState(x=x, z=split, u=split.clone(), backprojection=backprojection)
+        factor = _factor(fourier, rho=self.rho, damping=self.damping)
+        return ADMMState(x=x, z=split, u=split.clone(), backprojection=backprojection, factor=factor)
 
     @override
     def step(self, state: ADMMState, problem: InverseProblem) -> ADMMState:
         rhs = state.backprojection + self.rho * forward_differences_adjoint(state.z - state.u)
-        x = _solve_update(_fourier(problem), rhs, rho=self.rho, damping=self.damping)
+        x = from_half_spectrum(cholesky_solve(state.factor, to_half_spectrum(rhs)), problem.sampling.shape)
         gradient = forward_differences(x)
         z = _shrink(gradient + state.u, _total_variation(problem).weight / self.rho)
-        return ADMMState(x=x, z=z, u=state.u + gradient - z, backprojection=state.backprojection)
+        return ADMMState(x=x, z=z, u=state.u + gradient - z, backprojection=state.backprojection, factor=state.factor)
 
     @override
     def estimate(self, state: ADMMState) -> Object:
@@ -134,13 +141,11 @@ def _total_variation(problem: InverseProblem) -> TotalVariation:
     return prior
 
 
-def _solve_update(fourier: FourierDiagonal, rhs: Tensor, *, rho: float, damping: float) -> Tensor:
-    """Return ``x`` with ``(H* H + rho grad* grad + damping I) x = rhs``, solved per frequency."""
-    shape = fourier.sampling.shape
-    differences = _difference_transfers(shape, like=fourier.transfer)  # (3, Z, Y, X', 2)
+def _factor(fourier: FourierDiagonal, *, rho: float, damping: float) -> HermitianFactor:
+    """Return the Cholesky factor of ``H* H + rho grad* grad + damping I`` per frequency, the f-update's system."""
+    differences = _difference_transfers(fourier.sampling.shape, like=fourier.transfer)  # (3, Z, Y, X', 2)
     diagonal = rho * abs2(differences).sum(dim=0) + damping
-    factor = cholesky_hermitian(add_diagonal(gram(fourier.transfer), diagonal))
-    return from_half_spectrum(cholesky_solve(factor, to_half_spectrum(rhs)), shape)
+    return cholesky_hermitian(add_diagonal(gram(fourier.transfer), diagonal))
 
 
 def _difference_transfers(shape: tuple[int, int, int], *, like: Tensor) -> Tensor:

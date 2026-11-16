@@ -406,9 +406,7 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; 
     """
     with operation():
         search = expect_searchable(data, model, sampling, search=search)
-        for part in model.modules():
-            if isinstance(part, Gaussian):
-                part.start_from(data)
+        prior = start_from_data(model, data, prior)
         objective = CalibrationObjective.of(data, model, sampling, score=score, prior=prior)
         specs = objective.specs
         for stage in search:
@@ -446,6 +444,40 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; 
             shown = histories if record else [None] * len(histories)
             _report(result, seen, histories=shown, elapsed=clock.seconds())
         return result
+
+
+def start_from_data(model: ImagingModel, data: Data, prior: ParameterPrior | None = None) -> ParameterPrior:
+    """Start each quantity of ``model`` that starts from the data, a ``Gaussian("estimate")`` sigma, from ``data``.
+
+    :meth:`~waveorder.nn.Gaussian.start_from` sets its start and bounds; the prior returned takes those bounds for
+    it too, since a prior clamps to its own specs.
+
+    Parameters
+    ----------
+    model : ImagingModel
+        Modified in place.
+    data : Tensor
+        The data calibrated on.
+    prior : ParameterPrior, optional
+        The calibration's prior; by default the one the model's specs declare once started.
+
+    Returns
+    -------
+    ParameterPrior
+    """
+    started = []
+    for prefix, part in model.named_modules():
+        if isinstance(part, Gaussian) and part.estimated:
+            part.start_from(data)
+            started.append(f"{prefix}.sigma" if prefix else "sigma")
+    specs = free_specs(model)
+    if prior is None:
+        return ParameterPrior(specs)
+    if not any(name in prior.specs for name in started):
+        return prior
+    return ParameterPrior(
+        {name: specs[name] if name in started else spec for name, spec in prior.specs.items()}, prior.centers
+    )
 
 
 def _seen(kept: Sequence[Sequence[object]], names: Sequence[str]) -> tuple[ScoreGrid | None, SweepResult | None]:
@@ -628,6 +660,8 @@ def _geometric(low: float, high: float) -> bool:
 def on_bounds(specs: Mapping[str, Free], values: Mapping[str, Tensor]) -> Tensor:
     """Return whether each free quantity is on a bound (within ``1e-6`` of its span), on the values' device.
 
+    The distance is measured as the search measures the span: linearly, or in log units on a geometric span
+    (positive and wider than a factor of 100), so a weight in ``(1e-12, 1e12)`` is on a bound only near one.
     A quantity without bounds is never on one. Nothing reads back.
 
     Parameters
@@ -658,5 +692,10 @@ def on_bounds(specs: Mapping[str, Free], values: Mapping[str, Tensor]) -> Tensor
             flags.append(torch.zeros_like(value, dtype=torch.bool))
         else:
             low, high = spec.bounds
-            flags.append(torch.minimum(value - low, high - value) <= _BOUND_TOLERANCE * (high - low))
+            if _geometric(low, high):
+                logs = value.log()
+                near = torch.minimum(logs - math.log(low), math.log(high) - logs)
+                flags.append(near <= _BOUND_TOLERANCE * math.log(high / low))
+            else:
+                flags.append(torch.minimum(value - low, high - value) <= _BOUND_TOLERANCE * (high - low))
     return torch.stack(flags)

@@ -11,7 +11,7 @@ the host (:func:`assert_no_host_sync`)::
 import copy
 import linecache
 import warnings
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -165,7 +165,10 @@ def assert_prox_optimal(
 ) -> None:
     """Check ``prior.prox(v, step)`` against nearby points of the support on ``step*P(x) + |x-v|^2/2``.
 
-    A zero step must return the projection of ``v``. Approximate proximal maps pass when their error is below the
+    A zero step must return the projection of ``v``. The nearby points are ``trials`` random ones and, since a
+    random direction is nearly orthogonal to the gradient on a large array, the directed ones ``x +/- t x`` and
+    ``x +/- t (v - x)`` for ``t`` in 1e-2 and 1e-3, all projected onto the support: a prox that shrinks too little
+    or too much, or ignores ``scale``, moves along them. Approximate proximal maps pass when their error is below the
     perturbation size, so give such priors enough inner iterations in the test.
     """
     name, dtype = type(prior).__name__, obj.dtype
@@ -185,10 +188,18 @@ def assert_prox_optimal(
         proximal = prior.prox(obj, step_t, scale=scale_t)
         assert torch.equal(prior.project(proximal), proximal), f"{name}.prox left the prior's support in {dtype}"
         best = objective(proximal)
-        for trial in range(trials):
-            direction = torch.randn(obj.shape, generator=_generator(seed + trial), dtype=obj.dtype)
-            direction = direction.to(obj.device)
-            candidate = prior.project(proximal + 1e-2 * direction / direction.norm() * proximal.norm().clamp_min(1))
+
+        def nearby() -> Iterator[Tensor]:
+            for trial in range(trials):
+                direction = torch.randn(obj.shape, generator=_generator(seed + trial), dtype=obj.dtype)
+                direction = direction.to(obj.device)
+                yield proximal + 1e-2 * direction / direction.norm() * proximal.norm().clamp_min(1)
+            residual = obj - proximal
+            for direction in (proximal, -proximal, residual, -residual):
+                for t in (1e-2, 1e-3):
+                    yield proximal + t * direction
+
+        for candidate in map(prior.project, nearby()):
             assert objective(candidate) >= best - 1e-6 * best.abs().clamp_min(1), (
                 f"{name}.prox and {name}.penalty disagree in {dtype}: at prox(v, step) the objective step * "
                 f"penalty(x) + |x - v|^2 / 2 is {best.item()}, but a nearby point scores "

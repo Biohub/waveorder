@@ -13,6 +13,7 @@ from typing import ClassVar, override
 import pytest
 import torch
 
+from tests.nn import legacy_evidence_search
 from tests.nn.conftest import FREE_NA, NA, make_model, make_system, simulate
 from waveorder.errors import CalibrationWarning, ParameterError, PlacementError, ShapeError
 from waveorder.nn import (
@@ -285,6 +286,28 @@ def test_grid_batches_bound_storage_and_keep_the_grid_and_its_best():
     assert chunked.objective.item() == whole.objective.item()
 
 
+def test_learning_rate_scales_with_the_span_and_learning_rates_do_not():
+    # One Adam step moves each quantity by its rate: the aperture's span (0.8, 1.2) scales learning_rate by 0.4 but
+    # not an entry of learning_rates; on the weight's geometric span both are steps in log units.
+    weight = Free(WEIGHT, bounds=(WEIGHT / 1000, WEIGHT * 1000))
+    data = _data()
+    names = (NA, "object_prior.weight")
+
+    def step(stage: GradientSearch) -> list[float]:
+        model = _model(FREE_NA, weight=weight).double()
+        start = [model.get_parameter(name).item() for name in names]
+        result = calibrate(data.double(), model, SAMPLING, score=Evidence(), search=(stage,))
+        return [
+            abs(result.parameters[NA].item() - start[0]),
+            abs(math.log(result.parameters[names[1]].item() / start[1])),
+        ]
+
+    scaled = step(GradientSearch(iterations=1, learning_rate=0.01, last=True))
+    absolute = step(GradientSearch(iterations=1, learning_rates=dict.fromkeys(names, 0.01), last=True))
+    assert scaled == pytest.approx([0.01 * 0.4, 0.01], rel=1e-6)
+    assert absolute == pytest.approx([0.01, 0.01], rel=1e-6)
+
+
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_candidate_batches_reach_the_device_without_a_host_sync():
@@ -304,6 +327,27 @@ def test_candidate_batches_reach_the_device_without_a_host_sync():
     # The CPU generator draws the same points whatever the device.
     reference = list(RandomSearch(samples=6, seed=3, chunk_size=4).batches(specs, like=cpu))
     torch.testing.assert_close(drawn, reference, check_device=False)
+
+
+def test_random_points_are_wo40s_draws():
+    # A toleranced quantity: nominal + tolerance * N(0, 1), clamped to its bounds; a flat one: uniform over them.
+    specs = {
+        "coma": Free(0.0, tolerance=0.1),
+        "astigmatism": Free(0.05, tolerance=0.1, bounds=(-0.1, 0.12)),
+        "spherical": Free(0.0, bounds=(-0.2, 0.3)),
+    }
+    legacy = [
+        legacy_evidence_search.ParameterSpec("coma", 0.0, 0.1, None),
+        legacy_evidence_search.ParameterSpec("astigmatism", 0.05, 0.1, (-0.1, 0.12)),
+        legacy_evidence_search.ParameterSpec("spherical", 0.0, "free", (-0.2, 0.3)),
+    ]
+    like = torch.zeros((), dtype=torch.float64)
+    (drawn,) = RandomSearch(samples=500, seed=7).batches(specs, like=like)
+    expected = legacy_evidence_search.random_draws(legacy, samples=500, seed=7)
+    assert torch.equal(torch.stack([drawn[name] for name in specs], dim=1), expected)
+    # wo-4.0 spread a toleranced quantity by one tolerance (std 0.1), not uniformly over three (std 0.173).
+    (wide,) = RandomSearch(samples=20000).batches({"coma": Free(0.0, tolerance=0.1)}, like=like)
+    assert wide["coma"].std().item() == pytest.approx(0.1, rel=0.02)
 
 
 def test_search_spans_are_the_bounds_or_three_tolerances():
@@ -482,6 +526,16 @@ def test_on_bounds_names_a_missing_value():
     with pytest.raises(ParameterError, match="missing") as error:
         on_bounds(specs, {})
     assert error.value.path == NA
+
+
+def test_on_bounds_measures_a_geometric_span_in_log_units():
+    # The sweep weight's span (1e-12, 1e12): a linear tolerance of 1e-6 * 1e12 flagged every value below 1e6.
+    specs = {"weight": Free(1e-3, bounds=(1e-12, 1e12)), "shift": Free(0.0, bounds=(-1.0, 1.0))}
+    weights = torch.tensor([1e-12, 1.00001e-12, 1e-9, 0.0464, 1.0, 46.42, 1e11, 1e12], dtype=torch.float64)
+    shifts = torch.tensor([-1.0, -1.0 + 1e-7, -0.5, 0.0, 0.5, 0.9, 1.0 - 1e-7, 1.0], dtype=torch.float64)
+    flags = on_bounds(specs, {"weight": weights, "shift": shifts})
+    assert flags[0].tolist() == [True, True, False, False, False, False, False, True]
+    assert flags[1].tolist() == [True, True, False, False, False, False, True, True]
 
 
 @pytest.mark.parametrize(

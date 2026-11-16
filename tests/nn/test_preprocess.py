@@ -93,6 +93,8 @@ def test_band_power_is_differentiable() -> None:
 FOCUS_OPTIONS = [
     pytest.param({}, id="max"),
     pytest.param({"mode": "min"}, id="min"),
+    pytest.param({"polynomial_order": 0}, id="constant-fit"),
+    pytest.param({"polynomial_order": 0, "subpixel": True, "threshold_fwhm": 2.5}, id="constant-subpixel"),
     pytest.param({"polynomial_order": 2}, id="quadratic-fit"),
     pytest.param({"polynomial_order": 3, "subpixel": True}, id="cubic-subpixel"),
     pytest.param({"polynomial_order": 4, "subpixel": True, "mode": "min"}, id="quartic-subpixel-min"),
@@ -106,15 +108,24 @@ def _legacy_options(options: dict) -> dict:
     return {names.get(key, key): value for key, value in options.items()}
 
 
-@pytest.mark.filterwarnings("ignore:focus_from_transverse_band polynomial fit:waveorder.errors.WaveorderWarning")
+def _degenerate(caught: list[warnings.WarningMessage]) -> bool:
+    """Whether a degenerate peak width was warned: 3.x through scipy, 4.x as a WaveorderWarning."""
+    return any(
+        issubclass(w.category, legacy_preprocess.PeakPropertyWarning)
+        or (issubclass(w.category, WaveorderWarning) and "prominence of 0" in str(w.message))
+        for w in caught
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
 @pytest.mark.parametrize("options", FOCUS_OPTIONS)
 def test_focus_matches_3x(options, dtype) -> None:
     """Over random stacks of 3 to 14 slices (underdetermined fits included), every decision matches 3.x.
 
-    3.x raised for a sub-slice extreme within half a slice of the end (see the next test); those stacks are skipped.
-    In float32 (the 3.x dtype) the half-spectrum power differs from the masked full-spectrum sum by rounding, which
-    moves the fitted extreme and the peak width by about 1e-6 relative.
+    That includes the warning for a peak without prominence, whose width is 0 (an end slice, a ``"min"`` pick, a
+    fitted extreme that is no peak). 3.x raised for a sub-slice extreme within half a slice of the end (see the next
+    test); those stacks are skipped. In float32 (the 3.x dtype) the half-spectrum power differs from the masked
+    full-spectrum sum by rounding, which moves the fitted extreme and the peak width by about 1e-6 relative.
     """
     band = TransverseBand(numerical_aperture=1.1, wavelength=WAVELENGTH, pixel_size=0.12)
     tolerance = 1e-9 if dtype == torch.float64 else 1e-4
@@ -122,13 +133,18 @@ def test_focus_matches_3x(options, dtype) -> None:
     for seed in range(40):
         nz = 3 + seed % 12
         stack = _stack((nz, 20 + seed % 7, 24), seed=seed, dtype=dtype)
-        try:
-            index, stats = legacy_preprocess.focus_from_transverse_band(
-                stack, 1.1, WAVELENGTH, 0.12, **_legacy_options(options)
-            )
-        except IndexError:
-            continue
-        focus = focus_from_transverse_band(stack, band, **options)
+        with warnings.catch_warnings(record=True) as legacy_warnings:
+            warnings.simplefilter("always")
+            try:
+                index, stats = legacy_preprocess.focus_from_transverse_band(
+                    stack, 1.1, WAVELENGTH, 0.12, **_legacy_options(options)
+                )
+            except IndexError:
+                continue
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            focus = focus_from_transverse_band(stack, band, **options)
+        assert _degenerate(caught) == _degenerate(legacy_warnings)
         assert focus.peak_index == stats["peak_index"]
         assert focus.peak_fwhm == pytest.approx(stats["peak_FWHM"], rel=tolerance, abs=tolerance)
         assert (focus.index is None) == (index is None)
@@ -158,7 +174,12 @@ def test_focus_finds_the_peak_slice_and_its_width() -> None:
     assert focus.peak_fwhm == pytest.approx(expected, rel=1e-12)
     wider = expected + 0.1
     assert focus_from_transverse_band(_scaled(profile), band, threshold_fwhm=wider).index is None
-    assert focus_from_transverse_band(_scaled(profile), band, mode="min").index in (0, 12)
+    # The least power is on an end slice: no prominence, so its width is 0, which 3.x warned of through scipy.
+    with pytest.warns(WaveorderWarning, match="prominence of 0, so its peak width is 0$"):
+        minimum = focus_from_transverse_band(_scaled(profile), band, mode="min")
+    assert (minimum.index, minimum.peak_fwhm) in ((0, 0.0), (12, 0.0))
+    with pytest.warns(WaveorderWarning, match=r"and no slice is in focus \(threshold_fwhm = 1.0\)"):
+        assert focus_from_transverse_band(_scaled(profile), band, mode="min", threshold_fwhm=1.0).index is None
 
 
 def test_subpixel_extreme_near_the_last_slice_is_measured_there() -> None:
@@ -170,10 +191,12 @@ def test_subpixel_extreme_near_the_last_slice_is_measured_there() -> None:
             stack, 1.2, WAVELENGTH, 0.1, polynomial_fit_order=2, enable_subpixel_precision=True
         )
     band = TransverseBand(numerical_aperture=1.2, wavelength=WAVELENGTH, pixel_size=0.1)
-    focus = focus_from_transverse_band(stack, band, polynomial_order=2, subpixel=True)
+    with pytest.warns(WaveorderWarning, match="band power at slice 4 has a prominence of 0"):
+        focus = focus_from_transverse_band(stack, band, polynomial_order=2, subpixel=True)
     assert focus.index == pytest.approx(4.7, abs=1e-9)
     assert focus.peak_index == 4
-    assert focus.peak_fwhm == legacy_preprocess.peak_widths([float(v) for v in focus.power.double()], 4)[0]
+    with pytest.warns(legacy_preprocess.PeakPropertyWarning):
+        assert focus.peak_fwhm == legacy_preprocess.peak_widths([float(v) for v in focus.power.double()], 4)[0]
 
 
 def test_focus_keeps_the_power_graph() -> None:
@@ -193,6 +216,7 @@ def test_a_single_slice_is_in_focus_with_a_warning() -> None:
     assert focus.power.shape == (1,)
 
 
+@pytest.mark.filterwarnings("ignore:focus_from_transverse_band. the band power:waveorder.errors.WaveorderWarning")
 def test_a_rank_deficient_fit_warns() -> None:
     band = TransverseBand(numerical_aperture=1.2, wavelength=WAVELENGTH, pixel_size=0.1)
     with pytest.warns(WaveorderWarning, match="rank deficient"):

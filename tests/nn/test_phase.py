@@ -166,6 +166,48 @@ def test_thick_tikhonov_reconstruction_matches_unmodified_3x() -> None:
     assert _relative(_reconstruct_like_3x(system, intensity, sampling, weight=weight), expected) <= 1e-10
 
 
+def _nyquist_bins(shape: tuple[int, ...]) -> Tensor:
+    """The full-spectrum bins on the Nyquist plane of an even axis."""
+    mask = torch.zeros(shape, dtype=torch.bool)
+    for axis, size in enumerate(shape):
+        if size % 2 == 0:
+            mask.select(axis, size // 2)[...] = True
+    return mask
+
+
+@pytest.mark.parametrize(
+    ("shape", "pixel_size", "gap"),
+    [
+        pytest.param((7, 12, 12), (0.4, 0.25, 0.25), 0.0630, id="even-oversampled-yx"),
+        pytest.param((6, 12, 12), (1.0, 0.25, 0.25), 0.1102, id="even-oversampled-zyx"),
+    ],
+)
+def test_thick_tilted_inverse_differs_from_wo40_only_on_nyquist_bins(shape, pixel_size, gap) -> None:
+    """Tilted, oversampled on even axes: the forward operator equals wo-4.0's (see the operator test below), and
+    Wiener is the Tikhonov solution of that operator, ``conj(H_h) / (|H_h|^2 + w)`` with ``H_h`` the Hermitian part
+    of wo-4.0's cropped transfer ``H_c``. wo-4.0's filter ``conj(H_c) / (|H_c|^2 + w)`` is not: the crop keeps
+    ``-N/2`` of an even axis but not ``+N/2``, so ``H_c`` is not Hermitian on the Nyquist bins. The reconstructions
+    agree off those bins and differ on them by the pinned share of the estimate (white data, w = 1e-3)."""
+    sampling = Sampling(shape=shape, pixel_size=pixel_size)
+    optics = _optics(zenith=-0.65, azimuth=0.8, edge="sigmoid")
+    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX, absorption=0.2).double()
+    assert system.upsampling(sampling)[1:] == (2, 2)
+    real_tf, imag_tf = _thick_reference(system, sampling)
+    noise = torch.randn(shape, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
+    intensity = 1e3 * (1 + 0.01 * noise)
+    weight = 1e-3
+    estimate = _reconstruct_like_3x(system, intensity, sampling, weight=weight)
+    hermitian = _hermitian_part(real_tf + 0.2 * imag_tf)
+    spectrum = torch.fft.fftn(brightfield_contrast(intensity[None])[0])
+    oracle = torch.fft.ifftn(hermitian.conj() / (hermitian.abs() ** 2 + weight) * spectrum).real
+    assert _relative(estimate, oracle) <= 1e-12
+    wo40 = legacy.thick_inverse(intensity, real_tf, imag_tf, absorption_ratio=0.2, regularization_strength=weight)
+    nyquist = _nyquist_bins(shape)
+    difference, reference = torch.fft.fftn(estimate - wo40), torch.fft.fftn(estimate)
+    assert float(difference[~nyquist].norm() / reference[~nyquist].norm()) <= 1e-12
+    assert _relative(wo40, estimate) == pytest.approx(gap, abs=1e-3)
+
+
 def test_default_ramp_edge_gap_to_unmodified_3x_is_pinned() -> None:
     """The default antialiased edge weights the pupil's edge ring, where 3.x's sigmoid is a hard edge. Measured at
     16 x 64 x 64 (0.4, 0.1, 0.1 um): 8.3% (phase) and 4.4% (absorption) in the transfer, 1.7% in a Tikhonov

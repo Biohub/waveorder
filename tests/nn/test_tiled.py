@@ -5,21 +5,28 @@ from typing import ClassVar
 import pytest
 import torch
 
-from tests.nn.conftest import FREE_NA, NA, make_model, simulate
+from tests.nn.conftest import FREE_NA, NA, make_model, make_system, simulate
 from waveorder.errors import IncompatibleModelError, ParameterError, PlacementError, ShapeError
 from waveorder.nn import (
     Evidence,
+    Free,
+    Gaussian,
     GradientSearch,
     GridSearch,
+    ImagingModel,
     LBFGSSearch,
     NelderMeadSearch,
+    ParameterPrior,
     RandomSearch,
     Sampling,
+    Tikhonov,
     calibrate,
     calibrate_tiles,
+    free_specs,
     load_parameters,
 )
 from waveorder.nn.search.base import CalibrationObjective, Estimate
+from waveorder.nn.systems.tiled import expect_tile_parameters
 
 SAMPLING = Sampling(shape=(8, 32, 32), pixel_size=(0.25, 0.1, 0.1))
 APERTURES = (0.9, 1.0, 1.1)
@@ -72,16 +79,74 @@ def test_a_stage_that_reads_back_runs_tile_by_tile(stage):
         assert result.parameters[NA][index].item() == pytest.approx(alone.parameters[NA].item(), rel=1e-6)
 
 
-def test_a_warm_start_starts_each_tile_at_its_row():
+@pytest.mark.parametrize("chunk_size", [None, 2], ids=["all_at_once", "chunks_of_two"])
+def test_a_warm_start_starts_each_tile_at_its_row(chunk_size):
     tiles = _tiles()
     start = {NA: torch.tensor([0.95, 1.0, 1.05])}
     stages = (GradientSearch(iterations=5),)
-    result = calibrate_tiles(tiles, _model(), SAMPLING, score=Evidence(), search=stages, start=start)
+    result = calibrate_tiles(
+        tiles, _model(), SAMPLING, score=Evidence(), search=stages, start=start, chunk_size=chunk_size
+    )
     for index, tile in enumerate(tiles):
         model = _model()
         load_parameters(model, {NA: start[NA][index]})  # the same prior; only the starting value moves
         alone = calibrate(tile, model, SAMPLING, score=Evidence(), search=stages)
         assert result.parameters[NA][index].item() == pytest.approx(alone.parameters[NA].item(), rel=1e-6)
+
+
+def test_a_prior_of_one_row_per_tile_gives_each_tile_its_row():
+    stages = (GridSearch(points=7), GradientSearch(iterations=10))
+    tiles = _tiles(torch.float64)
+    prior = ParameterPrior(free_specs(_model()), {NA: torch.tensor([0.85, 1.15, 0.85], dtype=torch.float64)})
+    result = calibrate_tiles(
+        tiles, _model(torch.float64), SAMPLING, score=Evidence(), search=stages, prior=prior, chunk_size=2
+    )
+    for index, tile in enumerate(tiles):
+        alone = calibrate(
+            tile, _model(torch.float64), SAMPLING, score=Evidence(), search=stages, prior=prior.select([index])
+        )
+        assert result.parameters[NA][index].item() == pytest.approx(alone.parameters[NA].item(), rel=1e-12)
+        assert result.objective[index].item() == pytest.approx(alone.objective.item(), rel=1e-12)
+
+
+def test_each_tile_reports_its_own_bounds():
+    # The lower bound cuts off the aperture of the first tile only (0.98 with bounds (0.8, 1.2)).
+    stages = (GridSearch(points=7), GradientSearch(iterations=10))
+    tiles = _tiles(torch.float64)
+
+    def model():
+        return make_model(Free(1.0, tolerance=0.2, bounds=(1.0, 1.2))).double()
+
+    result = calibrate_tiles(tiles, model(), SAMPLING, score=Evidence(), search=stages, chunk_size=2)
+    alone = [calibrate(tile, model(), SAMPLING, score=Evidence(), search=stages).at_bound for tile in tiles]
+    assert alone == [(NA,), (), ()]
+    assert [tile.at_bound for tile in result.tiles] == alone
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2], ids=["all_at_once", "chunks_of_two"])
+def test_an_estimated_noise_starts_from_each_tiles_data(chunk_size):
+    # Data 100 times brighter: the noise level is far above the sigma of 1 a Gaussian("estimate") holds unstarted.
+    stages = (GridSearch(points=5), GradientSearch(iterations=15))
+    tiles = 100 * _tiles(torch.float64)
+
+    def model():
+        return ImagingModel(make_system(FREE_NA), Tikhonov(1e-2), Gaussian("estimate")).double()
+
+    unstarted = model()
+    # A prior of the unstarted specs, as a caller builds it before the data is read: bounded to sigma <= 1. The
+    # estimated sigma takes its bounds from the data in calibrate and in calibrate_tiles alike.
+    stale = ParameterPrior(free_specs(unstarted))
+    for prior in (None, stale):
+        result = calibrate_tiles(
+            tiles, unstarted, SAMPLING, score=Evidence(), search=stages, prior=prior, chunk_size=chunk_size
+        )
+        assert unstarted.get_parameter("noise.sigma").item() == 1.0  # the model is not modified
+        for index, tile in enumerate(tiles):
+            alone = calibrate(tile, model(), SAMPLING, score=Evidence(), search=stages, prior=prior)
+            assert alone.parameters["noise.sigma"].item() > 10
+            for name in (NA, "noise.sigma"):
+                assert result.parameters[name][index].item() == pytest.approx(alone.parameters[name].item(), rel=1e-12)
+            assert result.tiles[index].at_bound == alone.at_bound
 
 
 class NoTileAxis:
@@ -100,6 +165,7 @@ def test_misuse_is_named():
     cases = [
         (dict(start={"system.detection.numerical_apertur": torch.ones(3)}), "start.system.detection.numerical_apertur"),
         (dict(start={NA: torch.ones(2)}), f"start.{NA}"),
+        (dict(start={NA: torch.tensor([float("nan"), 1.0, 1.0])}), f"start.{NA}"),
         (dict(chunk_size=0), "chunk_size"),
         (dict(search=()), "search"),
     ]
@@ -116,6 +182,9 @@ def test_misuse_is_named():
     assert error.value.path == "tiles"
     with pytest.raises(IncompatibleModelError, match=r"NoTileAxis\.run on 3 tiles returned shapes"):
         calibrate_tiles(tiles, model, SAMPLING, score=Evidence(), search=(NoTileAxis(),))
+    with pytest.raises(ParameterError, match="must be finite") as error:
+        expect_tile_parameters({NA: torch.tensor([float("nan"), 1.0, 1.0])}, model=model, tiles=3, where="here")
+    assert error.value.path == f"parameters.{NA}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
