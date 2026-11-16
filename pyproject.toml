@@ -183,6 +183,9 @@ ignore = [
 "benchmarks/**" = ["TID251"]  # benchmarks compare against reference arrays in numpy; the numpy ban is for waveorder
 "tests/benchmarks/**" = ["TID251"]
 "src/waveorder/plugin/**" = ["TID251"]  # the napari plugin hands napari numpy arrays (the reader, the overlay)
+# The skills' scripts are byte-identical copies of what the Biohub MCP serves (.skills/ruff.toml): they print, use
+# numpy and follow that repository's style, so the package's own rules do not apply to them.
+".skills/**" = ["T201", "E501", "RUF001", "RUF002", "RUF005", "D", "ANN", "TID251", "TID253"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
