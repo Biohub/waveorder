@@ -470,9 +470,12 @@ def _output(plan: Plan, arguments: Arguments, *, problems: Problems) -> None:
                     f"this reconstruction writes {shown_shape((t, z, y, x))}; use another {named('output')}",
                     str(plan.output),
                 )
-    if plan.version == "0.4" and any(grid.tiles is not None for grid in plan.grids.values()):
+    tiled = any(grid.tiles is not None for grid in plan.grids.values())
+    if tiled and plan.version == "0.4" and (existing is None or plan.replaces):
+        plan.version = DEFAULT_VERSION  # the tile merger needs shards, which v0.4 lacks: a new tiled output is v0.5
+    if tiled and plan.version == "0.4":
         problems.add(
             f"v0.4 outputs have no shards, so the tile merger cannot give each tile row blocks of its own: drop "
-            f"{named('tile')} and field tiles, or write to a new output from v0.5 inputs",
+            f"{named('tile')} and field tiles, or write to a new output",
             str(plan.output),
         )

@@ -731,8 +731,11 @@ def test_a_new_output_keeps_the_version_of_the_first_input(tmp_path, volume):
     model.reconstruct_positions(new, output=tmp_path / "plate.zarr", channels=["BF"], overwrite=True)
     with iohub.open_ome_zarr(tmp_path / "plate.zarr", mode="r") as node:
         assert node.version == "0.5"  # a replaced store is new: its version is the input's, not the old store's
-    with pytest.raises(Rejected, match=r"v0\.4 outputs have no shards"):
-        _plan(model, old, output=tmp_path / "tiled.zarr", channels=["BF"], tile=(8, 16, 16))  # a v0.4 output too
+    # A tiled reconstruction needs shards, which v0.4 lacks: its new output is v0.5 whatever the input is.
+    model.reconstruct_positions(old, output=tmp_path / "tiled.zarr", channels=["BF"], tile=(8, 16, 16))
+    with iohub.open_ome_zarr(tmp_path / "tiled.zarr", mode="r") as node:
+        assert node.version == "0.5"
+    assert read_output(tmp_path / "tiled.zarr", "A/1/0")[1].abs().max() > 0
 
 
 def _failing_at(monkeypatch, time: int, error: BaseException | None = None, position: str = "") -> None:
