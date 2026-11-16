@@ -138,6 +138,9 @@ def show(
 ) -> None:
     """Print the configuration of the model it builds, every default filled in.
 
+    The object prior, noise and solver.reconstruction stay out where the file leaves them out: the model chooses
+    them from its other parts.
+
     With -t, the calibrated block holds the value the store holds for every free quantity: the configuration a
     calibration found; closing comments name the score arrays and the grids of the transfer functions the store
     holds. The configuration is checked as wo config check does.
@@ -169,7 +172,7 @@ def show(
     assert not isinstance(shown, dict)  # a model built from a configuration returns one
     configured = resolved.config.solver  # the model was built on the CPU
     solver = shown.solver.model_copy(update={"device": configured.device})
-    text = dump_yaml(shown.model_copy(update={"solver": solver}))
+    text = dump_yaml(shown.model_copy(update={"solver": solver}), fill_parts=False)
     text += "".join(f"# {note}\n" for note in notes)
     write_text(text, output, overwrite=overwrite, reads=file)
 

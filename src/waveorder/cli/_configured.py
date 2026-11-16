@@ -84,10 +84,7 @@ def resolve_config(path: Path, *, device: str | None = None) -> ResolvedConfig:
     solver = data.setdefault("solver", {})
     if isinstance(solver, dict):  # another value is left for validation to refuse
         solver["device"] = split_devices(device)[0]
-    try:
-        config = load(data)
-    except Rejected as error:  # located at the mapping, which is the file's
-        raise Rejected([dataclasses.replace(problem, location=str(path)) for problem in error.problems]) from error
+    config = load(data, path=path)
     return ResolvedConfig(path=path, config=config)
 
 

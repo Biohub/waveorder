@@ -23,6 +23,13 @@ def test_view_is_gone():
     assert CliRunner().invoke(app, ["bm", "view"]).exit_code != 0
 
 
+def test_wo40s_migrate_configs_flag_is_accepted_and_hidden():
+    # wo-4.0's bm run migrated the cases only with --migrate-configs; every case is migrated here.
+    result = CliRunner().invoke(app, ["bm", "run", "--migrate-configs", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--migrate-configs" not in result.output
+
+
 def _make_run_dir(base, name, metadata=None, summary=None):
     d = base / name
     d.mkdir(parents=True)

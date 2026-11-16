@@ -73,6 +73,12 @@ def run(
             ),
         ),
     ] = False,
+    migrate_configs: Annotated[
+        bool,
+        typer.Option(
+            "--migrate-configs", hidden=True, help="Accepted for wo-4.0 command lines; every case is migrated."
+        ),
+    ] = False,
 ) -> None:
     """Run benchmark cases.
 
@@ -82,6 +88,7 @@ def run(
 
     Example: wo bm run --scope synthetic -o /tmp/bench
     """
+    del migrate_configs  # wo-4.0's flag: every case is migrated here
     root = _checkout()
     from benchmarks.config import infer_modality, load_experiment, resolve_recon_config
     from benchmarks.runner import run_hpc_case, run_synthetic_case
