@@ -262,6 +262,9 @@ _OPTIMIZER_DEFAULTS: dict[str, object] = {
     for name in ("method", "max_iterations", "convergence_tol", "convergence_patience", "use_gradients", "grid_points")
 }
 
+_GRADIENT_STEPS = 200
+"""The ``max_iter`` of a gradient stage that writes none."""
+
 _MISSING = object()
 
 
@@ -310,6 +313,8 @@ class _Migration:
         self.reach: dict[str, float] = {}
         # The 3.x block being translated: phase or fluorescence.
         self.contrast = "phase"
+        # A #592 file: a setting wo config check warns of and does not execute is dropped with a note, not rejected.
+        self.preview = False
 
     def reject(self, key: str, message: str) -> None:
         self.rejections.append(Rejection(key, message))
@@ -317,6 +322,13 @@ class _Migration:
     def note(self, message: str) -> None:
         if message not in self.notes:
             self.notes.append(message)
+
+    def unread(self, key: str, reason: str) -> None:
+        """Reject a setting 4.x does not execute; in a #592 file, which wo config check loads, drop it with a note."""
+        if self.preview:
+            self.note(f"{key} dropped: {reason}; wo config check warns of it and runs without it")
+        else:
+            self.reject(key, f"{reason}; remove it")
 
     def result(self, dialect: Dialect, config: dict[str, Any] | None) -> MigrationResult:
         return MigrationResult(
@@ -371,15 +383,13 @@ class _Migration:
     def _check_stopping(self, options: Mapping[str, Any], *, given: set[str], prefix: str) -> None:
         """Reject the 3.x early-stopping settings 4.x does not execute; note them at their 3.x default."""
         if options["convergence_tol"] is not None and options["method"] != "nelder_mead":
-            self.reject(
+            self.unread(
                 f"{prefix}.convergence_tol",
                 "3.x stopped early once the loss stalled; 4.x does not execute this setting and runs the full "
-                "max_iterations; remove it",
+                "max_iterations",
             )
         if options["convergence_patience"] not in (None, _OPTIMIZER_DEFAULTS["convergence_patience"]):
-            self.reject(
-                f"{prefix}.convergence_patience", "a 3.x setting 4.x does not execute; remove it (4.x runs its budget)"
-            )
+            self.unread(f"{prefix}.convergence_patience", "a 3.x setting 4.x does not execute (4.x runs its budget)")
         elif "convergence_patience" in given:
             self.note(
                 f"{prefix}.convergence_patience dropped: 3.x stopped after 5 stalled iterations; 4.x runs its "
@@ -391,35 +401,42 @@ class _Migration:
         method = options["method"]
         gradients = options["use_gradients"]
         if gradients is not None and gradients != (method in ("adam", "nadam", "lbfgs")):
-            self.reject(
+            self.unread(
                 f"{prefix}.use_gradients",
                 f"a 3.x setting 4.x does not execute; {method} uses gradients only if it is a gradient method",
             )
         elif "use_gradients" in given and gradients is not None:
             self.note(f"{prefix}.use_gradients dropped: it matches what {method} does")
         if method != "grid_search" and options["grid_points"] != _OPTIMIZER_DEFAULTS["grid_points"]:
-            self.reject(f"{prefix}.grid_points", f"is read only by grid_search, not {method}; remove it")
+            self.unread(f"{prefix}.grid_points", f"is read only by grid_search, not {method}")
         elif method != "grid_search" and "grid_points" in given:
             self.note(f"{prefix}.grid_points dropped: read only by grid_search")
         if options.get("log_dir") is not None:
-            self.reject(f"{prefix}.log_dir", "4.x does not write TensorBoard logs; remove it")
+            self.unread(f"{prefix}.log_dir", "4.x does not write TensorBoard logs")
 
     def _stage(self, options: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return the search stage the 3.x method stands for, and the ``advanced`` block it needs."""
+        """Return the search stage the 3.x method stands for, and the ``advanced`` block it needs.
+
+        ``max_iterations`` of ``None`` leaves the stage's iterations at its default, as ``wo config check`` runs a
+        #592 optimizer beside a search that is not one gradient stage.
+        """
         method, iterations = options["method"], options["max_iterations"]
+        budget = {} if iterations is None else {"iterations": iterations}
         advanced: dict[str, Any] = {}
         if method in ("adam", "nadam"):
-            stage: dict[str, Any] = {"gradient": {"max_iter": iterations, "optimizer": method}}
+            gradient = {"optimizer": method} if iterations is None else {"max_iter": iterations, "optimizer": method}
+            stage: dict[str, Any] = {"gradient": gradient}
+            steps = _GRADIENT_STEPS if iterations is None else iterations
             advanced["learning_rates"] = {path: rate for path, (_, rate, _) in self.free.items()}
-            self.reach = {path: iterations * rate for path, (_, rate, _) in self.free.items()}
+            self.reach = {path: steps * rate for path, (_, rate, _) in self.free.items()}
         elif method == "lbfgs":
-            stage = {"lbfgs": {"iterations": iterations}}
+            stage = {"lbfgs": budget}
             self.note(
                 "lbfgs: 4.x L-BFGS uses a strong-Wolfe line search within bounds; 3.x took unit steps without one"
             )
         elif method == "nelder_mead":
             tolerance = options["convergence_tol"]
-            stage = {"nelder_mead": {"iterations": iterations, "tolerance": 1e-4 if tolerance is None else tolerance}}
+            stage = {"nelder_mead": {**budget, "tolerance": 1e-4 if tolerance is None else tolerance}}
         else:
             points = options["grid_points"]
             for value, rate, parameter in self.free.values():
@@ -738,6 +755,7 @@ def _translate(migration: _Migration) -> dict[str, Any] | None:
 
 
 def _from_preview(migration: _Migration) -> MigrationResult:
+    migration.preview = True
     config = copy.deepcopy(dict(migration.raw))
     object_block = config.get("object")
     if isinstance(object_block, dict):
@@ -910,7 +928,7 @@ def _reach(config: Mapping[str, Any]) -> dict[str, float]:
     search = calibration.get("search") if isinstance(calibration, Mapping) else None
     stage = search[0] if isinstance(search, list) and len(search) == 1 else None
     gradient = stage.get("gradient") if isinstance(stage, Mapping) else None
-    iterations = gradient.get("max_iter", 200) if isinstance(gradient, Mapping) else 200
+    iterations = gradient.get("max_iter", _GRADIENT_STEPS) if isinstance(gradient, Mapping) else _GRADIENT_STEPS
     rates = advanced.get("learning_rates")
     if not isinstance(rates, Mapping) or not isinstance(iterations, int | float):
         return {}
@@ -938,8 +956,15 @@ def _preview_solver(migration: _Migration, solver: dict[str, Any], system: Mappi
         parameter = _lookup(system, path)
         if isinstance(parameter, dict) and "nominal" in parameter:
             migration.free[path] = (parameter["nominal"], rate, parameter)
+    migration.reach = _reach({"solver": solver})  # the bounds wo config check gives, whichever stage runs
     method = advanced.pop("optimizer", None)
-    if method is None:
+    score = calibration.get("score", "evidence")
+    if method is not None and score != "sharpness":
+        migration.note(
+            f"{_PREVIEW_ADVANCED}.optimizer: {method} dropped: under score {score} the search stages run, as in "
+            "wo-4.0; wo config check warns of it"
+        )
+    if method is None or score != "sharpness":
         _preview_without_optimizer(migration, advanced)
     else:
         _preview_optimizer(migration, calibration, advanced, method=method)
@@ -947,30 +972,37 @@ def _preview_solver(migration: _Migration, solver: dict[str, Any], system: Mappi
 
 def _preview_without_optimizer(migration: _Migration, advanced: dict[str, Any]) -> None:
     """Without a 3.x optimizer the search stages run, and they read none of the 3.x settings."""
-    for name in ("convergence_tol", "use_gradients", "log_dir"):
-        if advanced.get(name) is not None:
-            migration.reject(f"{_PREVIEW_ADVANCED}.{name}", "a 3.x setting the search stages do not execute; remove it")
-    for name in ("convergence_patience", "grid_points"):
+    for name in ("convergence_tol", "use_gradients", "log_dir", "convergence_patience", "grid_points"):
         value = advanced.pop(name, None)
         if value is None:
             continue
-        if value != _OPTIMIZER_DEFAULTS[name]:
-            migration.reject(f"{_PREVIEW_ADVANCED}.{name}", "a 3.x setting the search stages do not execute; remove it")
-        else:
+        if value == _OPTIMIZER_DEFAULTS.get(name):
             migration.note(f"{_PREVIEW_ADVANCED}.{name} dropped: the 3.x default, not executed by the search stages")
+        else:
+            migration.unread(f"{_PREVIEW_ADVANCED}.{name}", "a 3.x setting the search stages do not execute")
 
 
 def _preview_optimizer(
     migration: _Migration, calibration: dict[str, Any], advanced: dict[str, Any], *, method: object
 ) -> None:
-    """Replace #592's ``advanced.optimizer`` and its gradient stage by the one stage the 3.x method stands for."""
+    """Replace #592's ``advanced.optimizer`` and its search by the one stage the 3.x method stands for.
+
+    As ``wo config check`` reads it: the stage runs the ``max_iter`` of a lone gradient stage, and its own default
+    beside any other search, which it replaces.
+    """
     search = calibration.get("search")
     stage = search[0] if isinstance(search, list) and len(search) == 1 else None
     gradient = stage.get("gradient") if isinstance(stage, Mapping) else None
-    if search is not None and not isinstance(gradient, Mapping):
-        migration.reject("solver.calibration.search", "with advanced.optimizer, #592 files hold one gradient stage")
-        return
-    iterations = gradient.get("max_iter", 200) if isinstance(gradient, Mapping) else 200
+    iterations = None
+    if search is None:  # the default search, one gradient stage
+        iterations = _GRADIENT_STEPS
+    elif isinstance(gradient, Mapping):
+        iterations = gradient.get("max_iter", _GRADIENT_STEPS)
+    else:
+        migration.note(
+            "solver.calibration.search dropped: under score sharpness advanced.optimizer is the search; wo config "
+            "check warns of it"
+        )
     given = {name for name, value in advanced.items() if value is not None}
     options = {**_OPTIMIZER_DEFAULTS, **advanced, "method": method, "max_iterations": iterations}
     translated = migration.search(options, given=given, prefix=_PREVIEW_ADVANCED)

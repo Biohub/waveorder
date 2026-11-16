@@ -392,7 +392,7 @@ class DenoiserPrior(V4BaseModel):
 
 
 class PriorDenoiser(V4BaseModel):
-    """``prior: {denoiser: ...}``: accepted as wo-4.0 accepted it, and reconstructed with no prior."""
+    """``prior: {denoiser: ...}``: loaded as wo-4.0 loaded it; a reconstruction refuses it, as wo-4.0's did."""
 
     denoiser: DenoiserPrior
 
@@ -914,10 +914,13 @@ def _warn_unexecuted(config: V4Config) -> None:
             "this version reads no dark frames, and wo-4.0 ran none; sigma is 1, the default",
         )
     if isinstance(config.object.prior, PriorDenoiser):
-        no_effect(
-            "object.prior.denoiser",
-            config.object.prior.denoiser.checkpoint,
-            "this version has no denoiser prior, and wo-4.0 ran none; the object is reconstructed with prior none",
+        warnings.warn(
+            ConfigurationWarning(
+                "the denoiser prior is not in this version, and wo-4.0 did not run it either: the configuration "
+                "loads, and a reconstruction refuses it",
+                field="object.prior.denoiser",
+            ),
+            stacklevel=3,
         )
     source = config.object.source
     if isinstance(source, SourcePhantom | SourceFromRecon):

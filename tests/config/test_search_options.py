@@ -78,6 +78,13 @@ def test_a_nelder_mead_stage_reaches_the_minimum_of_a_fine_grid():
     assert objective <= grid_objective + 1e-3 * abs(grid_objective)
 
 
+def test_one_gradient_step_of_a_linear_quantity_is_wo_40s_adam_step():
+    # wo-4.0's evidence search ran torch.optim.Adam(lr=0.01) on the quantities in their own units, so its first step
+    # moves each by 0.01; the aperture spans 0.3 here, and a step scaled by the span would move it by 0.003.
+    found, _ = _calibrate([{"gradient": {"max_iter": 1}}])
+    assert abs(found - 1.2) == pytest.approx(0.01, rel=1e-5)
+
+
 @pytest.mark.parametrize(
     ("advanced", "kind", "attributes"),
     [

@@ -62,6 +62,9 @@ from waveorder.zernike_names import canonical_name, noll_indices_up_to_order, no
 _AUTO_WEIGHT = Free(1e-3, bounds=(1e-6, 1.0))
 """The weight of ``object.weight: auto``: free over six decades up to 1, as wo-4.0 calibrates it."""
 
+_STEP = 0.01
+"""wo-4.0's Adam step for each free quantity, in its own units (``torch.optim.Adam(lr=0.01)``)."""
+
 _SHARPNESS = {
     "midband_power": "midband_power_score",
     "spectral_flatness": "spectral_flatness_score",
@@ -95,13 +98,14 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
     object_written = {"prior", "weight", "constraints"} & config.object.model_fields_set
     prior = _prior(config) if object_written else None
     noise = _noise(config) if "noise" in written else None
-    solver = _solver(config) if "reconstruction" in config.solver.model_fields_set else None
-    free = any(free_specs(part) for part in (system, prior, noise) if part is not None)
+    solver = _solver(config) if _builds_reconstruction(config) else None
+    parts = {"system": system, "object_prior": prior, "noise": noise}
+    free = [f"{at}.{name}" for at, part in parts.items() if part is not None for name in free_specs(part)]
     calibration = config.solver.calibration
-    calibrated = calibration is not None and free
+    calibrated = calibration is not None and bool(free)
     # The bead fit estimates sigma itself (calibrate_beads) and runs one gradient search: no profile grid before it.
     profile = () if isinstance(config.object.prior, PriorBeads) else _profile(prior, noise)
-    search = _search(config, profile=profile) if calibrated else None
+    search = _search(config, profile=profile, free=free) if calibrated else None
     weight = config.object.weight
     if isinstance(weight, WeightAuto):  # the 3.x sweep of the weight: a stage of its own, nothing else free
         if calibration is not None:
@@ -346,8 +350,8 @@ def _prior(config: V4Config) -> ObjectPrior:
         weight = _AUTO_WEIGHT if weight == "auto" else Free(1e-3, bounds=(1e-12, 1e12))
     if isinstance(prior, PriorBeads):
         return _resolve("object_prior", "beads", prior.beads.model_dump(), at=f"{at}.beads")
-    if isinstance(prior, PriorDenoiser):  # warned of by the schema; its weight goes with it
-        return _resolve("object_prior", "none", {"nonnegative": nonnegative}, at=at)
+    if isinstance(prior, PriorDenoiser):  # warned of by the schema; the model refuses to reconstruct with it
+        prior = "tikhonov"  # the model is built with it, so the file loads as written (closed_form by default)
     if prior == "none":
         if "weight" in settings.model_fields_set:
             no_effect("object.weight", settings.weight, "object.prior: none has no weight, as in wo-4.0; remove it")
@@ -360,6 +364,17 @@ def _noise(config: V4Config) -> Noise:
     name = noise.kind
     settings = getattr(noise, name)
     at = f"noise.{name}"
+    if name != "gaussian" and _noise_unread(config):
+        drawn = "; the simulation draws it" if config.simulate is not None else ""
+        warnings.warn(
+            ConfigurationWarning(
+                f"is not read by this reconstruction, nor was it by wo-4.0's wo rec, which solved it as under "
+                f"Gaussian noise; it reconstructs with noise.gaussian.sigma: 1{drawn}",
+                field=at,
+            ),
+            stacklevel=3,
+        )
+        return _resolve("noise", "gaussian", {"sigma": 1.0}, at=at)
     arguments = settings.model_dump(exclude={"snr_db", "photons"})
     sigma = getattr(settings, "sigma", None)
     if isinstance(sigma, DarkFrames):  # warned of by the schema
@@ -375,6 +390,41 @@ def _noise(config: V4Config) -> Noise:
         no_effect(f"{at}.sigma", sigma, "only noise.gaussian.sigma is estimated, as in wo-4.0; sigma is 1, the default")
         arguments["sigma"] = 1.0
     return _resolve("noise", name, arguments, at=at)
+
+
+def _noise_unread(config: V4Config) -> bool:
+    """Whether wo-4.0's ``wo rec`` solved ``config`` without reading its noise block.
+
+    It did for ``closed_form`` with ``object.prior: tikhonov`` (its default) and for ``admm`` with ``tv``, without a
+    calibration or under score sharpness. A file that writes neither ``object`` nor ``solver.reconstruction`` leaves
+    both to the model, which chooses them from the noise; a simulation without ``noise.poisson.photons`` draws the
+    noise from the noise part.
+    """
+    calibration = config.solver.calibration
+    if calibration is not None and calibration.score != "sharpness":
+        return False
+    poisson = config.noise.poisson
+    if config.simulate is not None and (poisson is None or poisson.photons is None):
+        return False
+    prior, reconstruction = config.object.prior, config.solver.reconstruction
+    if prior == "tv":
+        return isinstance(reconstruction, ReconstructionAdmm)
+    written = "reconstruction" in config.solver.model_fields_set or bool(
+        {"prior", "weight", "constraints"} & config.object.model_fields_set
+    )
+    return prior == "tikhonov" and reconstruction == "closed_form" and written
+
+
+def _builds_reconstruction(config: V4Config) -> bool:
+    """Whether ``solver.reconstruction`` is built, rather than left for the model to choose from the other parts.
+
+    It is built when written, except ``closed_form`` in a bead calibration or a simulation: neither solves with it,
+    and wo-4.0 writes ``closed_form`` in every file, so there it means what leaving the key out means.
+    """
+    if "reconstruction" not in config.solver.model_fields_set:
+        return False
+    never_solved = isinstance(config.object.prior, PriorBeads) or config.simulate is not None
+    return not (never_solved and config.solver.reconstruction == "closed_form")
 
 
 # --- the solver, the score and the search ----------------------------------------------------------------------------
@@ -468,7 +518,7 @@ def _optimizer_stage(advanced: CalibrationAdvanced, rates: object, *, iterations
     budget = {} if iterations is None else {"iterations": iterations}
     steps = {"iterations": "solver.calibration.search.0.gradient.max_iter"}
     if optimizer in ("adam", "nadam"):
-        arguments = {"learning_rates": rates, "optimizer": optimizer, "learning_rate": 0.01, "last": True, **budget}
+        arguments = {"learning_rates": rates, "optimizer": optimizer, "learning_rate": _STEP, "last": True, **budget}
         keys = {"learning_rates": f"{at}.learning_rates", **steps}
         return _resolve("search", "gradient", arguments, at=f"{at}.optimizer", keys=keys)
     if optimizer == "lbfgs":
@@ -481,19 +531,23 @@ def _optimizer_stage(advanced: CalibrationAdvanced, rates: object, *, iterations
     return _resolve("search", "grid", arguments, at=f"{at}.optimizer", keys={"points": f"{at}.grid_points"})
 
 
-def _search(config: V4Config, *, profile: tuple[str, ...]) -> tuple[SearchStage, ...]:
+def _search(config: V4Config, *, profile: tuple[str, ...], free: list[str]) -> tuple[SearchStage, ...]:
     """Build the search stages; with ``profile``, a grid over those quantities goes first and before each gradient.
 
-    Gradient stages take wo-4.0's step (``learning_rate=0.01``) and end at their last point (``last=True``), and
-    grids span wo-4.0's width of two tolerances, so a migrated file calibrates as wo-4.0 did. Under score sharpness
-    ``advanced.optimizer`` is the one stage, for the ``max_iter`` of a lone gradient stage, as wo-4.0 ran it.
+    Gradient stages take wo-4.0's step of 0.01 per Adam step for each of the ``free`` quantities, in its own units
+    (in log units on a geometric span), unless ``advanced.learning_rates`` gives it one, and end at their last point
+    (``last=True``); grids span wo-4.0's width of two tolerances, so a migrated file calibrates as wo-4.0 did. Under
+    score sharpness ``advanced.optimizer`` is the one stage, for the ``max_iter`` of a lone gradient stage, as wo-4.0
+    ran it.
     """
     calibration = config.solver.calibration
     assert calibration is not None
     advanced = calibration.advanced or CalibrationAdvanced()
     at = "solver.calibration.advanced"
     rate_at = f"{at}.learning_rates"
-    rates = _keyed(advanced.learning_rates, at=rate_at, config=config)
+    configured = _keyed(advanced.learning_rates, at=rate_at, config=config)
+    assert isinstance(configured, Mapping)
+    rates = dict.fromkeys(free, _STEP) | dict(configured)
     drives = calibration.optimizer_drives
     reads = {"nelder_mead": "convergence_tol", "grid_search": "grid_points"}
     for name in ("convergence_tol", "grid_points"):
@@ -524,7 +578,7 @@ def _stage(stage: object, *, at: str, rates: object, config: V4Config) -> Search
             "iterations": options.max_iter,
             "learning_rates": rates,
             "optimizer": options.optimizer,
-            "learning_rate": 0.01,
+            "learning_rate": _STEP,
             "last": True,
         }
         keys = {"iterations": f"{at}.gradient.max_iter", "learning_rates": "solver.calibration.advanced.learning_rates"}

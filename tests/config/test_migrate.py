@@ -1,6 +1,7 @@
 """``waveorder.config.migrate``: the 3.x examples, every rule of the per-key table, and #592 version-4 files."""
 
 import copy
+import warnings
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import yaml
 from waveorder.config import load
 from waveorder.config.migrate import _BLOCK_KEYS, TABLE, migrate, render, table_help
 from waveorder.config.schema import ReconstructionRichardsonLucy
+from waveorder.errors import ConfigurationWarning
 from waveorder.models import ReconstructionModel
 
 DATA = Path(__file__).parent / "data"
@@ -611,7 +613,46 @@ def test_preview_unexecuted_settings_without_an_optimizer():
     result = converted(raw)
     assert "grid_points" not in result.config["solver"]["calibration"]["advanced"]
     raw["solver"]["calibration"]["advanced"]["convergence_patience"] = 2
-    assert rejected_keys(raw) == ["solver.calibration.advanced.convergence_patience"]
+    result = converted(raw)  # wo config check loads it with a warning, so migrate drops it with a note
+    assert "convergence_patience" not in result.config["solver"]["calibration"]["advanced"]
+    assert any(note.startswith("solver.calibration.advanced.convergence_patience dropped") for note in result.notes)
+
+
+def _loaded_and_migrated(raw: dict) -> tuple[object, object, tuple[str, ...]]:
+    """Return the search of ``raw`` as ``wo config check`` loads it and as its migration builds it, and the notes."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConfigurationWarning)
+        loaded = ReconstructionModel.from_config(copy.deepcopy(raw)).search
+        result = converted(raw)
+        migrated = ReconstructionModel.from_config(load(result.config)).search
+    return loaded, migrated, result.notes
+
+
+TWO_STAGES = [{"grid": {"points": 3}}, {"gradient": {"max_iter": 4}}]
+
+
+@pytest.mark.parametrize(
+    ("score", "advanced", "search", "key"),
+    [
+        ("sharpness", {"log_dir": "logs"}, None, "solver.calibration.advanced.log_dir"),
+        ("sharpness", {"use_gradients": False}, None, "solver.calibration.advanced.use_gradients"),
+        ("evidence", {}, TWO_STAGES, "solver.calibration.advanced.optimizer"),
+        ("sharpness", {"optimizer": "nadam"}, TWO_STAGES, "solver.calibration.search"),
+        ("sharpness", {"optimizer": "lbfgs"}, [{"grid": {"points": 3}}, "gradient"], "solver.calibration.search"),
+    ],
+    ids=["log_dir", "use_gradients", "optimizer_under_evidence", "nadam_beside_two_stages", "lbfgs_beside_two_stages"],
+)
+def test_a_592_setting_check_warns_of_is_migrated_with_a_note_into_the_search_check_runs(score, advanced, search, key):
+    # One rule for both: what the loader accepts with a warning, migrate drops with a note, and both run one search.
+    raw = preview()
+    calibration = raw["solver"]["calibration"]
+    calibration["score"] = score
+    calibration["advanced"] |= advanced
+    if search is not None:
+        calibration["search"] = search
+    loaded, migrated, notes = _loaded_and_migrated(raw)
+    assert any(note.startswith((f"{key}: ", f"{key} dropped")) for note in notes), notes
+    assert migrated == loaded
 
 
 # --- the table ---------------------------------------------------------------------------------------------------

@@ -96,7 +96,7 @@ def expect_version(data: object, *, name: str) -> None:
         )
 
 
-def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
+def load(source: str | Path | Mapping[str, object] | V4Config, *, path: str | Path | None = None) -> V4Config:
     """Return the validated configuration of a YAML file or a mapping, or refuse it with every problem.
 
     A free aperture or tilt zenith written without bounds, as wo-4.0 took it, gets the range ``wo config migrate``
@@ -106,6 +106,8 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
     ----------
     source : str, Path, Mapping or V4Config
         The path of a ``version: 4`` YAML file, the mapping of one, or a configuration (returned as it is).
+    path : str or Path, optional
+        The file a mapping was read from, where its problems and warnings are located.
 
     Raises
     ------
@@ -114,7 +116,8 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
     """
     if isinstance(source, V4Config):
         return source
-    name = str(source) if isinstance(source, str | Path) else "the configuration"
+    file = source if isinstance(source, str | Path) else path
+    name = "the configuration" if file is None else str(file)
     try:
         if isinstance(source, str | Path):
             data: object = read(source)
@@ -128,7 +131,7 @@ def load(source: str | Path | Mapping[str, object] | V4Config) -> V4Config:
     except CONFIG_ERRORS as error:
         raise Rejected(problems(error, source=name)) from error
     wo40 = _wo40(data)
-    migrate = f"wo config migrate {name if isinstance(source, str | Path) else 'FILE'}"
+    migrate = f"wo config migrate {name if file is not None else 'FILE'}"
     ranges: tuple[str, ...] = ()
     if isinstance(data, Mapping):
         data, ranges = bounded(data)  # wo-4.0 took free apertures and zeniths without bounds
@@ -205,10 +208,17 @@ _UNCHOSEN = frozenset(
 """Paths whose null says only "not chosen", which :func:`dump` leaves out."""
 
 
-def dump(config: V4Config) -> dict[str, Any]:
+_MODEL_CHOSEN = {"object": ("prior", "weight", "constraints"), "noise": (), "solver": ("reconstruction",)}
+"""The keys a model chooses from its other parts when a configuration leaves them out, by block (``()``: all of it)."""
+
+
+def dump(config: V4Config, *, fill_parts: bool = True) -> dict[str, Any]:
     """Return ``config`` as a plain mapping with every default filled in, without the nulls that say "not chosen".
 
-    The mapping reads back as the same configuration; an empty ``calibrated`` block is left out.
+    The mapping reads back as the same configuration; an empty ``calibrated`` block is left out. With
+    ``fill_parts=False`` the object prior (``prior``, ``weight``, ``constraints``), ``noise`` and
+    ``solver.reconstruction`` are left out where ``config`` does not write them: the model chooses those from its
+    other parts, so their written defaults could build another model.
     """
 
     def chosen(value: object, path: str) -> object:
@@ -224,12 +234,20 @@ def dump(config: V4Config) -> dict[str, Any]:
     assert isinstance(shown, dict)
     if not shown.get("calibrated"):
         shown.pop("calibrated", None)
+    if not fill_parts:
+        for block, keys in _MODEL_CHOSEN.items():
+            written = getattr(config, block).model_fields_set
+            if not keys and block not in config.model_fields_set:
+                shown.pop(block)
+            elif keys and not set(keys) & written:
+                for key in keys:
+                    shown[block].pop(key)
     return shown
 
 
-def dump_yaml(config: V4Config) -> str:
+def dump_yaml(config: V4Config, *, fill_parts: bool = True) -> str:
     """Return :func:`dump` as YAML, in the order of the schema (what ``wo config show`` prints)."""
-    return yaml.safe_dump(dump(config), sort_keys=False)
+    return yaml.safe_dump(dump(config, fill_parts=fill_parts), sort_keys=False)
 
 
 @cache

@@ -525,7 +525,6 @@ SHARP = {"score": "sharpness"}
         ),
         (_raw(outputs=["transfer_function"]), "outputs"),
         (_raw(outputs=["reconstruction", "psf", "tile_map"]), "outputs.1"),
-        (_raw(object={"prior": {"denoiser": {"checkpoint": "x.pt"}}}), "object.prior.denoiser"),
         (_raw(noise={"gaussian": {"sigma": {"dark_frames": "dark.zarr"}}}), "noise.gaussian.sigma.dark_frames"),
         (_raw(object={"source": {"phantom": {"kind": "beads"}}}), "object.source.phantom"),
         (_raw(object={"source": {"from_recon": {"path": "r.zarr"}}}), "object.source.from_recon"),
@@ -547,7 +546,6 @@ SHARP = {"score": "sharpness"}
         "poisson_gaussian_estimate",
         "no_reconstruction",
         "unwritten_output",
-        "denoiser",
         "dark_frames",
         "phantom",
         "from_recon",
@@ -566,7 +564,7 @@ def test_a_wo_40_setting_nothing_runs_is_accepted_with_a_warning_at_its_key(raw,
 def test_wo_40_placeholders_build_what_runs_without_them():
     with pytest.warns(ConfigurationWarning, match="denoiser"):
         parts = _parts(_raw(object={"prior": {"denoiser": {"checkpoint": "x.pt"}}, "weight": 0.1}))
-    assert isinstance(parts["object_prior"], NoPrior)
+    assert isinstance(parts["object_prior"], Tikhonov)  # a reconstruction refuses it: see test_wo40_files.py
     with pytest.warns(ConfigurationWarning, match="dark frames"):
         parts = _parts(_raw(noise={"gaussian": {"sigma": {"dark_frames": "dark.zarr"}}}))
     assert parts["noise"].sigma == 1.0  # the default
@@ -731,7 +729,11 @@ def test_the_unwritten_parts_take_the_schemas_default_weight_and_sigma():
     ("raw", "field", "reason"),
     [
         (
-            _raw(noise={"poisson": {}}, object={"prior": "tikhonov"}, solver={"reconstruction": "closed_form"}),
+            _free(
+                noise={"poisson": {}},
+                object={"prior": "tikhonov"},
+                solver={"reconstruction": "closed_form", "calibration": {"score": "evidence"}},
+            ),
             "solver.reconstruction",
             "Wiener needs white Gaussian noise, got Poisson",
         ),
