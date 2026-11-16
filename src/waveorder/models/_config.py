@@ -5,7 +5,8 @@ in Python is described part by part by :func:`waveorder.registry.describe`, whic
 """
 
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +67,7 @@ def from_config[M: ReconstructionModel](cls: type[M], config: object) -> M:
     try:
         model = cls.for_system(system, **parts)
     except IncompatibleModelError as error:
-        raise Rejected.one(f"solver.reconstruction: {error}", location=source) from error
+        raise Rejected.one(f"solver.reconstruction: {_spelled(str(error))}", location=source) from error
     except ConfigurationError as error:
         located = error
         if error.field == "device":  # the model's own argument: the configuration writes it as solver.device
@@ -77,7 +78,7 @@ def from_config[M: ReconstructionModel](cls: type[M], config: object) -> M:
         try:
             score.check(model.imaging_model)
         except IncompatibleModelError as error:
-            raise Rejected.one(f"solver.calibration.score: {error}", location=source) from error
+            raise Rejected.one(f"solver.calibration.score: {_spelled(str(error))}", location=source) from error
     if loaded.calibrated:
         try:
             load_parameters(model.imaging_model, dict(loaded.calibrated))
@@ -85,6 +86,44 @@ def from_config[M: ReconstructionModel](cls: type[M], config: object) -> M:
             raise Rejected.one(f"calibrated: {error}", location=source) from error
     model._remember(loaded, left)  # noqa: SLF001 (the model's own bookkeeping, set by its constructor helper)
     return model
+
+
+_KEYS = {
+    "NoPrior": "none",
+    "Tikhonov": "tikhonov",
+    "TotalVariation": "tv",
+    "Beads": "beads",
+    "Gaussian": "gaussian",
+    "Poisson": "poisson",
+    "PoissonGaussian": "poisson_gaussian",
+}
+"""The configuration's name of each object prior and noise class a refusal names."""
+
+_SPELLINGS: tuple[tuple[str, str | Callable[[re.Match[str]], str]], ...] = (
+    (
+        r"assign model\.solver = None for the solver that follows them",
+        "leave solver.reconstruction out for the one that follows them",
+    ),
+    (
+        r"\b([Pp])ass a solver that takes these parts as solver=\.\.\.",
+        lambda match: f"{'W' if match[1] == 'P' else 'w'}rite a solver.reconstruction that takes these parts",
+    ),
+    (r"\b([Pp])ass (?=(?:noise|object_prior)=)", lambda match: f"{'W' if match[1] == 'P' else 'w'}rite "),
+    (r"\bnoise=Gaussian\(sigma(?:=\.\.\.)?\)", "noise: {gaussian: {sigma: ...}}"),
+    (r"\bobject_prior=NoPrior\(\)", "object.prior: none"),
+    (
+        r"\b(object_prior|noise)=(\w+)",
+        lambda match: f"{'noise' if match[1] == 'noise' else 'object.prior'}: {_KEYS.get(match[2], match[2])}",
+    ),
+)
+"""Python spellings in the models' refusals, and how a configuration writes them."""
+
+
+def _spelled(message: str) -> str:
+    """Return a model's refusal with its Python arguments spelled as the configuration keys that set them."""
+    for pattern, spelling in _SPELLINGS:
+        message = re.sub(pattern, spelling, message)
+    return message
 
 
 def _field_tiles(tiles: Mapping[str, Any] | None, *, source: str) -> FieldTiles | None:

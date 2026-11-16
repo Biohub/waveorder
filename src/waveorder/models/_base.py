@@ -16,7 +16,14 @@ from typing import ClassVar, Literal, Self, Unpack, cast
 import torch
 from torch import Tensor, nn
 
-from waveorder.config.schema import GaussianNoise, ObjectSettings, PoissonNoise, SourceGaussianSpectrum, V4Config
+from waveorder.config.schema import (
+    GaussianNoise,
+    ObjectSettings,
+    PoissonNoise,
+    PriorDenoiser,
+    SourceGaussianSpectrum,
+    V4Config,
+)
 from waveorder.errors import (
     ConfigurationError,
     IncompatibleModelError,
@@ -353,12 +360,23 @@ class ReconstructionModel:
         self._config = None
 
     def _expect_reconstructs(self, where: str) -> None:
-        """Refuse to reconstruct with a calibration-only object prior (:class:`~waveorder.nn.priors.Beads`)."""
+        """Refuse to reconstruct with a calibration-only object prior, or the configured denoiser prior.
+
+        A :class:`~waveorder.nn.priors.Beads` prior calibrates and does not reconstruct; ``object.prior: {denoiser}``
+        loads, as wo-4.0 loaded it, and is refused here, as wo-4.0's ``wo reconstruct`` refused it.
+        """
         if isinstance(self.object_prior, Beads):
             raise IncompatibleModelError(
                 f"{where}: a Beads object prior calibrates the system (calibrate, calibrate_position, "
                 "wo calibrate-tf); it does not reconstruct. Build the model without a solver to calibrate, and "
                 "reconstruct with an object prior that has a penalty, such as Tikhonov"
+            )
+        config = self.config
+        if config is not None and isinstance(config.object.prior, PriorDenoiser):
+            raise ConfigurationError(
+                "object.prior.denoiser",
+                "the denoiser prior is not in this version, and wo-4.0 did not run it either; reconstruct with "
+                "object.prior tikhonov, tv or none",
             )
 
     def _choose_solver(self) -> None:
@@ -1023,7 +1041,6 @@ class ReconstructionModel:
             self.imaging_model.check(score, Sampling(shape=plan.read_shape, pixel_size=pixel_size))
             stack, sampling = stack_tiles(source, plan, pixel_size=pixel_size, device=self.device, dtype=self.dtype)
             bind(self, sampling)
-            self._start_from(stack)
             if prior is not None and not isinstance(prior, ParameterPrior):
                 prior = prior.to_prior(free_specs(self.imaging_model))
             return calibrate_tile_stack(

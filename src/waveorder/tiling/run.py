@@ -741,7 +741,7 @@ class _Run:
             index = tile.region.index
             operator = self.tiles(index, tile.sampling)
             return partial(self.tiles.solve, index, tile.data, tile.sampling, solver=self.solver, operator=operator)
-        # A solver that never reads H (a learned one) costs no bind.
+        # A solver that never reads H costs no bind.
         shared = self.operators(tile.sampling) if self.solver.needs_operator else None
         return partial(self.solver, tile.data, self.model, tile.sampling, operator=shared)
 
