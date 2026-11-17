@@ -23,11 +23,40 @@
 \fancyhf{}
 \renewcommand{\headrulewidth}{0pt}
 \fancyfoot[L]{\raisebox{-3pt}{\includegraphics[height=13pt]{brand/biohub-logo-black.png}}}
-\fancyfoot[R]{\small Computational Imaging Team \textbar{} \texttt{\{talon.chandler,shalin.mehta\}@biohub.org} \textbar{} 2026-11-13}
+\fancyfoot[R]{\small Computational Imaging Team \textbar{} \texttt{\{talon.chandler,shalin.mehta\}@biohub.org} \textbar{} 2026-11-16}
 
 \definecolor{boxgray}{gray}{0.96}
 \definecolor{boxframe}{gray}{0.75}
-\newcommand{\mysection}[1]{\vspace{5pt}{\Large\bfseries #1}\par\vspace{2pt}}
+% Knob colors in the Koehler figure, reused for the verbs in its caption.
+\definecolor{kclose}{HTML}{E2574C}
+\definecolor{kfocus}{HTML}{F39C34}
+\definecolor{kcenter}{HTML}{4B83E8}
+% Section heading under a thin rule; \mysectiontop omits the rule at a page top.
+\newcommand{\mysectiontop}[1]{{\Large\bfseries #1}\par\vspace{2pt}}
+% Blocks (figures, tables, rules) are separated by equal stretch, so each page
+% shares its spare space evenly and gaps match above and below every block.
+% A rule is not a paragraph, so the gap above it carries the \parskip that
+% the paragraph below it gets for free.
+\newcommand{\blockgap}{\par\vspace{4pt plus 1fill}}
+\newcommand{\sectionrule}{\par\vspace{\dimexpr4pt+\parskip\relax plus 1fill}%
+{\color{boxframe}\hrule height 0.4pt}\vspace{4pt plus 1fill}}
+\newcommand{\mysection}[1]{\sectionrule\mysectiontop{#1}}
+
+% Failure-mode grid: equal horizontal and vertical gaps; the shorter column
+% is padded inside its last box so both columns end on the same line.
+% (The zero-height rule keeps the padding from being stripped at the box end.)
+\newlength{\fmgap}\setlength{\fmgap}{8pt}
+\newlength{\fmwL}\newlength{\fmwR}
+\newdimen\fmpadL \newdimen\fmpadR
+\newdimen\fmhL \newdimen\fmhR
+\newsavebox{\fmcolL}\newsavebox{\fmcolR}
+\newcommand{\fmbox}[1]{\fcolorbox{boxframe}{boxgray}{%
+\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule}#1\end{minipage}}}
+\newcommand{\fmcolumn}[3]{% width, upper box, lower box
+\begin{minipage}[t]{#1}\vspace{0pt}%
+\fmbox{#2}\par\nointerlineskip\vspace{\fmgap}%
+\fmbox{#3}%
+\end{minipage}}
 \setlength{\fboxsep}{6pt}
 \setlength{\fboxrule}{0.4pt}
 
@@ -68,7 +97,7 @@ perturbation atlas} [1], where phase from defocus enabled label-free tracking an
 phenotyping of CRISPR-perturbed A549 cells. Brightfield
 defocus stacks from a standard motorized widefield microscope, together with a
 \href{https://github.com/biohub/waveorder}{WaveOrder} config [2], yield
-quantitative phase at screening scale (Figure~1).
+quantitative phase at screening scale (\textbf{Figure~1}).
 
 After reading this guide and acquiring data, use the
 \href{https://github.com/biohub/waveorder/blob/main/docs/guide/first-reconstruction.md}{first-reconstruction
@@ -77,18 +106,19 @@ guide} and connect your agent to the
 \texttt{waveorder-tutorial} skill. Methods are described in the
 \href{https://arxiv.org/abs/2412.09775}{WaveOrder preprint} [3].
 
-\begin{figure}[h!]
+\blockgap
+\noindent\begin{minipage}{\linewidth}
 \includegraphics[width=\linewidth]{figures/fig_overview.pdf}
-\caption{Key acquisition settings (left) produce a defocus stack with
+\captionof{figure}{Key acquisition settings (left) produce a defocus stack with
 defocus-dependent contrast that WaveOrder converts into quantitative phase.}
-\end{figure}
+\end{minipage}
 
 \mysection{Acquisition}
 
 The three settings that matter most are:
 \begin{itemize}
 \item \textbf{Koehler illumination.} Align the condenser before every
-  session. Misalignment is the most common source of artifacts. Ron Vale's
+  session (\textbf{Figure~2}). Misalignment is the most common source of artifacts. Ron Vale's
   five-minute
   \href{https://www.ibiology.org/talks/set-up-koehler-illumination/}{iBiology
   tutorial} [4] is a good refresher.
@@ -101,14 +131,15 @@ The three settings that matter most are:
   at 40$\times$.
 \end{itemize}
 
-\begin{table}[h!]
+\blockgap
+\noindent\begin{minipage}{\linewidth}
 \small
 \centering
-\begin{tabular}{llp{2.7in}}
+\begin{tabular}{lll}
 \toprule
 Parameter & Perturbation atlas value & Notes \\
 \midrule
-Objective & 20$\times$, 0.55 NA, air & any objective works; match the config \\
+Objective & 20$\times$, 0.55 NA, air ($n = 1$) & any objective works; match the config \\
 Condenser & 0.4 NA & $\approx$2/3 of detection NA, Koehler aligned \\
 Z stack & 7 slices, 2 \textmu m & confirm defocused features on top and bottom slices; use more slices for thicker samples \\
 Camera & 6.5 \textmu m pixels & 6.5 \textmu m / 20$\times$ = 0.325 \textmu m at the sample \\
@@ -116,10 +147,21 @@ Wavelength & 450 nm & any wavelength is fine; ideally use a 10 nm notch filter \
 Exposure & a few ms & fill 1/2--2/3 of the dynamic range \\
 \bottomrule
 \end{tabular}
-\caption{Acquisition parameters for the \href{https://www.biorxiv.org/content/10.64898/2026.06.01.728087v1}{Biohub's multimodal perturbation atlas dataset.}}
-\end{table}
+\captionof{table}{Acquisition parameters for the \href{https://www.biorxiv.org/content/10.64898/2026.06.01.728087v1}{Biohub's multimodal perturbation atlas dataset.}}
+\end{minipage}
 
-\mysection{Reconstruction}
+\blockgap
+\noindent\begin{minipage}{\linewidth}
+\includegraphics[width=\linewidth]{figures/fig_koehler.pdf}
+\captionof{figure}{Realign the condenser after changing the objective or the sample.
+After focussing on the sample, \textcolor{kclose}{\textbf{close}} the field
+stop, \textcolor{kfocus}{\textbf{focus}} and
+\textcolor{kcenter}{\textbf{center}} the field stop edges, then
+\textcolor{kclose}{\textbf{open}} the field stop.}
+\end{minipage}
+
+\newpage
+\mysectiontop{Reconstruction}
 
 \begin{minipage}[t]{0.55\linewidth}
 Convert to OME-Zarr with
@@ -139,7 +181,7 @@ waveorder view data.zarr/A/1/029029 \
 \vspace{3pt}
 
 Dense structures (nucleoli, nuclear envelopes, cell margins) should appear
-brighter than background, as in Figure~1. \texttt{reconstruction\_dimension:~2} returns one
+brighter than background, as in \textbf{Figure~1}. \texttt{reconstruction\_dimension:~2} returns one
 phase image per defocus stack, the best choice for samples that are thin compared to the depth of field of the microscope. If the sample appears to blur all at once as you defocus, use 2. If different regions of the sample blur at different defocus positions, consider trialling 3.
 \end{minipage}\hfill
 \begin{minipage}[t]{0.42\linewidth}
@@ -151,61 +193,49 @@ phase image per defocus stack, the best choice for samples that are thin compare
 \end{minipage}}
 \end{minipage}
 
-\vspace{8pt}
-\noindent
-\begin{minipage}[t]{0.555\linewidth}
-\vspace{0pt}%
-\fcolorbox{boxframe}{boxgray}{%
-\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule}
+\sectionrule
+\setlength{\fmwL}{\dimexpr0.566\linewidth-0.566\fmgap\relax}
+\setlength{\fmwR}{\dimexpr0.434\linewidth-0.434\fmgap\relax}
+\newcommand{\fmleft}{\fmcolumn{\fmwL}{%
 {\small\textbf{Failure mode 1 \textbar{} Flipped z axis}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.97\linewidth]{figures/fig_flip.pdf}
+\includegraphics[width=0.69\linewidth]{figures/fig_flip.pdf}
 \par\vspace{2pt}\raggedright\small
 Stages disagree on the z sign convention---is the first slice above or below focus? If the convention is flipped, contrast
 will be inverted and downstream comparison will be challenging. Dense organelles should be
 bright. Fix: \texttt{invert\_phase\_contrast: true}. Check once per
-microscope by reconstructing one stack both ways.
-\end{minipage}}
-
-\vspace{6pt}
-\fcolorbox{boxframe}{boxgray}{%
-\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule}
+microscope by reconstructing one stack both ways.}{%
 {\small\textbf{Failure mode 3 \textbar{} Autofocus drift}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.97\linewidth]{figures/fig_focus.pdf}
+\includegraphics[width=0.69\linewidth]{figures/fig_focus.pdf}
 \par\vspace{2pt}\raggedright\small
 When the stack center (e.g. the 4th slice in a 7 slice stack) is not in focus, the reconstruction will be blurry.
 Setting \texttt{z\_focus\_offset:~auto} runs
 the search that can recover the defocus offset.
-\end{minipage}}
-\end{minipage}\hfill
-\begin{minipage}[t]{0.425\linewidth}
-\vspace{0pt}%
-\fcolorbox{boxframe}{boxgray}{%
-\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule}
+\par\vskip\fmpadL\hrule height 0pt}}
+\newcommand{\fmright}{\fmcolumn{\fmwR}{%
 {\small\textbf{Failure mode 2 \textbar{} Incorrect regularization}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.97\linewidth]{figures/fig_reg.pdf}
+\includegraphics[width=0.69\linewidth]{figures/fig_reg.pdf}
 \par\vspace{2pt}\raggedright\small
 \texttt{regularization\_strength} balances noise and resolution and varies by
 orders of magnitude across samples and exposures. Sweep decades on one
 position and choose manually. Too small
 amplifies blotchy low-frequency noise; too large leaves a washed-out image. The optimum is usually within a decade of
-\texttt{1e-3}.
-\end{minipage}}
-
-\vspace{6pt}
-\fcolorbox{boxframe}{boxgray}{%
-\begin{minipage}{\dimexpr\linewidth-2\fboxsep-2\fboxrule}
+\texttt{1e-3}.}{%
 {\small\textbf{Failure mode 4 \textbar{} Tilted illumination at the well edge}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.97\linewidth]{figures/fig_tilt.pdf}
+\includegraphics[width=0.69\linewidth]{figures/fig_tilt.pdf}
 \par\vspace{2pt}\raggedright\small
 Misaligned Koehler and imaging near a well-edge meniscus tilts the illumination, making cells look shadow-cast
 with reduced contrast. Fit the tilt by gradient descent in the same config:
 {\footnotesize\UseVerbatim{tiltcfg}}
-\end{minipage}}
-\end{minipage}
+\par\vskip\fmpadR\hrule height 0pt}}
+\sbox{\fmcolL}{\fmleft}\sbox{\fmcolR}{\fmright}
+\fmhL=\dimexpr\ht\fmcolL+\dp\fmcolL\relax
+\fmhR=\dimexpr\ht\fmcolR+\dp\fmcolR\relax
+\ifdim\fmhL<\fmhR \fmpadL=\dimexpr\fmhR-\fmhL\relax \else \fmpadR=\dimexpr\fmhL-\fmhR\relax \fi
+\noindent\fmleft\hspace{\fmgap}\fmright
 
 \mysection{Scaling up}
 
@@ -220,8 +250,8 @@ reconstructions at the well edges, then refining the initial values until you re
 
 \mysection{References}
 
-\sloppy
-\begin{enumerate}
+\sloppy\footnotesize
+\begin{enumerate}[leftmargin=*,labelindent=0pt,align=left]
 \item C.~Liu, A.~V.~Hillsley, M.~Sekhar, et al., ``A Multimodal Perturbation
   Atlas Defines the Phenotypic Resolution of Cellular Morphology,''
   \href{https://www.biorxiv.org/content/10.64898/2026.06.01.728087v1}{bioRxiv

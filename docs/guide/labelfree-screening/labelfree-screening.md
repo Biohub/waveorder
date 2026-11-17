@@ -21,9 +21,9 @@ agent to the [Biohub MCP](https://biohub.ai/mcp) to run the
 
 The three settings that matter most are:
 
-- **Koehler illumination.** Align the condenser before every session.
-  Misalignment is the most common source of artifacts. Ron Vale's
-  five-minute
+- **Koehler illumination.** Align the condenser before every session
+  (**Figure 2**). Misalignment is the most common source of artifacts. Ron
+  Vale's five-minute
   [iBiology tutorial](https://www.ibiology.org/talks/set-up-koehler-illumination/)
   [4] is a good refresher.
 - **Condenser NA of roughly 2/3 the detection NA.** We used a 0.4 NA
@@ -37,12 +37,21 @@ The three settings that matter most are:
 
 | Parameter | Perturbation atlas value | Notes |
 | --- | --- | --- |
-| Objective | 20x, 0.55 NA, air | any objective works; match the config |
+| Objective | 20x, 0.55 NA, air (n = 1) | any objective works; match the config |
 | Condenser | 0.4 NA | ~2/3 of detection NA, Koehler aligned |
 | Z stack | 7 slices, 2 µm | confirm defocused features on top and bottom slices; use more slices for thicker samples |
 | Camera | 6.5 µm pixels | 6.5 µm / 20x = 0.325 µm at the sample |
 | Wavelength | 450 nm | any wavelength is fine; ideally use a 10 nm notch filter |
 | Exposure | a few ms | fill 1/2-2/3 of the dynamic range |
+
+![Realign the condenser after changing the objective or the sample](./figures/fig_koehler.png)
+
+**Figure 2.** Realign the condenser after changing the objective or the
+sample. After focussing on the sample,
+<span style="color:#e2574c">**close**</span> the field stop,
+<span style="color:#f39c34">**focus**</span> and
+<span style="color:#4b83e8">**center**</span> the field stop edges, then
+<span style="color:#e2574c">**open**</span> the field stop.
 
 ## Reconstruction
 
