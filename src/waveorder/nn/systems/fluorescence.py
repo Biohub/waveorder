@@ -144,11 +144,17 @@ class WidefieldFluorescence3D(ShiftInvariantSystem):
         """Return the OTF cropped to ``sampling``'s frequencies, its point-spread function clamped at 0.
 
         The crop rings the point-spread function below zero where the data undersample the OTF; clamping and
-        renormalizing to 1 at zero frequency keeps it an intensity (3.x ``_enforce_nonnegative_psf``).
+        renormalizing to 1 at zero frequency keeps it an intensity (3.x ``_enforce_nonnegative_psf``). The clamp runs
+        in float64: the clamped lobes alone set the OTF at zero lateral frequency off ``k_z = 0``, where a float32
+        inverse transform errs by 1e-4 relative and shifts every plane's mean by up to 1e-5.
         """
         otf = self._cropped_otf(sampling)
+        dtype = otf.dtype
+        otf = otf.to(torch.float32 if otf.device.type == "mps" else torch.float64)  # MPS has no float64
         psf = from_half_spectrum(otf, sampling.shape).clamp_min(0)
-        otf = to_half_spectrum(psf / psf.sum())
+        del otf  # one wide array at a time: the build's peak memory stays that of the OTF before it
+        psf = psf / psf.sum()
+        otf = to_half_spectrum(psf).to(dtype)
         return (otf[..., 0] if self.real_transfer else otf)[None, None]
 
     def _cropped_otf(self, sampling: Sampling) -> Tensor:
