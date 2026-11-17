@@ -62,6 +62,9 @@ from waveorder.zernike_names import canonical_name, noll_indices_up_to_order, no
 _AUTO_WEIGHT = Free(1e-3, bounds=(1e-6, 1.0))
 """The weight of ``object.weight: auto``: free over six decades up to 1, as wo-4.0 calibrates it."""
 
+_AUTO_NAME = "object_prior.weight"
+"""The quantity ``object.weight: {auto: ...}`` sweeps; a calibration before the sweep holds it at 1e-3, as wo-4.0."""
+
 _STEP = 0.01
 """wo-4.0's Adam step for each free quantity, in its own units (``torch.optim.Adam(lr=0.01)``)."""
 
@@ -100,20 +103,27 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
     noise = _noise(config) if "noise" in written else None
     solver = _solver(config) if _builds_reconstruction(config) else None
     parts = {"system": system, "object_prior": prior, "noise": noise}
-    free = [f"{at}.{name}" for at, part in parts.items() if part is not None for name in free_specs(part)]
+    weight = config.object.weight
+    swept = _AUTO_NAME if isinstance(weight, WeightAuto) else None  # the sweep sets it, after any calibration
+    free = [
+        name
+        for name in (f"{at}.{name}" for at, part in parts.items() if part is not None for name in free_specs(part))
+        if name != swept
+    ]
     calibration = config.solver.calibration
+    if isinstance(weight, WeightAuto) and calibration is not None and calibration.score != "sharpness":
+        raise ConfigurationError(
+            "object.weight.auto",
+            f"sweeps the weight after a sharpness calibration, as wo-4.0's wo rec did; score {calibration.score} "
+            "estimates the weight itself, so write object.weight: auto (wo-4.0's calibrate-tf refused a rule-based "
+            "weight too)",
+        )
     calibrated = calibration is not None and bool(free)
     # The bead fit estimates sigma itself (calibrate_beads) and runs one gradient search: no profile grid before it.
     profile = () if isinstance(config.object.prior, PriorBeads) else _profile(prior, noise)
+    profile = tuple(name for name in profile if name != swept)
     search = _search(config, profile=profile, free=free) if calibrated else None
-    weight = config.object.weight
-    if isinstance(weight, WeightAuto):  # the 3.x sweep of the weight: a stage of its own, nothing else free
-        if calibration is not None:
-            raise ConfigurationError(
-                "object.weight.auto",
-                "sweeps the weight with every other quantity held fixed, so it does not run with "
-                "solver.calibration; remove one of them",
-            )
+    if isinstance(weight, WeightAuto):  # the 3.x sweep of the weight, with every other quantity held fixed
         rule = weight.auto
         sweep = {
             "rule": rule.rule,
@@ -127,7 +137,7 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
             "keep_slices": rule.plot_path is not None,
         }
         keys = {"samples": "object.weight.auto.num_samples", "scale": "object.weight.auto.search_scale"}
-        search = (_resolve("search", "weight_sweep", sweep, at="object.weight.auto", keys=keys),)
+        search = (*(search or ()), _resolve("search", "weight_sweep", sweep, at="object.weight.auto", keys=keys))
     dependence = config.imaging_system.field_dependence
     tiles = dependence.tiled if isinstance(dependence, FieldDependenceTiled) else None
     return system, {

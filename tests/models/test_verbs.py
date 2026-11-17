@@ -17,6 +17,7 @@ from waveorder.nn import (
     GradientSearch,
     GridSearch,
     Illumination,
+    MidbandPowerScore,
     Sampling,
     Tikhonov,
     ZernikeAberration,
@@ -111,6 +112,24 @@ def test_a_weight_sweep_picks_the_weight_on_the_most_structured_crop():
     expected = sweep.sweep(crop, reference.imaging_model, Sampling(shape=(4, side, side), pixel_size=PIXEL_SIZE))
     picked = float(model.imaging_model.get_parameter("object_prior.weight").detach())
     assert picked == pytest.approx(expected.weight, rel=1e-6)
+
+
+def test_a_weight_sweep_after_a_calibration_runs_it_at_the_held_weight_on_the_whole_frame():
+    # wo-4.0's wo rec: adam at regularization_strength 1e-3 on the full frame, then the sweep with the values found.
+    def model(weight: float | Free, *search: object) -> Fluorescence3D:
+        aperture = Free(1.1, bounds=(0.9, 1.25))
+        stages = [GradientSearch(iterations=3, learning_rates={APERTURE: 0.01}, last=True), *search]
+        return _fluorescence(aperture, object_prior=Tikhonov(weight), score=MidbandPowerScore(), search=stages)
+
+    data, _ = _fluorescence().simulate(shape=(4, 32, 32), seed=0)
+    swept = model(Free(1e-3, bounds=(1e-12, 1e12)), WeightSweep(rule="l_curve", samples=5))
+    result = swept.calibrate(data, history=True)
+    fixed = model(1e-3).calibrate(data)
+    assert isinstance(result, CalibrationResult)
+    assert result.sweep is not None
+    assert [stage for stage, _ in result.trace] == ["GradientSearch", "WeightSweep"]
+    assert float(result.parameters[APERTURE]) == float(fixed.parameters[APERTURE])
+    assert float(result.parameters["object_prior.weight"]) == pytest.approx(result.sweep.weight, rel=1e-6)
 
 
 def test_a_weight_sweep_normalizes_its_crop_by_the_crops_own_mean_as_wo40():

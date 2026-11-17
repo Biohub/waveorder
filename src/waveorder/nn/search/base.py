@@ -138,6 +138,8 @@ class CalibrationObjective:
         The outer objective, for example :class:`~waveorder.nn.scores.Evidence`.
     prior : ParameterPrior
         Prior over the free quantities, with one row; a stage keeps its points within its bounds.
+    held : Mapping[str, Tensor]
+        Free quantities held at these values: left out of :attr:`specs` and passed with every point.
     """
 
     data: Data
@@ -145,25 +147,36 @@ class CalibrationObjective:
     sampling: Sampling
     score: Score
     prior: ParameterPrior
+    held: Mapping[str, Tensor] = field(default_factory=dict)
 
     @classmethod
     def of(
-        cls, data: Data, model: ImagingModel, sampling: Sampling, *, score: Score, prior: ParameterPrior | None = None
+        cls,
+        data: Data,
+        model: ImagingModel,
+        sampling: Sampling,
+        *,
+        score: Score,
+        prior: ParameterPrior | None = None,
+        hold: Iterable[str] = (),
     ) -> Self:
         """Return the objective of calibrating ``model`` on ``data`` with ``score``.
 
-        ``prior`` defaults to the one the :class:`~waveorder.nn.parameters.Free` specs of the model declare.
+        ``prior`` defaults to the one the :class:`~waveorder.nn.parameters.Free` specs of the model declare. The free
+        quantities named in ``hold`` stay at their current values in the model.
 
         Raises
         ------
         ParameterError
-            If the model has no free quantity, ``prior`` has more than one row, or it covers a name that is no free
-            quantity of the model.
+            If the model has no free quantity besides those held, ``prior`` has more than one row, it covers a name
+            that is no free quantity of the model, or ``hold`` names one that is not free.
         IncompatibleModelError
             If ``score`` cannot run on ``model`` or ``sampling``.
         """
         specs = free_specs(model)
-        if not specs:
+        held = list(hold)
+        expect_known_names(held, specs, path="hold")
+        if not set(specs) - set(held):
             raise ParameterError("the model has no free quantity to calibrate")
         model.check(score, sampling)
         prior = ParameterPrior(specs) if prior is None else prior
@@ -174,12 +187,13 @@ class CalibrationObjective:
         unknown = [name for name in prior.covered if name not in specs]
         if unknown:
             raise ParameterError(f"the prior covers {unknown}, which are no free quantities of the model", path="prior")
-        return cls(data=data, model=model, sampling=sampling, score=score, prior=prior)
+        values = {name: model.get_parameter(name).detach().clone() for name in held}
+        return cls(data=data, model=model, sampling=sampling, score=score, prior=prior, held=values)
 
     @property
     def specs(self) -> dict[str, Free]:
-        """The free quantities searched over: the :class:`~waveorder.nn.parameters.Free` specs of the model, by name."""
-        return free_specs(self.model)
+        """The quantities searched over: the model's :class:`~waveorder.nn.parameters.Free` specs but :attr:`held`."""
+        return {name: spec for name, spec in free_specs(self.model).items() if name not in self.held}
 
     def start(self) -> Estimate:
         """Return the model's current free quantities (cloned, detached) and the objective there, NaN as ``+inf``."""
@@ -189,6 +203,7 @@ class CalibrationObjective:
 
     def __call__(self, values: Mapping[str, Tensor]) -> Tensor:
         """Return the objective at ``values`` (0-d tensors by dotted name), differentiable in them."""
+        values = {**values, **self.held}
         return evaluate(lambda m: self.score(self.data, m, self.sampling), self.model, values) + self.prior.nll(values)
 
     def batch(self, candidates: Mapping[str, Tensor], *, chunk_size: int | None = None) -> Tensor:
@@ -197,6 +212,10 @@ class CalibrationObjective:
         ``candidates`` and ``chunk_size`` are those of :func:`score_candidates`, with a tensor for every name in
         :attr:`specs`.
         """
+        if self.held:
+            length = next(iter(candidates.values())).shape[0]
+            held = {name: value.expand(length, *value.shape) for name, value in self.held.items()}
+            candidates = {**candidates, **held}
         with torch.no_grad():
             scores = score_candidates(
                 self.data, self.model, self.sampling, score=self.score, candidates=candidates, chunk_size=chunk_size
@@ -348,7 +367,7 @@ class CalibrationResult:
     sweep: SweepResult | None = None
 
 
-def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; whether to keep the history)
+def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and the quantities held; the history)
     data: Data,
     model: ImagingModel,
     sampling: Sampling,
@@ -356,6 +375,7 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; 
     score: Score,
     search: Sequence[SearchStage] | None = None,
     prior: ParameterPrior | None = None,
+    hold: Iterable[str] = (),
     history: bool = False,
 ) -> CalibrationResult:
     """Estimate the free quantities of ``model`` by minimizing ``score + prior`` over them, stage by stage.
@@ -378,6 +398,9 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; 
         At least one, run in order. ``None`` runs ``GridSearch()`` then ``GradientSearch()``.
     prior : ParameterPrior, optional
         Prior over the free quantities, of one row; by default the one their ``Free`` specs declare.
+    hold : iterable of str
+        Free quantities, by dotted name, held at their current values: the stages search the others, and the result
+        leaves them out.
     history : bool
         Also return what the stages saw (:attr:`CalibrationResult.steps`, :attr:`~CalibrationResult.grid`,
         :attr:`~CalibrationResult.sweep`).
@@ -407,7 +430,7 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search and prior; 
     with operation():
         search = expect_searchable(data, model, sampling, search=search)
         prior = start_from_data(model, data, prior)
-        objective = CalibrationObjective.of(data, model, sampling, score=score, prior=prior)
+        objective = CalibrationObjective.of(data, model, sampling, score=score, prior=prior, hold=hold)
         specs = objective.specs
         for stage in search:
             _expect_stage_names(stage, specs)

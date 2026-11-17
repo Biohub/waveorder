@@ -748,7 +748,9 @@ class ReconstructionModel:
         The search starts at the model's current values; parts that start from the data
         (``Gaussian(sigma="estimate")``) set their start and bounds first. Before a
         :class:`~waveorder.nn.search.sweep.WeightSweep` stage the data is cropped to its most structured 256-pixel
-        square, which is padded and prepared alone. A :class:`~waveorder.nn.priors.Beads` object prior is fitted by
+        square, which is padded and prepared alone; stages before the sweep run first on the whole frame with the
+        swept weight held at its start, as wo-4.0 calibrated before it swept. A :class:`~waveorder.nn.priors.Beads`
+        object prior is fitted by
         :func:`~waveorder.nn.search.beads.calibrate_beads`. A likelihood score (the evidence) needs the noise and the
         object prior in the units of the data after :meth:`prepare`; a default part or z padding biases it and is
         warned about (``CalibrationWarning``).
@@ -802,9 +804,32 @@ class ReconstructionModel:
             padding = self._padding_for(sampling)
             padded = padding.sampling(sampling)
             self.imaging_model.check(score, padded)  # the model and its grid, before a transfer is computed
-            region = None
-            search = self.search
-            if any(isinstance(stage, WeightSweep) for stage in search or ()):
+            region, before, search = None, None, self.search
+            first = next((index for index, stage in enumerate(search or ()) if isinstance(stage, WeightSweep)), None)
+
+            def run(
+                frame: Tensor, grid: Sampling, stages: Sequence[SearchStage] | None, *, hold: Iterable[str] = ()
+            ) -> CalibrationResult:
+                measured = self._measured(frame, padding, prepared=prepared)
+                bind(self, grid)
+                self._start_from(measured)
+                over = prior.to_prior(free_specs(self.imaging_model)) if isinstance(prior, TfStore) else prior
+                return calibrate(
+                    measured,
+                    self.imaging_model,
+                    grid,
+                    score=score,
+                    search=stages,
+                    prior=over,
+                    hold=hold,
+                    history=history,
+                )
+
+            if first:  # the stages before the sweep calibrate on the whole frame, the swept weight held (wo-4.0)
+                assert search is not None
+                swept = {stage.name for stage in search[first:] if isinstance(stage, WeightSweep)}
+                before, search = run(recorded, padded, search[:first], hold=swept), search[first:]
+            if first is not None:
                 region = most_structured_crop(recorded, size=256)
                 y, x, side = region
                 recorded = recorded[..., y : y + side, x : x + side]
@@ -816,16 +841,13 @@ class ReconstructionModel:
                         else stage
                         for stage in search or ()
                     )
-            measured = self._measured(recorded, padding, prepared=prepared)
-            bind(self, padded)
-            self._start_from(measured)
-            if prior is not None and not isinstance(prior, ParameterPrior):
-                prior = prior.to_prior(free_specs(self.imaging_model))
-            result = calibrate(
-                measured, self.imaging_model, padded, score=score, search=search, prior=prior, history=history
-            )
+            result = run(recorded, padded, search)
             if result.sweep is not None:
                 result = dataclasses.replace(result, sweep=dataclasses.replace(result.sweep, region=region))
+            if before is not None:
+                result = dataclasses.replace(
+                    result, trace=before.trace + result.trace, steps=before.steps + result.steps, grid=before.grid
+                )
             return result
 
     def _start_from(self, data: Tensor) -> None:

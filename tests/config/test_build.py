@@ -595,9 +595,16 @@ def test_a_score_grid_without_a_grid_and_score_arrays_of_a_tiled_field_are_accep
     assert [getattr(warning.message, "location", None) for warning in caught] == ["outputs.1"]
 
 
-def test_a_rule_based_weight_does_not_run_with_a_calibration():
-    raw = _free(object={"weight": {"auto": {"rule": "l_curve"}}}, solver={"calibration": {"score": "evidence"}})
-    assert _refusal(raw).startswith("object.weight.auto: sweeps the weight with every other quantity held fixed")
+def test_a_rule_based_weight_is_swept_after_a_sharpness_calibration_and_refused_with_a_likelihood():
+    # wo-4.0's wo rec calibrated at weight 1e-3, then swept the weight; its calibrate-tf refused {auto} with evidence.
+    auto = {"weight": {"auto": {"rule": "l_curve"}}}
+    refusal = _refusal(_free(object=auto, solver={"calibration": {"score": "evidence"}}))
+    assert refusal.startswith("object.weight.auto: ")
+    parts = _parts(_free(object=auto, solver={"calibration": {"score": "sharpness"}}))
+    (gradient, given), (sweep, _) = (_spec(stage) for stage in parts["search"])
+    assert (gradient, sweep) == ("gradient", "weight_sweep")
+    assert given["learning_rates"] == {NA: 0.01}  # the weight is not descended: the model holds it until the sweep
+    assert free_specs(parts["object_prior"])["weight"].nominal == 1e-3
 
 
 def test_a_bead_calibration_with_an_estimated_sigma_runs_one_gradient_search():
