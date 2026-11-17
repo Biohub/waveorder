@@ -314,6 +314,45 @@ def test_optimization_cli(tmp_path):
     assert optimized.phase.transfer_function.z_focus_offset != 0.0
 
 
+def test_auto_focus_offset_cli_writes_no_config(tmp_path):
+    """`z_focus_offset: auto` is resolved for the run without saving a new config."""
+    from waveorder.api.phase import TransferFunctionSettings as PhaseTFSettings
+
+    input_path = tmp_path / "input.zarr"
+    output_path = tmp_path / "output.zarr"
+
+    channel_names = ["Brightfield"]
+    dataset = open_ome_zarr(input_path, layout="hcs", mode="w", channel_names=channel_names)
+    position = dataset.create_position("0", "0", "0")
+    data = np.random.rand(1, 1, 7, 64, 64).astype(np.float32) + 10.0
+    position.create_image("0", data, transform=[TransformationMeta(type="scale", scale=(1, 1, 2.0, 0.325, 0.325))])
+    dataset.close()
+
+    recon_settings = settings.ReconstructionSettings(
+        input_channel_names=channel_names,
+        time_indices=0,
+        reconstruction_dimension=2,
+        phase=settings.PhaseSettings(transfer_function=PhaseTFSettings(z_focus_offset="auto")),
+    )
+    config_path = tmp_path / "focus.yml"
+    utils.model_to_yaml(recon_settings, config_path)
+
+    result = CliRunner().invoke(
+        app,
+        ["reconstruct", "-i", str(input_path / "0" / "0" / "0"), "-c", str(config_path), "-o", str(output_path)],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "z_focus_offset =" in result.output
+    assert (output_path / "0" / "0" / "0").exists()
+
+    # The user's config is untouched, no sibling config appears, and the
+    # transfer function is named after the config the user passed.
+    assert sorted(path.name for path in tmp_path.glob("*.yml")) == ["focus.yml"]
+    assert utils.yaml_to_model(config_path, settings.ReconstructionSettings) == recon_settings
+    assert (tmp_path / "transfer_function_focus.zarr").exists()
+
+
 def test_cli_apply_inv_tf_mock(tmp_input_path_zarr):
     tmp_input_zarr, tmp_config_yml = tmp_input_path_zarr
     tmp_config_yml = tmp_config_yml.with_name("0.yml").resolve()

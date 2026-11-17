@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, model_validator
 
@@ -13,6 +13,10 @@ class OptimizableFloat(BaseModel):
     Accepts a bare float/int (backwards compatible, not optimizable)
     or a mapping with `init`/`initial_value` and `lr`/`learning_rate`.
 
+    ``initial_value: "auto"`` marks the value to be estimated from the data
+    before any numeric use; only fields whose resolution is implemented
+    (currently phase ``z_focus_offset``) accept it.
+
     Examples
     --------
     >>> OptimizableFloat(init=0.0, lr=0.01)
@@ -21,7 +25,7 @@ class OptimizableFloat(BaseModel):
     OptimizableFloat(initial_value=3.0, learning_rate=0.5)
     """
 
-    initial_value: float = 0.0
+    initial_value: Union[float, Literal["auto"]] = 0.0
     learning_rate: float = 0.01
 
     @model_validator(mode="before")
@@ -40,6 +44,11 @@ class OptimizableFloat(BaseModel):
 
     @property
     def value(self) -> float:
+        if self.initial_value == "auto":
+            raise ValueError(
+                "initial_value: 'auto' must be resolved from the data before use; "
+                "'auto' is currently supported only for phase z_focus_offset"
+            )
         return self.initial_value
 
     @property
@@ -51,7 +60,7 @@ class OptimizableFloat(BaseModel):
         return self.learning_rate > 0
 
     def __float__(self) -> float:
-        return self.initial_value
+        return self.value
 
     def __repr__(self) -> str:
         return f"OptimizableFloat(initial_value={self.initial_value}, learning_rate={self.learning_rate})"
@@ -85,9 +94,9 @@ def extract_optimizable_params(obj: Any, prefix: str = "") -> tuple[dict[str, tu
     if isinstance(obj, OptimizableFloat):
         key = prefix
         if obj.is_optimizable:
-            optimizable[key] = (obj.initial_value, obj.learning_rate)
+            optimizable[key] = (obj.value, obj.learning_rate)
         else:
-            fixed[key] = obj.initial_value
+            fixed[key] = obj.value
         return optimizable, fixed
 
     if isinstance(obj, BaseModel):

@@ -123,3 +123,45 @@ def test_reconstruct_apodization_rolloff_smoke():
     nyquist_row_apod = np.abs(np.fft.fft2(phase_apod.numpy())[16, :])
     nyquist_row_hard = np.abs(np.fft.fft2(phase_hard.numpy())[16, :])
     assert nyquist_row_apod.max() < 1e-3 * nyquist_row_hard.max()
+
+
+def test_gram_singular_system_matches_svd():
+    """The gradient-mode decomposition reconstructs identically to the SVD."""
+    torch.manual_seed(0)
+    zyx_data = torch.rand(4, 32, 32) + 10.0
+    absorption_tf, phase_tf = isotropic_thin_3d.calculate_transfer_function(
+        yx_shape=(32, 32),
+        yx_pixel_size=6.5 / 20,
+        z_position_list=[-2, -1, 0, 1],
+        wavelength_illumination=0.5,
+        index_of_refraction_media=1.0,
+        numerical_aperture_illumination=0.4,
+        numerical_aperture_detection=0.55,
+    )
+
+    results = []
+    for use_svd in (True, False):
+        singular_system = isotropic_thin_3d.calculate_singular_system(absorption_tf, phase_tf, use_svd=use_svd)
+        results.append(
+            isotropic_thin_3d.apply_inverse_transfer_function(zyx_data, singular_system, regularization_strength=1e-3)
+        )
+    for svd_result, gram_result in zip(*results):
+        assert torch.allclose(svd_result, gram_result, atol=1e-4)
+
+
+def test_gram_singular_system_finite_gradients():
+    """Gradients stay finite where singular values are degenerate or zero."""
+    z_focus_offset = torch.tensor(0.0, requires_grad=True)
+    z_positions = (-torch.arange(4) + 2 + z_focus_offset) * 0.25
+    _, phase_yx = isotropic_thin_3d.reconstruct(
+        torch.rand(4, 32, 32) + 10.0,
+        yx_pixel_size=0.1,
+        z_position_list=z_positions,
+        wavelength_illumination=0.532,
+        index_of_refraction_media=1.3,
+        numerical_aperture_illumination=0.9,
+        numerical_aperture_detection=1.2,
+    )
+    loss = (phase_yx**2).mean()
+    loss.backward()
+    assert torch.isfinite(z_focus_offset.grad)

@@ -106,7 +106,8 @@ else:
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
-exclude_patterns = []
+# Developer notes that live next to a page but are not part of the site.
+exclude_patterns = ["guide/labelfree-screening/README.md"]
 
 # The reST default role (used for this markup `text`) to use for all documents.
 # default_role = None

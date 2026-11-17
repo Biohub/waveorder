@@ -1,3 +1,4 @@
+import tempfile
 from pathlib import Path
 
 import typer
@@ -35,6 +36,13 @@ def _reconstruct_cli(
     If any parameter has an `lr` key (OptimizableFloat), an optimization loop
     runs before the standard reconstruction pipeline.
 
+    If `z_focus_offset` is 'auto' (bare, or as an `init`), the in-focus slice is
+    found with a per-slice search over a 3D reconstruction of the first
+    position. The resolved offset is used for this run and printed; it depends
+    on the data, so no new config is written for it. As
+    `{init: auto, lr: 0.05}`, the searched slice seeds the optimization loop,
+    which refines it to sub-slice precision.
+
     If `apply_inverse` has an `auto_regularization` block, `regularization_strength`
     is chosen from the data after the transfer function is computed, and the
     resolved settings are written alongside the config.
@@ -58,57 +66,113 @@ def _reconstruct_cli(
 
     settings = utils.yaml_to_model(config_filepath, ReconstructionSettings)
 
-    # Check for optimizable parameters and run optimization if needed
-    if has_optimizable_params(settings):
-        config_filepath = _run_optimization(settings, input_position_dirpaths[0], config_filepath)
+    # `config_filepath` names what this run writes (the transfer function and
+    # any resolved configs); `run_config` is the config the steps below read.
+    run_config = config_filepath
 
-    # Positions that share a ZYX shape can share a transfer function, so compute
-    # one per distinct shape, using the first position that has that shape.
-    position_zyx_shapes = read_zyx_shapes(input_position_dirpaths)
-    first_position_by_zyx_shape: dict[tuple[int, ...], Path] = {}
-    for zyx_shape, input_position_dirpath in zip(position_zyx_shapes, input_position_dirpaths, strict=True):
-        first_position_by_zyx_shape.setdefault(zyx_shape, input_position_dirpath)
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        # Resolve z_focus_offset: 'auto' before anything consumes the offset (the
+        # optimizer needs a numeric init and the transfer function a numeric
+        # offset). The offset depends on the data, so it is not saved next to the
+        # user's config: the steps below read it from a copy that lasts for this
+        # run only.
+        if _has_auto_z_focus_offset(settings):
+            _run_auto_z_focus_offset(settings, input_position_dirpaths[0])
+            run_config = Path(scratch_dir) / config_filepath.name
+            utils.model_to_yaml(settings, run_config)
 
-    if len(first_position_by_zyx_shape) > 1:
-        typer.echo(
-            typer.style(
-                f"Found {len(first_position_by_zyx_shape)} distinct ZYX shapes across "
-                f"{len(input_position_dirpaths)} positions: computing one transfer "
-                "function per shape.",
-                fg="yellow",
+        # Check for optimizable parameters and run optimization if needed
+        if has_optimizable_params(settings):
+            config_filepath = _run_optimization(settings, input_position_dirpaths[0], config_filepath)
+            run_config = config_filepath
+
+        # Positions that share a ZYX shape can share a transfer function, so compute
+        # one per distinct shape, using the first position that has that shape.
+        position_zyx_shapes = read_zyx_shapes(input_position_dirpaths)
+        first_position_by_zyx_shape: dict[tuple[int, ...], Path] = {}
+        for zyx_shape, input_position_dirpath in zip(position_zyx_shapes, input_position_dirpaths, strict=True):
+            first_position_by_zyx_shape.setdefault(zyx_shape, input_position_dirpath)
+
+        if len(first_position_by_zyx_shape) > 1:
+            typer.echo(
+                typer.style(
+                    f"Found {len(first_position_by_zyx_shape)} distinct ZYX shapes across "
+                    f"{len(input_position_dirpaths)} positions: computing one transfer "
+                    "function per shape.",
+                    fg="yellow",
+                )
             )
+
+        transfer_function_paths = {}
+        for zyx_shape, input_position_dirpath in first_position_by_zyx_shape.items():
+            # Only disambiguate the filename when there is more than one shape, so
+            # single-shape runs keep writing the path users already expect.
+            suffix = "" if len(first_position_by_zyx_shape) == 1 else "_" + "x".join(str(size) for size in zyx_shape)
+            transfer_function_path = output_dirpath.parent / f"transfer_function_{config_filepath.stem}{suffix}.zarr"
+            compute_transfer_function_cli(input_position_dirpath, run_config, transfer_function_path)
+            transfer_function_paths[zyx_shape] = transfer_function_path
+
+        # Choose regularization_strength from the data, if asked to. This runs after
+        # the transfer function (which it needs, and which does not depend on
+        # `apply_inverse`) and before the reconstruction, so the sweep happens once
+        # rather than per timepoint inside the process pool.
+        if _has_auto_regularization(settings):
+            config_filepath = _run_auto_regularization(
+                settings,
+                input_position_dirpaths[0],
+                config_filepath,
+            )
+            run_config = config_filepath
+
+        # Apply each position's matching inverse transfer function
+        apply_inverse_transfer_function_cli(
+            input_position_dirpaths,
+            transfer_function_paths,
+            run_config,
+            output_dirpath,
+            num_processes,
+            write_config_scale_to_output,
+            resume,
         )
 
-    transfer_function_paths = {}
-    for zyx_shape, input_position_dirpath in first_position_by_zyx_shape.items():
-        # Only disambiguate the filename when there is more than one shape, so
-        # single-shape runs keep writing the path users already expect.
-        suffix = "" if len(first_position_by_zyx_shape) == 1 else "_" + "x".join(str(size) for size in zyx_shape)
-        transfer_function_path = output_dirpath.parent / f"transfer_function_{config_filepath.stem}{suffix}.zarr"
-        compute_transfer_function_cli(input_position_dirpath, config_filepath, transfer_function_path)
-        transfer_function_paths[zyx_shape] = transfer_function_path
 
-    # Choose regularization_strength from the data, if asked to. This runs after
-    # the transfer function (which it needs, and which does not depend on
-    # `apply_inverse`) and before the reconstruction, so the sweep happens once
-    # rather than per timepoint inside the process pool.
-    if _has_auto_regularization(settings):
-        config_filepath = _run_auto_regularization(
-            settings,
-            input_position_dirpaths[0],
-            config_filepath,
-        )
+def _has_auto_z_focus_offset(settings) -> bool:
+    """Whether the phase block asks for an automatic focus-offset search.
 
-    # Apply each position's matching inverse transfer function
-    apply_inverse_transfer_function_cli(
-        input_position_dirpaths,
-        transfer_function_paths,
-        config_filepath,
-        output_dirpath,
-        num_processes,
-        write_config_scale_to_output,
-        resume,
+    3D reconstructions do not use a focus offset, so 'auto' is left for the
+    API to warn about and drop.
+    """
+    from waveorder.api import phase
+
+    return (
+        settings.phase is not None
+        and settings.reconstruction_dimension == 2
+        and phase._z_focus_offset_is_auto(settings.phase.transfer_function)
     )
+
+
+def _run_auto_z_focus_offset(settings, input_position_dirpath):
+    """Resolve z_focus_offset from the data and store it in `settings`, in place."""
+    # Deferred imports for the same reason as above
+    from iohub.ngff import open_ome_zarr
+
+    from waveorder.api import phase
+    from waveorder.cli.printing import echo_headline
+    from waveorder.cli.utils import resolve_time_indices
+
+    echo_headline("\nResolving z_focus_offset with a per-slice focus search...")
+
+    input_dataset = open_ome_zarr(input_position_dirpath, layout="fov", mode="r")
+    try:
+        t_idx = resolve_time_indices(settings.time_indices, input_dataset.data.shape[0])[0]
+        czyx = input_dataset.to_xarray().isel(t=t_idx).sel(c=settings.input_channel_names)
+    finally:
+        input_dataset.close()
+
+    settings.phase = phase.resolve_z_focus_offset(czyx, settings.phase, device=settings.device)
+
+    offset = settings.phase.transfer_function.z_focus_offset
+    typer.echo(typer.style(f"    z_focus_offset = {float(offset):g} (slice units), t={t_idx}", fg="green"))
 
 
 def _run_optimization(settings, input_position_dirpath, config_filepath):
