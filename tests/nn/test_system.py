@@ -22,7 +22,6 @@ from waveorder.nn import (
     Illumination,
     IlluminationTilt,
     ImagingModel,
-    Loop,
     MidbandPowerScore,
     Poisson,
     RichardsonLucy,
@@ -455,15 +454,15 @@ def test_reprs_list_each_quantity_and_free_ones_as_their_spec():
     assert "=0.05" in repr(aberration)
 
 
-def test_solver_reprs_show_their_loop():
-    assert repr(Loop(50)) == "Loop(50)"
-    assert repr(Loop(200, tolerance=1e-4)) == "Loop(200, tolerance=0.0001)"
-    assert repr(FISTA(loop=Loop(20))) == "FISTA(loop=Loop(20))"
-    assert repr(RichardsonLucy()) == "RichardsonLucy(loop=Loop(25), background=0)"
-    assert repr(RichardsonLucy(loop=Loop(3), back_projector="gaussian", start="ones")) == (
-        "RichardsonLucy(loop=Loop(3), background=0, back_projector='gaussian', start='ones')"
+def test_solver_reprs_show_their_stopping_settings():
+    assert repr(FISTA(iterations=20)) == "FISTA(iterations=20)"
+    assert repr(FISTA(iterations=200, tolerance=1e-4)) == "FISTA(iterations=200, tolerance=0.0001)"
+    assert repr(FISTA(check_every=3)) == "FISTA(iterations=50, check_every=3)"
+    assert repr(RichardsonLucy()) == "RichardsonLucy(iterations=25, background=0)"
+    assert repr(RichardsonLucy(iterations=3, back_projector="gaussian", start="ones")) == (
+        "RichardsonLucy(iterations=3, background=0, back_projector='gaussian', start='ones')"
     )
-    assert repr(ADMM(rho=0.01)) == "ADMM(loop=Loop(10), rho=0.01, damping=0.001)"
+    assert repr(ADMM(rho=0.01)) == "ADMM(iterations=10, rho=0.01, damping=0.001)"
     assert repr(Wiener()) == "Wiener()"
     score = repr(MidbandPowerScore(solver=Wiener(), cutoff=3.4, fields=("phase",)))
     assert "cutoff=3.4, fractions=(0.125, 0.25), fields=('phase',)" in score

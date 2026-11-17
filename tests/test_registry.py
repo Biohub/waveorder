@@ -10,8 +10,7 @@ import pytest
 from tests.registration import temporarily
 from waveorder import registry
 from waveorder.errors import ParameterError, RegistrationError
-from waveorder.nn import FISTA, Detection, Free, Tikhonov, Wiener, ZernikeAberration, load_parameters
-from waveorder.nn.solvers import Loop
+from waveorder.nn import FISTA, Detection, Free, MidbandPowerScore, Tikhonov, Wiener, ZernikeAberration, load_parameters
 
 
 class Shrink:
@@ -105,9 +104,13 @@ def test_a_quantity_is_reported_at_its_current_value_and_a_copy_keeps_its_argume
 
 
 def test_nested_specs_and_values_are_rebuilt_before_the_part():
-    solver = registry.resolve({"fista": {"loop": {"loop": {"iterations": 3, "tolerance": 1e-3}}}}, "solver")
-    assert isinstance(solver, FISTA)
-    assert solver.loop == Loop(3, tolerance=1e-3)
+    score = registry.resolve(
+        {"midband_power_score": {"solver": {"fista": {"iterations": 3, "tolerance": 1e-3}}}}, "score"
+    )
+    assert isinstance(score, MidbandPowerScore)
+    assert isinstance(score.solver, FISTA)
+    assert (score.solver.iterations, score.solver.tolerance) == (3, 1e-3)
+    assert registry.describe(FISTA(iterations=3)) == {"fista": {"iterations": 3, "tolerance": None, "check_every": 10}}
     prior = registry.resolve(
         {"tikhonov": {"weight": {"free": {"nominal": 0.01, "bounds": [1e-4, 1.0]}}}}, "object_prior"
     )

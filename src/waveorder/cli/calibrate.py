@@ -11,15 +11,7 @@ from typing import Annotated
 
 import typer
 
-from waveorder.cli.options import (
-    ConfigFilepath,
-    Device,
-    InputPositions,
-    OutputDirpath,
-    Overwrite,
-    Wandb,
-    expect_store_output,
-)
+from waveorder.cli.options import ConfigFilepath, Device, InputPositions, OutputDirpath, Overwrite, expect_store_output
 from waveorder.cli.render import status
 from waveorder.errors import Problems
 
@@ -55,7 +47,6 @@ def calibrate_transfer_function(  # noqa: PLR0913 (one keyword per flag)
     start: _Start = None,
     device: Device = None,
     overwrite: Overwrite = False,
-    wandb: Wandb = None,
 ) -> None:
     """Estimate the configuration's free quantities from one position and write a tf.zarr.
 
@@ -68,11 +59,10 @@ def calibrate_transfer_function(  # noqa: PLR0913 (one keyword per flag)
     Example: wo calibrate-tf -i in.zarr -c phase.yml -o tf.zarr
     """
     from waveorder.cli._configured import build_model, collecting, load_store, located, resolve_config
-    from waveorder.cli._observation import check_wandb, observing, parameter_table
+    from waveorder.cli._progress import calibrating, parameter_table
     from waveorder.io.positions import SINGLE_POSITION, expand_positions, plate_name
     from waveorder.io.tf_store import TfStore
 
-    check_wandb(wandb)
     resolved = resolve_config(config_filepath, device=device)
     model = build_model(resolved)
     problems = Problems()
@@ -102,9 +92,8 @@ def calibrate_transfer_function(  # noqa: PLR0913 (one keyword per flag)
     problems.raise_if_any()
     name = plate_name(positions[0])
     name = str(positions[0]) if name == SINGLE_POSITION else name
-    watching = observing(wandb, job_type="calibrate-transfer-function", store=output_dirpath.name)
-    with located(resolved), watching as observed:
-        observed.calibrating(position=name, time_index=time)
+    with located(resolved):
+        calibrating(position=name, time_index=time)
         store = calibrate(dry_run=False)
         assert store is not None
         store.save(output_dirpath, overwrite=overwrite)

@@ -48,7 +48,7 @@ def test_admm_takes_its_iterations_and_penalty_and_reconstructs():
     model = ReconstructionModel.from_config(raw)
     solver = model.solver
     assert isinstance(solver, ADMM)
-    assert (solver.loop.iterations, solver.rho) == (7, 0.01)
+    assert (solver.iterations, solver.rho) == (7, 0.01)
     sampling = Sampling(shape=SHAPE, pixel_size=PIXEL_SIZE)
     with torch.no_grad():
         data = model.imaging_model(torch.rand(1, *SHAPE, generator=torch.Generator().manual_seed(0)), sampling)

@@ -9,7 +9,7 @@ import dataclasses
 import operator
 import os
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import ClassVar, Literal, Self, Unpack, cast
 
@@ -34,6 +34,7 @@ from waveorder.errors import (
     ReconstructionReport,
     Rejected,
     ShapeError,
+    UnitResult,
 )
 from waveorder.io.tf_store import TfStore
 from waveorder.models import _arguments
@@ -69,6 +70,7 @@ from waveorder.nn.preprocess import ZPadding, apodize, most_structured_crop
 from waveorder.nn.priors import Beads
 from waveorder.nn.sampling import ZYX
 from waveorder.nn.scores import SharpnessScore
+from waveorder.nn.search import Estimate
 from waveorder.nn.search.beads import BeadCalibration, calibrate_beads
 from waveorder.nn.search.sweep import WeightSweep
 from waveorder.nn.systems.fluorescence import WidefieldFluorescence3D
@@ -667,16 +669,15 @@ class ReconstructionModel:
         expect_instance(calibration, bool, where=where, name="calibration")
         if not calibration:
             self._expect_reconstructs(where)
-        with running(self, "check", reported=False):
-            padded = self._padding_for(sampling).sampling(sampling)
-            self.imaging_model.check(self.solver, padded)
-            if calibration and isinstance(self.object_prior, Beads):
-                self._expect_beads(None, where=where)  # a bead fit scores by its own likelihood
-            elif calibration:
-                self.imaging_model.check(calibration_score(self, where=where, warn=False), padded)
-            if calibration or self.solver.needs_operator:
-                with torch.no_grad():  # a transfer without a graph is cached, so the solve that follows reuses it
-                    bind(self, padded, stored=not calibration)
+        padded = self._padding_for(sampling).sampling(sampling)
+        self.imaging_model.check(self.solver, padded)
+        if calibration and isinstance(self.object_prior, Beads):
+            self._expect_beads(None, where=where)  # a bead fit scores by its own likelihood
+        elif calibration:
+            self.imaging_model.check(calibration_score(self, where=where, warn=False), padded)
+        if calibration or self.solver.needs_operator:
+            with torch.no_grad():  # a transfer without a graph is cached, so the solve that follows reuses it
+                bind(self, padded, stored=not calibration)
 
     def reconstruct(self, data: object, *, pixel_size: PixelSize | None = None, prepared: bool = False) -> SolveResult:
         """Estimate the object from recorded data with the model's solver and current values.
@@ -723,7 +724,7 @@ class ReconstructionModel:
                 "apodization_rolloff",
                 f"applies to a Wiener estimate, not to {type(self.solver).__name__}'s",
             )
-        with running(self, "reconstruct"), torch.no_grad():
+        with torch.no_grad():
             padding = self._padding_for(sampling)
             padded = padding.sampling(sampling)
             self.imaging_model.check(self.solver, padded)  # the model and its grid, before a transfer is computed
@@ -742,6 +743,7 @@ class ReconstructionModel:
         prior: ParameterPrior | TfStore | None = None,
         prepared: bool = False,
         history: bool = False,
+        callback: Callable[[int, SearchStage, Estimate], None] | None = None,
     ) -> CalibrationResult | BeadCalibration:
         """Estimate the free quantities from recorded data with the model's score and search; the model takes them.
 
@@ -769,6 +771,9 @@ class ReconstructionModel:
         history : bool
             Also return the objective at each gradient step, the last grid over the free quantities, and a weight
             sweep's result with its crop. A bead calibration always returns its trace.
+        callback : callable, optional
+            Called as ``callback(index, stage, best)`` as each stage ends, as :func:`~waveorder.nn.calibrate` calls
+            it; the stages before a weight sweep count first. A bead calibration has no stages and never calls it.
 
         Returns
         -------
@@ -792,63 +797,65 @@ class ReconstructionModel:
             self._expect_beads(prior, where=where)
             stages = [stage for stage in self.search or () if isinstance(stage, GradientSearch)]
             iterations, rate = (stages[0].iterations, stages[0].learning_rate) if stages else (_BEAD_ITERATIONS, 0.01)
-            with running(self, "calibrate"):
-                padding = self._padding_for(sampling)
-                measured = self._measured(recorded, padding, prepared=prepared)
-                padded = padding.sampling(sampling)
-                self._start_from(measured)
-                return calibrate_beads(measured, self.imaging_model, padded, iterations=iterations, learning_rate=rate)
+            padding = self._padding_for(sampling)
+            measured = self._measured(recorded, padding, prepared=prepared)
+            padded = padding.sampling(sampling)
+            self._start_from(measured)
+            return calibrate_beads(measured, self.imaging_model, padded, iterations=iterations, learning_rate=rate)
         self._expect_whole_field(where)
         score = calibration_score(self, where=where)
-        with running(self, "calibrate"):
-            padding = self._padding_for(sampling)
-            padded = padding.sampling(sampling)
-            self.imaging_model.check(score, padded)  # the model and its grid, before a transfer is computed
-            region, before, search = None, None, self.search
-            first = next((index for index, stage in enumerate(search or ()) if isinstance(stage, WeightSweep)), None)
+        padding = self._padding_for(sampling)
+        padded = padding.sampling(sampling)
+        self.imaging_model.check(score, padded)  # the model and its grid, before a transfer is computed
+        region, before, search = None, None, self.search
+        first = next((index for index, stage in enumerate(search or ()) if isinstance(stage, WeightSweep)), None)
 
-            def run(
-                frame: Tensor, grid: Sampling, stages: Sequence[SearchStage] | None, *, hold: Iterable[str] = ()
-            ) -> CalibrationResult:
-                measured = self._measured(frame, padding, prepared=prepared)
-                bind(self, grid)
-                self._start_from(measured)
-                over = prior.to_prior(free_specs(self.imaging_model)) if isinstance(prior, TfStore) else prior
-                return calibrate(
-                    measured,
-                    self.imaging_model,
-                    grid,
-                    score=score,
-                    search=stages,
-                    prior=over,
-                    hold=hold,
-                    history=history,
-                )
+        def run(
+            frame: Tensor,
+            grid: Sampling,
+            stages: Sequence[SearchStage] | None,
+            *,
+            hold: Iterable[str] = (),
+            counted: int = 0,
+        ) -> CalibrationResult:
+            measured = self._measured(frame, padding, prepared=prepared)
+            bind(self, grid)
+            self._start_from(measured)
+            over = prior.to_prior(free_specs(self.imaging_model)) if isinstance(prior, TfStore) else prior
+            return calibrate(
+                measured,
+                self.imaging_model,
+                grid,
+                score=score,
+                search=stages,
+                prior=over,
+                hold=hold,
+                history=history,
+                callback=_shifted(callback, counted),
+            )
 
-            if first:  # the stages before the sweep calibrate on the whole frame, the swept weight held (wo-4.0)
-                assert search is not None
-                swept = {stage.name for stage in search[first:] if isinstance(stage, WeightSweep)}
-                before, search = run(recorded, padded, search[:first], hold=swept), search[first:]
-            if first is not None:
-                region = most_structured_crop(recorded, size=256)
-                y, x, side = region
-                recorded = recorded[..., y : y + side, x : x + side]
-                padded = dataclasses.replace(padded, shape=(padded.shape[0], side, side))
-                if self._z_padding == "auto":  # the sweep leaves out the slices auto chose for this stack
-                    search = tuple(
-                        dataclasses.replace(stage, z_padding=padding.slices)
-                        if isinstance(stage, WeightSweep)
-                        else stage
-                        for stage in search or ()
-                    )
-            result = run(recorded, padded, search)
-            if result.sweep is not None:
-                result = dataclasses.replace(result, sweep=dataclasses.replace(result.sweep, region=region))
-            if before is not None:
-                result = dataclasses.replace(
-                    result, trace=before.trace + result.trace, steps=before.steps + result.steps, grid=before.grid
+        if first:  # the stages before the sweep calibrate on the whole frame, the swept weight held (wo-4.0)
+            assert search is not None
+            swept = {stage.name for stage in search[first:] if isinstance(stage, WeightSweep)}
+            before, search = run(recorded, padded, search[:first], hold=swept), search[first:]
+        if first is not None:
+            region = most_structured_crop(recorded, size=256)
+            y, x, side = region
+            recorded = recorded[..., y : y + side, x : x + side]
+            padded = dataclasses.replace(padded, shape=(padded.shape[0], side, side))
+            if self._z_padding == "auto":  # the sweep leaves out the slices auto chose for this stack
+                search = tuple(
+                    dataclasses.replace(stage, z_padding=padding.slices) if isinstance(stage, WeightSweep) else stage
+                    for stage in search or ()
                 )
-            return result
+        result = run(recorded, padded, search, counted=0 if before is None else len(before.trace))
+        if result.sweep is not None:
+            result = dataclasses.replace(result, sweep=dataclasses.replace(result.sweep, region=region))
+        if before is not None:
+            result = dataclasses.replace(
+                result, trace=before.trace + result.trace, steps=before.steps + result.steps, grid=before.grid
+            )
+        return result
 
     def _start_from(self, data: Tensor) -> None:
         """Let the parts that start from the data set their start and bounds from ``data``."""
@@ -953,7 +960,7 @@ class ReconstructionModel:
         dtype, device = placement(self.imaging_model)
         obj = obj.to(device=device, dtype=dtype)
         config = None if simulated is None else config
-        with torch.no_grad(), running(self, "simulate"):  # a free noise parameter must not reach the data either
+        with torch.no_grad():  # a free noise parameter must not reach the data either
             clean = self.imaging_model(obj, sampling).cpu()
             data = _noisy(clean, self.noise, config=config, generator=generator) if noise else clean
         return data.to(device=device, dtype=dtype), obj
@@ -1049,23 +1056,22 @@ class ReconstructionModel:
         score = calibration_score(self, where=where)
         if not prepared:
             source = _tiles.as_measured(self, source, plan=plan, where=where)
-        with running(self, "calibrate_tiles"):
-            # The model and the grid of a tile are judged before a tile is read or a transfer function computed.
-            self.imaging_model.check(score, Sampling(shape=plan.read_shape, pixel_size=pixel_size))
-            stack, sampling = stack_tiles(source, plan, pixel_size=pixel_size, device=self.device, dtype=self.dtype)
-            bind(self, sampling)
-            if prior is not None and not isinstance(prior, ParameterPrior):
-                prior = prior.to_prior(free_specs(self.imaging_model))
-            return calibrate_tile_stack(
-                stack,
-                self.imaging_model,
-                sampling,
-                score=score,
-                search=self.search,
-                start=start,
-                chunk_size=chunk_size,
-                prior=prior,
-            )
+        # The model and the grid of a tile are judged before a tile is read or a transfer function computed.
+        self.imaging_model.check(score, Sampling(shape=plan.read_shape, pixel_size=pixel_size))
+        stack, sampling = stack_tiles(source, plan, pixel_size=pixel_size, device=self.device, dtype=self.dtype)
+        bind(self, sampling)
+        if prior is not None and not isinstance(prior, ParameterPrior):
+            prior = prior.to_prior(free_specs(self.imaging_model))
+        return calibrate_tile_stack(
+            stack,
+            self.imaging_model,
+            sampling,
+            score=score,
+            search=self.search,
+            start=start,
+            chunk_size=chunk_size,
+            prior=prior,
+        )
 
     def reconstruct_tiles(
         self,
@@ -1118,21 +1124,20 @@ class ReconstructionModel:
         sampling = Sampling(shape=plan.read_shape, pixel_size=pixel_size)
         if not prepared:
             pairs = tuple((_tiles.as_measured(self, source, plan=plan, where=where), sink) for source, sink in pairs)
-        with running(self, "reconstruct_tiles"):
-            self.imaging_model.check(self.solver, sampling)  # before the bind computes a transfer function
-            if self.solver.needs_operator:
-                with torch.no_grad():  # cached without a graph: the tile driver binds the same sampling again
-                    bind(self, sampling)
-            return reconstruct_series(
-                pairs,
-                model=self.imaging_model,
-                solver=self.solver,
-                pixel_size=sampling.pixel_size,
-                plan=plan,
-                device=self.device,
-                options=options,
-                parameters=parameters,
-            )
+        self.imaging_model.check(self.solver, sampling)  # before the bind computes a transfer function
+        if self.solver.needs_operator:
+            with torch.no_grad():  # cached without a graph: the tile driver binds the same sampling again
+                bind(self, sampling)
+        return reconstruct_series(
+            pairs,
+            model=self.imaging_model,
+            solver=self.solver,
+            pixel_size=sampling.pixel_size,
+            plan=plan,
+            device=self.device,
+            options=options,
+            parameters=parameters,
+        )
 
     # --- position methods (OME-Zarr); their helpers import iohub, so each method imports them when it runs ---------
 
@@ -1153,6 +1158,8 @@ class ReconstructionModel:
         overwrite: bool = False,
         resume: bool = False,
         write_pixel_size: bool = False,
+        on_start: Callable[[int], None] | None = None,
+        on_unit: Callable[[UnitResult], None] | None = None,
     ) -> ReconstructionReport:
         """Reconstruct the selected time points of OME-Zarr positions into an output plate, over the devices.
 
@@ -1191,6 +1198,11 @@ class ReconstructionModel:
             Skip the units an interrupted run of the same reconstruction finished (iohub's progress record).
         write_pixel_size : bool
             Record the stated ``pixel_size`` as the output's scale instead of each input's.
+        on_start : callable, optional
+            Called as ``on_start(total)`` with the number of units once the checks passed and the plate is written,
+            before any unit runs; never in a ``dry_run``.
+        on_unit : callable, optional
+            Called as ``on_unit(result)`` in this process as each unit ends, wherever it ran.
 
         Returns
         -------
@@ -1242,9 +1254,18 @@ class ReconstructionModel:
             indices = _positions.write_plate(plan, records)
             work = _positions.unit_work(self, plan, indices, records=records, resume=resume)
             report.status = "finished"
+            if on_start is not None:
+                on_start(len(units))
             try:
                 _pool.run_units(
-                    self, units, work=work, workers=assigned, payload=payload, keep_going=keep_going, report=report
+                    self,
+                    units,
+                    work=work,
+                    workers=assigned,
+                    payload=payload,
+                    keep_going=keep_going,
+                    report=report,
+                    on_unit=on_unit,
                 )
             finally:
                 ended = {result.unit for result in report.results}
@@ -1508,6 +1529,20 @@ _MODEL_CLASSES: list[type[ReconstructionModel]] = []
 """The model classes that declare ``system_types``, in the order they were defined; no two list one system type."""
 
 
+def _shifted(
+    callback: Callable[[int, SearchStage, Estimate], None] | None, by: int
+) -> Callable[[int, SearchStage, Estimate], None] | None:
+    """Return ``callback`` with the stage index it receives counted from ``by``."""
+    if callback is None or not by:
+        return callback
+    told = callback
+
+    def shifted(index: int, stage: SearchStage, best: Estimate) -> None:
+        told(by + index, stage, best)
+
+    return shifted
+
+
 def _model_class(system: ImagingSystem) -> type[ReconstructionModel]:
     """Return the class whose ``system_types`` list ``system``'s type, else one it is an instance of, else the base."""
     for model_class in _MODEL_CLASSES:
@@ -1568,4 +1603,4 @@ def _noisy(clean: Tensor, noise: Noise, *, config: V4Config | None, generator: t
 
 # The helpers take a ReconstructionModel first, so they are imported once the class exists.
 from waveorder.models import _config, _stores, _tiles  # noqa: E402
-from waveorder.models._run import bind, calibration_score, placed, running  # noqa: E402
+from waveorder.models._run import bind, calibration_score, placed  # noqa: E402

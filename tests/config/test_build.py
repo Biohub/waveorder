@@ -32,7 +32,6 @@ from waveorder.nn import (
     load_parameters,
 )
 from waveorder.nn.functional import half_spectrum_frequencies
-from waveorder.nn.solvers import Loop
 from waveorder.tiling import TilePlan
 from waveorder.zernike_names import noll_indices_up_to_order, noll_to_name
 
@@ -295,21 +294,27 @@ def test_a_sigma_to_estimate_is_free_under_the_evidence():
     assert "sigma" in free_specs(parts["noise"])
 
 
-LOOP = Loop(9, tolerance=1e-3, check_every=3)
-LOOP_SETTINGS = {name: getattr(LOOP, name) for name in ("iterations", "tolerance", "check_every")}
+STOPPING = {"iterations": 9, "tolerance": 1e-3, "check_every": 3}
 RICHARDSON_LUCY = {"background": 1.0, "back_projector": "gaussian", "start": "ones"}
-SHORT = Loop(3, tolerance=1e-3, check_every=3)
+SHORT = STOPPING | {"iterations": 3}
+DEFAULT_STOPPING = {"tolerance": None, "check_every": 10}
 
 
 @pytest.mark.parametrize(
-    ("reconstruction", "blocks", "name", "loop", "arguments"),
+    ("reconstruction", "blocks", "name", "stopping", "arguments"),
     [
         ("closed_form", {}, "wiener", None, {}),
-        ("fista", {}, "fista", Loop(FISTA().loop.iterations), {}),
-        ({"fista": LOOP_SETTINGS}, {}, "fista", LOOP, {}),
-        ({"admm": {"iterations": 3, "rho": 0.01}}, {"object": {"prior": "tv"}}, "admm", Loop(3), {"rho": 0.01}),
+        ("fista", {}, "fista", {"iterations": FISTA().iterations} | DEFAULT_STOPPING, {}),
+        ({"fista": STOPPING}, {}, "fista", STOPPING, {}),
         (
-            {"richardson_lucy": LOOP_SETTINGS | {"iterations": 3} | RICHARDSON_LUCY},
+            {"admm": {"iterations": 3, "rho": 0.01}},
+            {"object": {"prior": "tv"}},
+            "admm",
+            {"iterations": 3} | DEFAULT_STOPPING,
+            {"rho": 0.01},
+        ),
+        (
+            {"richardson_lucy": SHORT | RICHARDSON_LUCY},
             {"object": {"prior": "none"}, "noise": {"poisson": {}}},
             "richardson_lucy",
             SHORT,
@@ -318,11 +323,12 @@ SHORT = Loop(3, tolerance=1e-3, check_every=3)
     ],
     ids=["closed_form", "bare_fista", "fista", "admm", "richardson_lucy"],
 )
-def test_each_solver_builds_its_class_with_the_configured_arguments(reconstruction, blocks, name, loop, arguments):
+def test_each_solver_builds_its_class_with_the_configured_arguments(reconstruction, blocks, name, stopping, arguments):
     solver = _parts(_raw(solver={"reconstruction": reconstruction}, **blocks))["solver"]
     built, given = _spec(solver)
     assert built == name
-    assert getattr(solver, "loop", None) == loop
+    held = {key: getattr(solver, key) for key in STOPPING} if hasattr(solver, "iterations") else None
+    assert held == stopping
     assert {key: given[key] for key in arguments} == arguments
 
 

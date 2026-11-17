@@ -12,7 +12,9 @@ from waveorder.nn.model import ImagingModel, bound_operator, expect_on_system
 from waveorder.nn.operators import LinearOperator
 from waveorder.nn.parameters import CalibratableModule
 from waveorder.nn.sampling import Data, Object, Sampling
-from waveorder.observe import capturing, observing, operation
+
+type StepCallback = Callable[[int, Object], None]
+"""``callback(iteration, estimate)``: what an iterative solver calls after each iteration, counted from 1."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,7 @@ class InverseProblem:
     _normal_actions: dict[bool, Callable[[Tensor], Tensor]] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+    callback: StepCallback | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def of(
@@ -42,11 +45,12 @@ class InverseProblem:
         *,
         operator: LinearOperator | None = None,
         where: str = "InverseProblem.of",
+        callback: StepCallback | None = None,
     ) -> Self:
         """Validate ``data`` against the model's system on ``sampling``, and adopt ``operator`` when one is given.
 
         Without ``operator`` nothing is bound here; :attr:`operator` binds later in the grad mode of this call.
-        ``where`` names the caller in every error.
+        ``where`` names the caller in every error, and ``callback`` is kept for an iterative solver to call.
 
         Raises
         ------
@@ -65,7 +69,7 @@ class InverseProblem:
         bound = (
             {} if operator is None else {"operator": bound_operator(system, sampling, operator=operator, where=where)}
         )
-        return cls(data, model, sampling, where, torch.is_grad_enabled(), bound)
+        return cls(data, model, sampling, where, torch.is_grad_enabled(), bound, callback=callback)
 
     @property
     def operator(self) -> LinearOperator:
@@ -103,7 +107,7 @@ class Verb[R](CalibratableModule, ABC):
     Every call runs :meth:`ImagingModel.check <waveorder.nn.model.ImagingModel.check>`, so an incompatible model or
     sampling fails before any computation, then :meth:`run` on one :class:`InverseProblem`. Subclasses implement
     :meth:`run` and, when they cannot run on every model, :meth:`check`. Free tuning quantities (step sizes,
-    weights) are ``nn.Parameter`` objects. Each eager call is one :func:`~waveorder.observe.operation`.
+    weights) are ``nn.Parameter`` objects.
     """
 
     @property
@@ -125,26 +129,24 @@ class Verb[R](CalibratableModule, ABC):
     def run(self, problem: InverseProblem) -> R:
         """Do the work on a checked problem; ``problem.operator`` is ``H`` on its sampling, bound on first use."""
 
-    def report(self, problem: InverseProblem, result: object) -> None:
-        """Emit the events of a finished outermost call (:func:`waveorder.observe.emit`); none by default.
-
-        Called only when an observer listens; it must not read device values. ``result`` is what :meth:`run` returned.
-        """
-        del problem, result
-
     @final
     @override
     def forward(
-        self, data: Data, model: ImagingModel, sampling: Sampling, *, operator: LinearOperator | None = None
+        self,
+        data: Data,
+        model: ImagingModel,
+        sampling: Sampling,
+        *,
+        operator: LinearOperator | None = None,
+        callback: StepCallback | None = None,
     ) -> R:
-        """Check, validate and run; pass ``operator`` to reuse ``H`` already bound to ``sampling``."""
-        where = type(self).__name__
+        """Check, validate and run; pass ``operator`` to reuse ``H`` already bound to ``sampling``.
+
+        An iterative solver calls ``callback(iteration, estimate)`` after each iteration, with the estimate on its
+        device and attached to the graph; reading it back there costs a device sync per iteration. A verb that does
+        not iterate never calls it.
+        """
         model.check(self, sampling)
-        if capturing():  # inside a transform the verb runs without an operation
-            return self.run(InverseProblem.of(data, model, sampling, operator=operator, where=where))
-        with operation():
-            problem = InverseProblem.of(data, model, sampling, operator=operator, where=where)
-            result = self.run(problem)
-            if observing():
-                self.report(problem, result)
-        return result
+        return self.run(
+            InverseProblem.of(data, model, sampling, operator=operator, where=type(self).__name__, callback=callback)
+        )

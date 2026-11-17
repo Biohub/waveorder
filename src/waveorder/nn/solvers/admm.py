@@ -25,11 +25,9 @@ from waveorder.nn.operators import FourierDiagonal
 from waveorder.nn.parameters import repr_parts
 from waveorder.nn.priors import TotalVariation
 from waveorder.nn.sampling import Object
-from waveorder.nn.solvers.base import IterativeSolver, Loop
+from waveorder.nn.solvers.base import IterativeSolver
 from waveorder.nn.verbs import InverseProblem
 from waveorder.registry import register
-
-_DEFAULT_LOOP = Loop(10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +57,10 @@ class ADMM(IterativeSolver[ADMMState]):
 
     Parameters
     ----------
-    loop : Loop
-        Iterations and stopping (default ``Loop(10)``); ``N`` iterations make ``N`` ``f``-updates from zero.
+    iterations : int
+        Maximum number of iterations; ``N`` iterations make ``N`` ``f``-updates from zero.
+    tolerance, check_every
+        Early stopping, as :class:`~waveorder.nn.solvers.IterativeSolver`.
     rho : float
         Augmented Lagrangian weight, in the units of ``s`` times the objective; positive and finite.
     damping : float
@@ -72,8 +72,16 @@ class ADMM(IterativeSolver[ADMMState]):
         If ``rho`` is not positive and finite or ``damping`` not nonnegative and finite.
     """
 
-    def __init__(self, *, loop: Loop = _DEFAULT_LOOP, rho: float = 1e-3, damping: float = 1e-3) -> None:
-        super().__init__(loop=loop)
+    def __init__(
+        self,
+        *,
+        iterations: int = 10,
+        tolerance: float | None = None,
+        check_every: int = 10,
+        rho: float = 1e-3,
+        damping: float = 1e-3,
+    ) -> None:
+        super().__init__(iterations=iterations, tolerance=tolerance, check_every=check_every)
         for name, value, positive in (("rho", rho, True), ("damping", damping, False)):
             if not math.isfinite(value) or value < 0 or (positive and value == 0):
                 bound = "positive" if positive else "nonnegative"

@@ -166,6 +166,22 @@ def test_the_history_holds_every_gradient_step_and_the_last_full_grid():
     assert plain.parameters[NA].item() == pytest.approx(result.parameters[NA].item())
 
 
+def test_calibrate_calls_back_as_each_stage_ends_with_the_best_so_far():
+    data, model = _data(), _model(FREE_NA)
+    stages = (GridSearch(points=5, chunk_size=2), GradientSearch(iterations=3))
+    seen: list[tuple[int, object, Estimate]] = []
+    result = calibrate(
+        data, model, SAMPLING, score=Evidence(), search=stages, callback=lambda *ended: seen.append(ended)
+    )
+    assert [index for index, _, _ in seen] == [0, 1]
+    assert all(stage is given for (_, stage, _), given in zip(seen, stages, strict=True))
+    for (_, _, best), (_, objective) in zip(seen, result.trace, strict=True):
+        assert NA in best.point
+        assert best.objective.item() == pytest.approx(objective, rel=1e-6)
+    plain = calibrate(data, _model(FREE_NA), SAMPLING, score=Evidence(), search=stages)
+    assert plain.parameters[NA].item() == pytest.approx(result.parameters[NA].item())
+
+
 def test_evaluate_swaps_top_level_names_and_does_not_keep_the_module_alive():
     prior = Tikhonov(Free(1.0, bounds=(0.1, 2.0)))
     swapped = evaluate(lambda m: m.quantity("weight") * 2, prior, {"weight": torch.tensor(3.0)})

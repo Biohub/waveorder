@@ -1,10 +1,6 @@
-"""What every method of a model runs through: its events, the bind, and the calibration score."""
+"""What the methods of a model share: placing its modules, the bind, and the calibration score."""
 
-import importlib.metadata
-import time
 import warnings
-from collections.abc import Generator
-from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -13,7 +9,6 @@ from waveorder.errors import CalibrationWarning, ConfigurationError, ParameterEr
 from waveorder.models._base import ReconstructionModel
 from waveorder.models._stores import seed_stored_transfer
 from waveorder.nn import Evidence, LinearOperator, Sampling, Score, free_specs
-from waveorder.observe import emit, flush, observing
 
 
 def placed[M: nn.Module](module: M, *, device: torch.device, dtype: torch.dtype) -> M:
@@ -34,54 +29,11 @@ def placed[M: nn.Module](module: M, *, device: torch.device, dtype: torch.dtype)
     return module._apply(convert)  # noqa: SLF001 (the hook nn.Module.to, .double and .cuda run through)
 
 
-@contextmanager
-def running(model: ReconstructionModel, verb: str, *, reported: bool = True) -> Generator[None]:
-    """Run a method's body between ``run.start`` and ``run.end`` (method ``model.<verb>``) if reported.
-
-    ``run.end`` first flushes the events waiting for device values (:func:`waveorder.observe.flush`), then reports
-    ``"status"`` ``"ok"`` or ``"error"`` (with the exception's message) and the method's wall time.
-    """
-    method = f"model.{verb}"
-    if not (reported and observing()):
-        yield
-        return
-    emit("run.start", _run_start(model, method))
-    started = time.perf_counter()
-    end: dict[str, object] = {"method": method, "status": "ok"}
-    try:
-        yield
-    except BaseException as error:
-        end |= {"status": "error", "error": f"{type(error).__name__}: {error}"}
-        raise
-    finally:
-        flush()
-        emit("run.end", end | {"wall_s": time.perf_counter() - started})
-
-
-def _run_start(model: ReconstructionModel, method: str) -> dict[str, object]:
-    """Return the payload of ``run.start``: host values only."""
-    versions: dict[str, str | None] = {}
-    for package in ("waveorder", "torch", "iohub", "pydantic"):
-        try:
-            versions[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            versions[package] = None
-    versions["cuda"] = torch.version.cuda
-    config = model.config
-    return {
-        "method": method,
-        "config": None if config is None else config.model_dump(mode="json"),
-        "device": str(model.device),
-        "versions": versions,
-    }
-
-
 def bind(model: ReconstructionModel, sampling: Sampling, *, stored: bool = False) -> LinearOperator:
     """Bind the model's system to ``sampling``; with ``stored``, a loaded store's fitting transfer is used."""
-    with running(model, "bind", reported=False):
-        if stored:
-            seed_stored_transfer(model, sampling)
-        return model.system.bind(sampling)
+    if stored:
+        seed_stored_transfer(model, sampling)
+    return model.system.bind(sampling)
 
 
 def calibration_score(model: ReconstructionModel, *, where: str, stacklevel: int = 3, warn: bool = True) -> Score:

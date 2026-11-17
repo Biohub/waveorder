@@ -1,4 +1,4 @@
-"""Solvers under vmap over candidates and over data; Loop settings; the transfer cache across grad modes."""
+"""Solvers under vmap over candidates and over data; stopping settings; the transfer cache across grad modes."""
 
 import pytest
 import torch
@@ -20,7 +20,6 @@ from waveorder.nn import (
     TotalVariation,
     evaluate,
 )
-from waveorder.nn.solvers import Loop
 from waveorder.testing import assert_solver_vmaps_over_candidates
 
 SAMPLING = Sampling(shape=(8, 32, 32), pixel_size=(0.25, 0.1, 0.1))
@@ -40,15 +39,15 @@ def test_tolerance_under_vmap_is_refused_not_read_back():
     # Deciding to stop needs a host read, which vmap cannot do; it used to crash the process instead of raising.
     model = make_model(1.0)
     with torch.no_grad(), pytest.raises(IncompatibleModelError, match="tolerance=None"):
-        vmap(lambda d: FISTA(loop=Loop(4, tolerance=1e-3))(d, model, SAMPLING).estimate)(_data(batch=(2,)))
+        vmap(lambda d: FISTA(iterations=4, tolerance=1e-3)(d, model, SAMPLING).estimate)(_data(batch=(2,)))
 
 
 @pytest.mark.parametrize(
     "case",
     [
-        lambda: (FISTA(loop=Loop(4)), Tikhonov(WEIGHT), Gaussian(SIGMA)),
-        lambda: (ADMM(loop=Loop(4), rho=0.1), TotalVariation(0.05), Gaussian(SIGMA)),
-        lambda: (RichardsonLucy(loop=Loop(4)), NoPrior(), Poisson(gain=2.0)),
+        lambda: (FISTA(iterations=4), Tikhonov(WEIGHT), Gaussian(SIGMA)),
+        lambda: (ADMM(iterations=4, rho=0.1), TotalVariation(0.05), Gaussian(SIGMA)),
+        lambda: (RichardsonLucy(iterations=4), NoPrior(), Poisson(gain=2.0)),
     ],
     ids=["fista", "admm_tv", "richardson_lucy"],
 )
@@ -66,7 +65,7 @@ def test_the_candidate_check_fails_a_solver_that_reads_values_back():
     # A tolerance decides when to stop by a host read, which vmap over candidates cannot do.
     model, data = _small_model(), _data(sampling=SMALL).double()
     with pytest.raises(AssertionError, match="FISTA does not run under vmap over candidate values"):
-        assert_solver_vmaps_over_candidates(FISTA(loop=Loop(5, tolerance=1e-3)), data=data, model=model, sampling=SMALL)
+        assert_solver_vmaps_over_candidates(FISTA(iterations=5, tolerance=1e-3), data=data, model=model, sampling=SMALL)
 
 
 def test_a_fista_gradient_computes_the_gram_once(monkeypatch):
@@ -82,32 +81,32 @@ def test_a_fista_gradient_computes_the_gram_once(monkeypatch):
 
     monkeypatch.setattr(operators, "gram", counted)
     model, data, weights = _small_model(), _data(sampling=SMALL).double(), _data(seed=4, sampling=SMALL).double()
-    solver = FISTA(loop=Loop(20))
+    solver = FISTA(iterations=20)
     point = torch.tensor(1.0, dtype=torch.float64)
     value = grad(lambda na: evaluate(lambda m: (solver(data, m, SMALL).estimate * weights).sum(), model, {NA: na}))
     assert value(point).abs() > 0
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("solver", [FISTA, RichardsonLucy])
 @pytest.mark.parametrize(
-    ("settings", "match"),
+    ("settings", "field"),
     [
-        ({"iterations": 0}, "Loop.iterations"),
-        ({"iterations": 5, "check_every": 0}, "Loop.check_every"),
-        ({"iterations": 5, "tolerance": 0.0}, "Loop.tolerance"),
+        ({"iterations": 0}, "iterations"),
+        ({"iterations": 5, "check_every": 0}, "check_every"),
+        ({"iterations": 5, "tolerance": 0.0}, "tolerance"),
     ],
 )
-def test_loop_rejects_bad_settings_by_name(settings, match):
-    with pytest.raises(ParameterError, match=match) as error:
-        Loop(**settings)
-    assert error.value.path == match.removeprefix("Loop.")  # the field, so config can locate it
+def test_iterative_solvers_reject_bad_stopping_settings_by_name(solver, settings, field):
+    with pytest.raises(ParameterError, match=f"{solver.__name__}.{field}") as error:
+        solver(**settings)
+    assert error.value.path == field  # the field, so config can locate it
 
 
-def test_loop_settings_reach_every_iterative_solver():
-    # check_every is a Loop setting, so Richardson-Lucy honours it although its constructor never names it.
+def test_check_every_sets_when_richardson_lucy_checks_its_tolerance():
     model = ImagingModel(make_system(1.0), NoPrior(), Poisson(gain=2.0))
     data = 10.0 + _data(sampling=SMALL).abs()
-    result = RichardsonLucy(loop=Loop(500, tolerance=1e-3, check_every=7))(data, model, SMALL)
+    result = RichardsonLucy(iterations=500, tolerance=1e-3, check_every=7)(data, model, SMALL)
     assert result.status == "converged"
     assert result.iterations % 7 == 0
 

@@ -41,7 +41,6 @@ from waveorder.nn import (
     TotalVariation,
     free_specs,
 )
-from waveorder.observe import observe
 
 FLUORESCENCE = """\
 version: 4
@@ -115,14 +114,6 @@ def _offset(kind: type[Offset]) -> Offset:
         object_prior=Tikhonov(weight=1e-3),
         noise=Gaussian(sigma=0.01),
     )
-
-
-class _Events:
-    def __init__(self) -> None:
-        self.seen: list[tuple[str, dict]] = []
-
-    def event(self, name, payload) -> None:
-        self.seen.append((name, dict(payload)))
 
 
 def test_a_plate_is_reconstructed_and_each_unit_equals_the_models_reconstruction(plate, volumes, tmp_path):
@@ -861,47 +852,17 @@ def test_the_fingerprint_leaves_out_where_and_when_a_job_runs():
         assert _positions.fingerprint(model, other, tile=None, tile_overlap=None) != token
 
 
-# --- events and workers ----------------------------------------------------------------------------------------------
+# --- progress callbacks and workers ----------------------------------------------------------------------------------
 
 
-def test_units_start_and_unit_end_reach_an_attached_observer(plate, tmp_path):
-    events = _Events()
-    with observe(events):
-        phase_model().reconstruct_positions(plate, output=tmp_path / "out.zarr", channels=["BF"], times=[0])
-    names = [name for name, _ in events.seen]
-    assert names[0] == "units.start"
-    assert events.seen[0][1] == {
-        "output": str(tmp_path / "out.zarr"),
-        "total": 2,
-        "positions": 2,
-        "devices": ["cpu"],
-        "workers": 1,
-    }
-    ends = [payload for name, payload in events.seen if name == "unit.end"]
-    assert [(payload["unit"], payload["status"]) for payload in ends] == [
-        ("A/1/0/t0", "complete"),
-        ("A/1/1/t0", "complete"),
-    ]
-    assert names.index("run.start") < names.index("unit.end")  # the model's own events arrive between
-
-
-@pytest.mark.parametrize("tile", [None, (8, 16, 16)], ids=["whole", "tiled"])
-def test_every_event_of_a_unit_run_in_this_process_names_the_unit(plate, tmp_path, tile):
-    events = _Events()
-    with observe(events):
-        phase_model().reconstruct_positions(plate, output=tmp_path / "out.zarr", channels=["BF"], times=[1], tile=tile)
-    (first, _), *rest = events.seen
-    assert first == "units.start"
-    by_unit: dict[str, list[str]] = {}
-    for name, payload in rest:
-        assert "worker" not in payload  # no worker process ran it
-        by_unit.setdefault(payload["unit"], []).append(name)
-    assert list(by_unit) == ["A/1/0/t1", "A/1/1/t1"]
-    for names in by_unit.values():
-        assert (names[0], names[-2], names[-1]) == ("run.start", "run.end", "unit.end")
-        assert len(names) > 3  # what the verb reports in between: tiles.end or solve.end
-    units = [payload["unit"] for _, payload in rest]
-    assert units == sorted(units)  # one unit after the other
+def test_each_unit_reaches_on_unit_as_it_ends_in_this_process(plate, tmp_path):
+    totals, ended = [], []
+    report = phase_model().reconstruct_positions(
+        plate, output=tmp_path / "out.zarr", channels=["BF"], times=[0], on_start=totals.append, on_unit=ended.append
+    )
+    assert totals == [2]
+    assert [(result.unit, result.status) for result in ended] == [("A/1/0/t0", "complete"), ("A/1/1/t0", "complete")]
+    assert ended == list(report.results)
 
 
 def test_auto_devices_of_a_cpu_model_run_in_the_calling_process(plate, tmp_path, monkeypatch):

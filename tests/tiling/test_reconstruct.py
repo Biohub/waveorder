@@ -6,7 +6,7 @@ import zarr
 
 from tests.tiling.conftest import ArraySink, ArraySource, Blur, blur_model
 from waveorder.errors import ConvergenceWarning, ParameterError, PlacementError, ShapeError
-from waveorder.nn import FISTA, Gaussian, ImagingModel, Loop, NoPrior, Sampling, Wiener
+from waveorder.nn import FISTA, Gaussian, ImagingModel, NoPrior, Sampling, Wiener
 from waveorder.tiling import TileOptions, TilePlan, estimate_memory, reconstruct_series
 from waveorder.tiling.run import OperatorCache
 
@@ -151,7 +151,7 @@ def test_stats_count_nonfinite_tiles_on_the_device_and_unconverged_tiles_from_th
     assert stats.nonfinite == 1
     assert stats.unconverged == 0  # Wiener reports "direct": no criterion requested, so never a failure
 
-    solver = FISTA(loop=Loop(2, tolerance=1e-12))  # a criterion it cannot meet in two steps
+    solver = FISTA(iterations=2, tolerance=1e-12)  # a criterion it cannot meet in two steps
     sink = torch.full((1, *SHAPE), float("nan"))
     model = ImagingModel(Blur(1.0), NoPrior(), Gaussian(0.1))
     with pytest.warns(ConvergenceWarning, match="without meeting tolerance"):

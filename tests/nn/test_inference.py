@@ -46,7 +46,7 @@ from waveorder.nn import (
 )
 from waveorder.nn.operators import LinearOperator
 from waveorder.nn.parameters import same_device
-from waveorder.nn.solvers import Loop, Solver
+from waveorder.nn.solvers import Solver
 from waveorder.nn.verbs import InverseProblem
 from waveorder.testing import assert_solver_descends
 
@@ -96,7 +96,7 @@ def test_the_objective_validates_data_and_estimate_as_every_verb_does():
     with pytest.raises(PlacementError, match=r"^Wiener data is torch\.float64 on cpu but "):
         Wiener()(data.double(), model, SMALL)
     with pytest.raises(PlacementError, match=r"^FISTA data is torch\.float64 on cpu but "):
-        FISTA(loop=Loop(1))(data.double(), model, SMALL)
+        FISTA(iterations=1)(data.double(), model, SMALL)
     with pytest.raises(PlacementError, match=r"^InverseProblem\.of data is torch\.float64"):  # called directly
         InverseProblem.of(data.double(), model, SMALL)
     # Complex data is complex, not "move it to float32": .to(float32) would silently drop the imaginary part.
@@ -116,7 +116,7 @@ def test_every_path_that_takes_an_injected_operator_validates_it_before_use():
     channels = r"operator maps data of shape \(2, 8, 32, 32\), but WidefieldFluorescence3D on this sampling maps data"
     with pytest.raises(ShapeError, match=f"ImagingModel.objective {channels}"):
         model.objective(data, estimate, SMALL, operator=two_channels)
-    for verb in (Wiener(), FISTA(loop=Loop(1)), Evidence()):
+    for verb in (Wiener(), FISTA(iterations=1), Evidence()):
         with pytest.raises(ShapeError, match=f"^{type(verb).__name__} {channels}"):
             verb(data, model, SMALL, operator=two_channels)
     # Placement: an operator bound from a float64 copy of the system does not stand in for the float32 one.
@@ -142,8 +142,8 @@ def test_every_path_that_takes_an_injected_operator_validates_it_before_use():
 @pytest.mark.parametrize(
     "case",
     [
-        lambda: (FISTA(loop=Loop(5)), make_model(1.0)),
-        lambda: (RichardsonLucy(loop=Loop(5)), ImagingModel(make_system(1.0), NoPrior(), Poisson(gain=2.0))),
+        lambda: (FISTA(iterations=5), make_model(1.0)),
+        lambda: (RichardsonLucy(iterations=5), ImagingModel(make_system(1.0), NoPrior(), Poisson(gain=2.0))),
         lambda: (Wiener(), make_model(1.0)),
     ],
     ids=["fista", "richardson_lucy", "wiener"],
@@ -271,12 +271,12 @@ def _poisson_data(model: ImagingModel, sampling: Sampling) -> Tensor:
     "case",
     [
         lambda: (Wiener(), make_model(1.0)),
-        lambda: (FISTA(loop=Loop(20)), make_model(1.0)),
+        lambda: (FISTA(iterations=20), make_model(1.0)),
         lambda: (
-            FISTA(loop=Loop(20)),
+            FISTA(iterations=20),
             ImagingModel(make_system(1.0), TotalVariation(0.05, nonnegative=True), Gaussian(SIGMA)),
         ),
-        lambda: (RichardsonLucy(loop=Loop(10)), _poisson_model(NoPrior())),
+        lambda: (RichardsonLucy(iterations=10), _poisson_model(NoPrior())),
     ],
     ids=["wiener", "fista", "fista_tv", "richardson_lucy"],
 )
@@ -309,20 +309,20 @@ class _Flat(ObjectPrior):
 
 def test_richardson_lucy_asks_the_prior_whether_it_is_flat():
     data = _poisson_data(_poisson_model(NoPrior()), SMALL)
-    custom = RichardsonLucy(loop=Loop(5))(data, _poisson_model(_Flat()), SMALL)
-    reference = RichardsonLucy(loop=Loop(5))(data, _poisson_model(NoPrior()), SMALL)
+    custom = RichardsonLucy(iterations=5)(data, _poisson_model(_Flat()), SMALL)
+    reference = RichardsonLucy(iterations=5)(data, _poisson_model(NoPrior()), SMALL)
     torch.testing.assert_close(custom.estimate, reference.estimate)
     with pytest.raises(IncompatibleModelError, match="prior Tikhonov"):
-        RichardsonLucy(loop=Loop(5))(data, _poisson_model(Tikhonov(WEIGHT)), SMALL)
+        RichardsonLucy(iterations=5)(data, _poisson_model(Tikhonov(WEIGHT)), SMALL)
 
 
 def test_richardson_lucy_asks_the_noise_for_photon_counts():
     model = ImagingModel(make_system(1.0), NoPrior(), Poisson())
     data = _poisson_data(model, SMALL)
-    custom = RichardsonLucy(loop=Loop(5))(data, ImagingModel(make_system(1.0), NoPrior(), _ShotNoise()), SMALL)
-    torch.testing.assert_close(custom.estimate, RichardsonLucy(loop=Loop(5))(data, model, SMALL).estimate)
+    custom = RichardsonLucy(iterations=5)(data, ImagingModel(make_system(1.0), NoPrior(), _ShotNoise()), SMALL)
+    torch.testing.assert_close(custom.estimate, RichardsonLucy(iterations=5)(data, model, SMALL).estimate)
     with pytest.raises(IncompatibleModelError, match="photon_counts"):
-        RichardsonLucy(loop=Loop(5))(data, ImagingModel(make_system(1.0), NoPrior(), Gaussian(SIGMA)), SMALL)
+        RichardsonLucy(iterations=5)(data, ImagingModel(make_system(1.0), NoPrior(), Gaussian(SIGMA)), SMALL)
 
 
 def test_fista_normal_operator_path_matches_the_generic_gradient():
@@ -332,8 +332,8 @@ def test_fista_normal_operator_path_matches_the_generic_gradient():
         return ImagingModel(make_system(1.0), Tikhonov(WEIGHT), noise).double()
 
     _, data = simulate(make_model(1.0).double(), SMALL, scale=PRIOR_SCALE)
-    fast = FISTA(loop=Loop(30))(data, model(reports_variance=True), SMALL)
-    generic = FISTA(loop=Loop(30))(data, model(reports_variance=False), SMALL)
+    fast = FISTA(iterations=30)(data, model(reports_variance=True), SMALL)
+    generic = FISTA(iterations=30)(data, model(reports_variance=False), SMALL)
     assert fast.estimate.abs().max() > 0
     torch.testing.assert_close(fast.estimate, generic.estimate, rtol=1e-9, atol=1e-12)
     torch.testing.assert_close(fast.objective, generic.objective, rtol=1e-12, atol=0)
@@ -343,7 +343,7 @@ def test_fista_matches_wiener_on_the_same_quadratic_objective(sampling):
     model = make_model(1.0)
     _, data = simulate(model, sampling, scale=PRIOR_SCALE)
     closed = Wiener()(data, model, sampling)
-    iterated = FISTA(loop=Loop(200))(data, model, sampling)
+    iterated = FISTA(iterations=200)(data, model, sampling)
     assert iterated.objective.item() == pytest.approx(closed.objective.item(), rel=1e-4)
     torch.testing.assert_close(iterated.estimate, closed.estimate, atol=2e-3, rtol=0)
 
@@ -355,7 +355,7 @@ def test_fista_swaps_priors_and_keeps_their_support(prior, sampling):
     with torch.no_grad():
         data = model.noise.sample(model(obj, sampling), generator=torch.Generator().manual_seed(1))
     start = model.object_prior.project(model.system.bind(sampling).adjoint(data))  # FISTA's initial point
-    result = FISTA(loop=Loop(30))(data, model, sampling)
+    result = FISTA(iterations=30)(data, model, sampling)
     assert result.estimate.min() >= 0
     assert result.objective < model.objective(data, start, sampling)
 
@@ -363,16 +363,46 @@ def test_fista_swaps_priors_and_keeps_their_support(prior, sampling):
 def test_fista_stops_at_tolerance_and_warns_when_it_cannot(sampling):
     model = make_model(1.0)
     _, data = simulate(model, sampling, scale=PRIOR_SCALE)
-    loose = FISTA(loop=Loop(500, tolerance=1e-3))(data, model, sampling)
+    loose = FISTA(iterations=500, tolerance=1e-3)(data, model, sampling)
     assert loose.status == "converged"
     assert loose.iterations < 500
     with pytest.warns(ConvergenceWarning, match="without meeting tolerance"):
-        tight = FISTA(loop=Loop(3, tolerance=1e-12))(data, model, sampling)
+        tight = FISTA(iterations=3, tolerance=1e-12)(data, model, sampling)
     assert tight.status == "max_iterations"
     # No criterion requested: the fixed budget ran, which is neither convergence nor failure.
-    fixed = FISTA(loop=Loop(3))(data, model, sampling)
+    fixed = FISTA(iterations=3)(data, model, sampling)
     assert fixed.status == "budget"
     assert bool(fixed.finite)
+
+
+def _poisson_case(solver: Solver, sampling: Sampling) -> tuple[Solver, ImagingModel, Tensor]:
+    data = 10.0 + torch.rand(1, *sampling.shape, generator=torch.Generator().manual_seed(0))
+    return solver, ImagingModel(make_system(1.0), NoPrior(), Poisson(gain=2.0)), data
+
+
+def _gaussian_case(solver: Solver, sampling: Sampling) -> tuple[Solver, ImagingModel, Tensor]:
+    model = make_model(1.0)
+    return solver, model, simulate(model, sampling, scale=PRIOR_SCALE)[1]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        lambda sampling: _gaussian_case(FISTA(iterations=4), sampling),
+        lambda sampling: _gaussian_case(FISTA(iterations=500, tolerance=1e-3), sampling),  # converges early
+        lambda sampling: _poisson_case(RichardsonLucy(iterations=4), sampling),
+    ],
+    ids=["fista", "fista_with_tolerance", "richardson_lucy"],
+)
+def test_an_iterative_solver_calls_back_after_each_iteration_without_changing_the_result(case, sampling):
+    solver, model, data = case(sampling)
+    seen: list[tuple[int, Tensor]] = []
+    result = solver(data, model, sampling, callback=lambda iteration, estimate: seen.append((iteration, estimate)))
+    assert [iteration for iteration, _ in seen] == list(range(1, result.iterations + 1))
+    torch.testing.assert_close(seen[-1][1], result.estimate)
+    plain = solver(data, model, sampling)
+    assert (plain.iterations, plain.status) == (result.iterations, result.status)
+    torch.testing.assert_close(plain.estimate, result.estimate, rtol=0, atol=0)
 
 
 class _Understated(LinearOperator):
@@ -416,12 +446,12 @@ def test_a_diverging_solve_reports_it_on_the_device_and_with_a_tolerance_in_its_
     _, data = simulate(make_model(1.0).double(), SMALL, scale=PRIOR_SCALE)
     model = ImagingModel(_Understating(), Tikhonov(WEIGHT), Gaussian(SIGMA)).double()
     with torch.no_grad():
-        diverged = FISTA(loop=Loop(300))(data, model, SMALL)
+        diverged = FISTA(iterations=300)(data, model, SMALL)
         assert diverged.status == "budget"
         assert not bool(diverged.finite)  # reported on the device; the solve itself read nothing back
         # With a tolerance the loop reads back at its checks, reports the divergence in the status and warns.
         with pytest.warns(ConvergenceWarning, match="non-finite"):
-            checked = FISTA(loop=Loop(300, tolerance=1e-12))(data, model, SMALL)
+            checked = FISTA(iterations=300, tolerance=1e-12)(data, model, SMALL)
         assert checked.status == "nonfinite"
 
 
@@ -429,10 +459,10 @@ def test_data_on_another_dtype_or_device_is_refused_naming_both_placements():
     model = make_model(1.0).double()
     data = torch.zeros(1, *SMALL.shape)
     with pytest.raises(PlacementError, match=r"float32 on cpu.*float64 on cpu"):
-        FISTA(loop=Loop(1))(data, model, SMALL)
+        FISTA(iterations=1)(data, model, SMALL)
     if torch.cuda.is_available():
         with pytest.raises(PlacementError, match=r"float64 on cuda:0.*float64 on cpu"):
-            FISTA(loop=Loop(1))(data.double().cuda(), model, SMALL)
+            FISTA(iterations=1)(data.double().cuda(), model, SMALL)
 
 
 def test_a_model_whose_children_were_moved_apart_names_the_child_before_solving():
@@ -442,13 +472,13 @@ def test_a_model_whose_children_were_moved_apart_names_the_child_before_solving(
     with pytest.raises(
         PlacementError, match=r"object_prior computes in torch.float32 on cpu but system computes in torch.float64"
     ):
-        FISTA(loop=Loop(1))(data, model, SMALL)
+        FISTA(iterations=1)(data, model, SMALL)
     # A tree built mixed and then moved as a whole is fine: the check runs per call, not at construction.
-    assert FISTA(loop=Loop(1))(data, model.double(), SMALL).status == "budget"
+    assert FISTA(iterations=1)(data, model.double(), SMALL).status == "budget"
     if torch.cuda.is_available():
         model.noise.cuda()
         with pytest.raises(PlacementError, match=r"noise computes in torch.float64 on cuda:0 but system"):
-            FISTA(loop=Loop(1))(data, model, SMALL)
+            FISTA(iterations=1)(data, model, SMALL)
 
 
 def test_a_device_without_an_index_is_the_current_one():
@@ -467,8 +497,8 @@ def test_richardson_lucy_is_nonnegative_and_raises_the_likelihood(sampling):
     obj = 50.0 * torch.rand(model.system.object_shape(sampling), generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         data = model.noise.sample(model(obj, sampling), generator=torch.Generator().manual_seed(1))
-    short = RichardsonLucy(loop=Loop(2))(data, model, sampling)
-    long = RichardsonLucy(loop=Loop(20))(data, model, sampling)
+    short = RichardsonLucy(iterations=2)(data, model, sampling)
+    long = RichardsonLucy(iterations=20)(data, model, sampling)
     assert long.estimate.min() >= 0
     assert long.objective < short.objective
 
@@ -646,9 +676,9 @@ def test_a_solve_result_repr_shows_shapes_not_tensors(sampling):
     result = Wiener()(data, model, sampling)
     assert repr(result) == (
         "SolveResult(estimate=Tensor(shape=(1, 16, 64, 64), dtype=torch.float32, device=cpu), "
-        "objective=Tensor(shape=(), dtype=torch.float32, device=cpu), iterations=0, status='direct', history=None)"
+        "objective=Tensor(shape=(), dtype=torch.float32, device=cpu), iterations=0, status='direct')"
     )
-    iterated = repr(FISTA(loop=Loop(2))(data, model, sampling))
+    iterated = repr(FISTA(iterations=2)(data, model, sampling))
     assert "iterations=2, status='budget'" in iterated
     assert "tensor(" not in iterated
     assert "\n" not in iterated

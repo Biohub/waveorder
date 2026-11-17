@@ -59,7 +59,7 @@ def test_every_command_has_help(command):
 
 def test_rec_help_shows_resume_and_tile():
     shown = runner.invoke(app, ["rec", "--help"]).stdout
-    assert all(flag in shown for flag in ("--resume", "--tile", "--tile-overlap", "--wandb", "--num-processes"))
+    assert all(flag in shown for flag in ("--resume", "--tile", "--tile-overlap", "--num-processes"))
 
 
 @pytest.mark.parametrize("command", [["tile-stitch"], ["create-output"], ["config", "schema"], ["distill"]])
@@ -95,13 +95,14 @@ def test_run_commands_take_3x_flags_and_preflight_the_request(config, command, a
 
 _REMOVED = {
     "rec": [
-        "--json", "--dry-run", "--events", "--torch-trace", "--wandb-project", "--wandb-tag", "--wandb-run-name",
+        "--json", "--dry-run", "--events", "--torch-trace", "--wandb", "--wandb-project", "--wandb-tag",
+        "--wandb-run-name",
         "--memory-budget", "--calibrate-on", "--time-indices", "--output-version", "--allow-system-mismatch",
         "-t", "-v", "-q", "--traceback",
     ],
     "apply-inv-tf": ["--json", "--dry-run", "--allow-system-mismatch", "--output-version", "--time-indices"],
     "compute-tf": ["--shape", "--dry-run", "-t", "--allow-system-mismatch", "--json"],
-    "calibrate-tf": ["--calibrate-on", "--time-indices", "--dry-run", "--json"],
+    "calibrate-tf": ["--calibrate-on", "--time-indices", "--dry-run", "--json", "--wandb"],
 }  # fmt: skip
 
 
@@ -233,12 +234,3 @@ def test_input_files_are_skipped(config, tmp_path):
     assert result.exit_code == 2
     assert "in.zarr matches nothing on disk" in result.stderr
     assert "zarr.json" not in result.stderr
-
-
-def test_wandb_needs_the_package(config, monkeypatch):
-    import sys
-
-    monkeypatch.setitem(sys.modules, "wandb", None)
-    result = runner.invoke(app, ["rec", "-i", "in.zarr", "-c", str(config), "-o", "out.zarr", "--wandb", "p"])
-    assert result.exit_code == 2
-    assert "--wandb: needs the wandb package: pip install waveorder[wandb]" in result.stderr

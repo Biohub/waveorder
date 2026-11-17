@@ -10,7 +10,7 @@ import waveorder
 
 ROOT = Path(waveorder.__file__).parent
 
-UTILITIES = frozenset({"errors", "observe", "zernike_names", "registry"})
+UTILITIES = frozenset({"errors", "zernike_names", "registry"})
 """Top-level modules any layer may import; they import no layer themselves."""
 
 LAYERS: dict[str, frozenset[str]] = {
@@ -19,9 +19,8 @@ LAYERS: dict[str, frozenset[str]] = {
     "tiling": frozenset({"io", "nn"}),
     "config": frozenset({"io", "nn"}),
     "models": frozenset({"config", "tiling", "io", "nn"}),
-    "cli": frozenset({"config", "models", "tiling", "io", "nn", "integrations", "plugin"}),
+    "cli": frozenset({"config", "models", "tiling", "io", "nn", "plugin"}),
     "plugin": frozenset({"config", "io"}),
-    "integrations": frozenset(),
     "testing": frozenset({"nn"}),
     "calibrate": frozenset({"models", "io", "nn"}),
     "simulate": frozenset({"models", "nn"}),

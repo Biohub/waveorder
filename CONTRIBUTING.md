@@ -21,7 +21,7 @@ repository (or [fork](https://docs.github.com/en/get-started/quickstart/fork-a-r
 ```sh
 git clone https://github.com/Biohub/waveorder.git
 cd waveorder
-uv sync    # the dev group: test (pytest, coverage, wandb, napari, pytest-qt) and lint (ruff, ty), pinned to CI's versions
+uv sync    # the dev group: test (pytest, coverage, napari, pytest-qt) and lint (ruff, ty), pinned to CI's versions
 ```
 
 ## The checks
@@ -60,9 +60,9 @@ cli ──> models ──> config ──> io, nn
 | `waveorder.io` | OME-Zarr plates and positions, the transfer-function store `TfStore`, staging buffers |
 | `waveorder.nn` | the torch modules of `g = H f + n`: systems, optics, priors, noise, solvers, scores, search stages |
 
-The layer `cli` may also import `tiling`, `io`, `nn` and `integrations` (wandb); `testing` imports `nn`. The front
-doors `waveorder.calibrate` and `waveorder.simulate` only re-export names from the layers below them. Any layer may
-import the utility modules `errors`, `observe`, `zernike_names` and `registry`, which import no layer. `waveorder.nn`
+The layer `cli` may also import `tiling`, `io` and `nn`; `testing` imports `nn`. The front doors
+`waveorder.calibrate` and `waveorder.simulate` only re-export names from the layers below them. Any layer may import
+the utility modules `errors`, `zernike_names` and `registry`, which import no layer. `waveorder.nn`
 reads and writes no files: it imports neither `zarr` nor `iohub`.
 
 `tests/test_layering.py` holds the table (`LAYERS`) and fails for an import that goes up, naming the file and the
@@ -80,7 +80,7 @@ and `wo config new` never import torch; commands import the layers below inside 
   Within one module, a forward reference is a PEP 695 alias (`type _Fourier = FourierDiagonal | None`), which is
   evaluated lazily. `tests/test_annotations.py` fails on a string annotation.
 - No `from __future__ import annotations`: pydantic and torch read annotations at runtime. ruff bans it too.
-- `wandb`, `napari` and the other heavy or optional libraries are imported inside the function that needs them
+- `napari` and the other heavy or optional libraries are imported inside the function that needs them
   (ruff's `banned-module-level-imports` lists them).
 - Complex values are stored as real pairs: a spectrum or per-frequency matrix is its `torch.view_as_real` form, with
   a trailing axis of size 2, and a real transfer (`real_transfer = True`) drops that axis. `waveorder.nn.functional`
@@ -132,7 +132,7 @@ and `STAGES` and in its parametrized noise and score tests.
 | Gaussian object prior | `GaussianObjectPrior` | also `spectrum(sampling, *, scale)`, used by the closed-form solver and the evidence | `check_prior(prior, obj)` |
 | noise model (`"noise"`) | `Noise` | `nll`, `sample`, `variance`; `gradient` defaults to autograd of `nll`, `scale` to `white_gaussian_variance()` or 1 | `check_noise(noise, data, mean)` |
 | solver (`"solver"`) | `Solver` | `run(problem)` returning a `SolveResult`; `check(model)` when it cannot run on every model | `check_solver(solver, data=, model=, sampling=)` |
-| iterative solver | `IterativeSolver` | `start(problem)`, `step(state, problem)`, `estimate(state)`; `check(model)` as for `Solver`; built with a `Loop` | `check_solver(...)` |
+| iterative solver | `IterativeSolver` | `start(problem)`, `step(state, problem)`, `estimate(state)`; `check(model)` as for `Solver`; built with `iterations`, `tolerance` and `check_every` | `check_solver(...)` |
 | score (`"score"`) | `Score` | `run(problem)` returning a 0-d tensor; `check(model)` as for `Solver`; `is_likelihood` | `check_score(score, data=, model=, sampling=)` |
 | sharpness score | `SharpnessScore` | `sharpness(slices, sampling)` | `check_score(...)` |
 | search stage (`"search"`) | the `SearchStage` protocol | `run(objective, *, start)` returning an `Estimate`; class attributes `reads_back`, `quantity_keyed` | `check_search_stage(stage, objective, start)` |
@@ -179,7 +179,7 @@ and build the system in `__init__`, passing `**parts: Unpack[Parts]` on. Overrid
 Commands live in `src/waveorder/cli/` (shared flags in `options.py`) and call model methods; most options are one
 argument of the method a command calls. Keep `wo --help` free of torch: what a command needs from the models runs
 in an underscore module it imports inside its body (`_configured.py` builds the model from the configuration,
-`_reconstruct.py`, `_simulate.py`, `_observation.py`), and add the command to the tests in `tests/cli/`.
+`_reconstruct.py`, `_simulate.py`, `_progress.py`), and add the command to the tests in `tests/cli/`.
 
 ## The regression suite
 

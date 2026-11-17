@@ -17,7 +17,6 @@ from waveorder.nn import (
     GradientSearch,
     GridSearch,
     ImagingModel,
-    Loop,
     Sampling,
     Tikhonov,
     Wiener,
@@ -401,7 +400,7 @@ def test_wiener_and_fista_recover_a_thick_phantom() -> None:
     assert _correlation(Wiener()(data, sharp, sampling).estimate, phantom) > 0.9
     smooth = ImagingModel(system, Tikhonov(1e-5), Gaussian(1.0)).double()
     wiener = Wiener()(data, smooth, sampling).estimate
-    fista = FISTA(loop=Loop(300))(data, smooth, sampling).estimate
+    fista = FISTA(iterations=300)(data, smooth, sampling).estimate
     assert _relative(fista, wiener) < 1e-3
 
 
@@ -414,7 +413,7 @@ def test_wiener_and_fista_recover_a_thin_phantom() -> None:
     assert _correlation(wiener[0], obj[0]) > 0.95
     assert _correlation(wiener[1], obj[1]) > 0.95
     smooth = ImagingModel(system, Tikhonov(5e-2), Gaussian(1.0)).double()  # |H|^2 <= 4: well conditioned
-    fista = FISTA(loop=Loop(300))(data, smooth, sampling).estimate
+    fista = FISTA(iterations=300)(data, smooth, sampling).estimate
     assert _relative(fista, Wiener()(data, smooth, sampling).estimate) < 1e-3
 
 

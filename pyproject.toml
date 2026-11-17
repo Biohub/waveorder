@@ -64,7 +64,6 @@ wo = "waveorder.cli:app"
 waveorder = "waveorder:napari.yaml"
 
 [project.optional-dependencies]
-wandb = ["wandb>=0.31"]
 visual = [
     "napari[pyqt6]>=0.10",
     "PyQt6>=6.5,<6.8",  # wo-4.0's range: wheels that run on manylinux_2_28 Linux systems
@@ -81,7 +80,6 @@ all = ["waveorder[visual]"]
 test = [
     "pytest>=9.2",
     "pytest-cov>=7.1",
-    "wandb>=0.31",
     "pytest-qt>=4.5",
     "napari[pyqt6]>=0.10",
     "PyQt6>=6.5,<6.8",
@@ -200,7 +198,6 @@ max-positional-args = 3
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"
 banned-module-level-imports = [
-  "wandb",
   "nsight",
   "matplotlib",
   "napari",

@@ -538,11 +538,11 @@ def check_noise(noise: Noise, data: Tensor, mean: Tensor, *, seed: int = 0) -> N
 def check_solver(solver: Solver, *, data: Tensor, model: ImagingModel, sampling: Sampling, rtol: float = 1e-4) -> None:
     """Run every check a solver must pass on one problem.
 
-    The solve must descend from its start. A solver without ``Loop(tolerance=...)`` must also match a loop under
-    ``vmap`` over candidate values and, on CUDA, run without a host sync.
+    The solve must descend from its start. A solver without a ``tolerance`` must also match a loop under ``vmap`` over
+    candidate values and, on CUDA, run without a host sync.
     """
     assert_solver_descends(solver, data=data, model=model, sampling=sampling)
-    if isinstance(solver, IterativeSolver) and solver.loop.tolerance is not None:
+    if isinstance(solver, IterativeSolver) and solver.tolerance is not None:
         return
     assert_solver_vmaps_over_candidates(solver, data=data, model=model, sampling=sampling, rtol=rtol)
     if data.is_cuda:

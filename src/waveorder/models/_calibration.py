@@ -184,6 +184,8 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
             found[_SIGMA] = torch.tensor(held, dtype=torch.float64)
     else:
         at_bound, objective = list(result.at_bound), result.objective
+        for index, (stage, value) in enumerate(result.trace):
+            log.info("calibration stage %d %s: objective %.6g", index, stage, value)
         if "score_trace" in wanted and result.steps:
             scores["score_trace"] = torch.tensor(result.steps, dtype=torch.float64)
         if "score_grid" in wanted and result.grid is not None:

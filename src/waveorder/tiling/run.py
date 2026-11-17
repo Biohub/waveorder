@@ -6,7 +6,6 @@ a chunked source, uploaded on a side CUDA stream), binds and solves each tile, a
 calibration; :func:`recover_zernikes` fits per-tile Zernike coefficients with these pieces.
 """
 
-import dataclasses
 import math
 import threading
 import time
@@ -42,7 +41,6 @@ from waveorder.nn.systems.tiled import (
     zernike_search,
     zernike_terms,
 )
-from waveorder.observe import emit, observing, operation
 from waveorder.tiling.merge import (
     OUTPUT_DTYPES,
     ArrayLike,
@@ -568,8 +566,7 @@ def reconstruct_series(  # noqa: PLR0913 (the volumes, the model and solver, the
 ) -> TileStats:
     """Reconstruct each ``(source, sink)`` volume tile by tile.
 
-    Reading, uploading, solving and writing overlap, also across volumes. Runs under ``torch.no_grad()``; an observer
-    receives one ``tiles.end`` event with every :class:`TileStats` field.
+    Reading, uploading, solving and writing overlap, also across volumes. Runs under ``torch.no_grad()``.
 
     Parameters
     ----------
@@ -640,14 +637,7 @@ def reconstruct_series(  # noqa: PLR0913 (the volumes, the model and solver, the
         table = expect_tile_parameters(parameters, model=model, tiles=len(plan.regions), where=where)
     tiles = TileOperators(model, table, budget=options.operator_cache_bytes) if table else None
     run = _Run(loader, [sink for _, sink in volumes], model=model, solver=solver, tiles=tiles)
-    with operation():
-        stats = run()
-        if observing():
-            emit(
-                "tiles.end",
-                {item.name: getattr(stats, item.name) for item in dataclasses.fields(stats) if item.init and item.repr},
-            )
-    return stats
+    return run()
 
 
 @final

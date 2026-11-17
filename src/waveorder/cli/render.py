@@ -10,7 +10,6 @@ waveorder's own (a bug) prints its stack.
 
 import inspect
 import logging
-import math
 import os
 import sys
 import threading
@@ -18,7 +17,7 @@ import time
 import traceback
 import warnings
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TextIO
@@ -30,7 +29,15 @@ from typer._click.globals import get_current_context
 from typer.core import TyperGroup, TyperOption
 
 from waveorder.cli.options import PROGRESS_LOGGER
-from waveorder.errors import PlacementError, Problem, ReconstructionFailed, Rejected, WaveorderError, WaveorderWarning
+from waveorder.errors import (
+    PlacementError,
+    Problem,
+    ReconstructionFailed,
+    Rejected,
+    UnitResult,
+    WaveorderError,
+    WaveorderWarning,
+)
 
 if TYPE_CHECKING:
     from rich.progress import Progress, TaskID
@@ -55,17 +62,12 @@ def status(text: str) -> None:
 # --- progress -------------------------------------------------------------------------------------------------------
 
 
-def _seconds(payload: Mapping[str, object], key: str) -> float | None:
-    value = payload.get(key)
-    return float(value) if isinstance(value, int | float) else None
-
-
 def _units(count: int) -> str:
     return "unit" if count == 1 else "units"
 
 
 class RunDisplay:
-    """Progress of one command on stderr, fed with the events of its calibration and its units.
+    """Progress of one run on stderr: :meth:`start` with the number of units, then :meth:`unit` as each ends.
 
     On a terminal, a Rich progress bar over the units; otherwise one timestamped line per unit and a summary every
     ``interval`` seconds. Lines go through the progress logger, so Rich prints them above the bar.
@@ -90,32 +92,12 @@ class RunDisplay:
         self._bar: Progress | None = None
         self._task: TaskID | None = None
 
-    def event(self, name: str, payload: Mapping[str, object]) -> None:
-        """Show one event: a calibration that starts, a calibration stage, the start of the units, a unit."""
-        if name == "calibration.stage.end":
-            elapsed = _seconds(payload, "elapsed_s")
-            objective = payload.get("objective")
-            log.info(
-                "calibration stage %s %s: objective %s, %.1f s",
-                payload.get("index"),
-                payload.get("stage"),
-                f"{objective:.6g}" if isinstance(objective, int | float) else objective,
-                math.nan if elapsed is None else elapsed,
-            )
-        elif name == "tf.store":
-            log.info("calibrating on %s at t=%s ...", payload.get("position"), payload.get("time"))
-        elif name == "units.start":
-            self._start(payload)
-        elif name == "unit.end":
-            self.unit(payload)
-
-    def _start(self, payload: Mapping[str, object]) -> None:
-        total = payload.get("total")
-        self.total = int(total) if isinstance(total, int) else 0
+    def start(self, output: str | Path, total: int) -> None:
+        """Start showing a run of ``total`` units into ``output``: the bar, or the periodic summaries."""
+        self.total = total
         self._started = time.monotonic()
-        if not self.total:
+        if not total:
             return
-        where = Path(str(payload.get("output"))).name
         if self.bar:
             from rich.console import Console
             from rich.progress import (
@@ -136,20 +118,15 @@ class RunDisplay:
                 TimeRemainingColumn(),
                 console=Console(stderr=True),
             )
-            self._task = self._bar.add_task(where, total=self.total, completed=0, failed=0)
+            self._task = self._bar.add_task(Path(output).name, total=total, completed=0, failed=0)
             self._bar.start()
             return
-        devices = payload.get("devices")
-        on = f" on {', '.join(map(str, devices))}" if isinstance(devices, list) and devices else ""
-        workers = payload.get("workers")
-        shared = f" ({workers} workers)" if isinstance(workers, int) and workers > 1 else ""
-        log.info("%s: %d %s%s%s", where, self.total, _units(self.total), on, shared)
         self._thread = threading.Thread(target=self._summaries, name="wo-progress", daemon=True)
         self._thread.start()
 
-    def unit(self, result: Mapping[str, object]) -> None:
-        """Count a unit that ended (the fields of its ``unit.end``) and show it; a failed unit is logged by the run."""
-        status = str(result.get("status"))
+    def unit(self, result: UnitResult) -> None:
+        """Count a unit that ended and show it; a failed unit is logged by the run."""
+        status = result.status
         with self._lock:
             self.counts[status] += 1
             ended = sum(self.counts.values())
@@ -159,10 +136,9 @@ class RunDisplay:
         if status == "failed":
             return
         said = {"complete": "reconstructed", "empty": "empty (zeros written)"}.get(status, status)
-        wall = _seconds(result, "wall_s")
-        took = f" in {wall:.1f} s" if wall else ""
-        on = f" on {result['device']}" if result.get("device") else ""
-        log.info("unit %s %s%s%s; %d/%d %s", result.get("unit"), said, took, on, ended, self.total, _units(self.total))
+        took = f" in {result.wall_s:.1f} s" if result.wall_s else ""
+        on = f" on {result.device}" if result.device else ""
+        log.info("unit %s %s%s%s; %d/%d %s", result.unit, said, took, on, ended, self.total, _units(self.total))
 
     def summary(self) -> str:
         """Return the periodic summary: units ended, by outcome, and left; seconds elapsed."""

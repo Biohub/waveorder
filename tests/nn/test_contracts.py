@@ -31,7 +31,6 @@ from waveorder.nn import (
 )
 from waveorder.nn.operators import LinearOperator
 from waveorder.nn.search import CalibrationObjective, Estimate
-from waveorder.nn.solvers import Loop
 from waveorder.testing import (
     assert_adjoint,
     assert_gradients_match_finite_differences,
@@ -331,9 +330,9 @@ def test_noises_pass_the_conformance_suite(noise):
 
 SOLVERS = {
     "wiener": (Wiener, Tikhonov(1e-2), Gaussian(0.05)),
-    "fista": (lambda: FISTA(loop=Loop(20)), Tikhonov(1e-2, nonnegative=True), Gaussian(0.05)),
-    "fista_tv": (lambda: FISTA(loop=Loop(10)), TotalVariation(1e-2, inner_iterations=20), Gaussian(0.05)),
-    "richardson_lucy": (lambda: RichardsonLucy(loop=Loop(10)), NoPrior(nonnegative=True), Poisson(gain=1.0)),
+    "fista": (lambda: FISTA(iterations=20), Tikhonov(1e-2, nonnegative=True), Gaussian(0.05)),
+    "fista_tv": (lambda: FISTA(iterations=10), TotalVariation(1e-2, inner_iterations=20), Gaussian(0.05)),
+    "richardson_lucy": (lambda: RichardsonLucy(iterations=10), NoPrior(nonnegative=True), Poisson(gain=1.0)),
 }
 
 
@@ -507,7 +506,7 @@ def test_zero_operator_has_zero_norm_and_fista_stays_finite():
     model = ImagingModel(system, Tikhonov(0.5), Gaussian(1.0))
     operator = system.bind(SMALL)
     assert operator.norm() == 0
-    result = FISTA(loop=Loop(5))(torch.randn(1, *SMALL.shape), model, SMALL)
+    result = FISTA(iterations=5)(torch.randn(1, *SMALL.shape), model, SMALL)
     assert torch.isfinite(result.estimate).all()
     assert result.estimate.abs().max() == 0  # the prior's minimizer, since there is no data term
 
@@ -526,7 +525,7 @@ def test_matrix_free_fista_vmaps_over_data_like_a_loop():
     model, data = _shift_variant_problem()
 
     def solve(g):
-        return FISTA(loop=Loop(5))(g, model, TINY).estimate
+        return FISTA(iterations=5)(g, model, TINY).estimate
 
     torch.testing.assert_close(vmap(solve)(data), torch.stack([solve(g) for g in data]))
 
@@ -537,7 +536,7 @@ def test_matrix_free_fista_vmaps_over_system_parameters():
     weights = torch.stack([model.system.weights.detach() * scale for scale in (0.5, 1.0, 2.0)])
 
     def solve(w):
-        return evaluate(lambda m: FISTA(loop=Loop(5))(data[0], m, TINY).estimate, model, {"system.weights": w})
+        return evaluate(lambda m: FISTA(iterations=5)(data[0], m, TINY).estimate, model, {"system.weights": w})
 
     looped = torch.stack([solve(w) for w in weights])
     torch.testing.assert_close(vmap(solve)(weights), looped)
@@ -546,7 +545,7 @@ def test_matrix_free_fista_vmaps_over_system_parameters():
 def test_a_shift_variant_operator_with_a_norm_bound_passes_the_kit_and_solves():
     model, data = _shift_variant_problem()
     assert_adjoint(model.system, TINY, rtol=1e-10)
-    assert_solver_descends(FISTA(loop=Loop(10)), data=data[0], model=model, sampling=TINY)
+    assert_solver_descends(FISTA(iterations=10), data=data[0], model=model, sampling=TINY)
 
 
 class _ClaimsNonnegative(MatrixSystem):
@@ -594,8 +593,8 @@ def test_no_host_sync_kit_names_the_caller_the_library_frame_and_the_tolerance_r
     model = make_model(1.0).cuda()
     data = torch.ones(1, *TINY.shape, device="cuda")
     with pytest.raises(AssertionError, match=r"test_contracts\.py:\d+ in <lambda> .* via .*parameters\.py:\d+ in "
-                       r"read_flag .*tolerance=1e-06 to _checked.*use tolerance=None"):  # fmt: skip
-        assert_no_host_sync(lambda: FISTA(loop=Loop(20, tolerance=1e-6))(data, model, TINY))
+                       r"read_flag .*tolerance=1e-06 to \w+.*use tolerance=None"):  # fmt: skip
+        assert_no_host_sync(lambda: FISTA(iterations=20, tolerance=1e-6)(data, model, TINY))
 
 
 def test_nonnegativity_check_catches_a_psf_with_a_negative_lobe():

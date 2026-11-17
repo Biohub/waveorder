@@ -14,9 +14,15 @@ import torch
 from torch import Tensor
 
 from waveorder.errors import ParameterError
-from waveorder.nn.search.base import CalibrationObjective, Estimate, _expect_count, _geometric, expect_known_names
+from waveorder.nn.search.base import (
+    CalibrationObjective,
+    Estimate,
+    _expect_count,
+    _geometric,
+    expect_known_names,
+    record_step,
+)
 from waveorder.nn.search.grid import _span
-from waveorder.observe import record_step
 from waveorder.registry import register
 
 
@@ -218,7 +224,7 @@ def _descend(  # noqa: PLR0913 (the objective and one keyword per loop setting)
         last_point = point()
         value = objective(last_point)
         detached = last_value = value.detach()
-        record_step(detached)  # the objective at each evaluation, for an observer (calibrate collects it)
+        record_step(detached)  # the objective at each evaluation, for calibrate(..., history=True)
         improved = torch.isfinite(detached) & (detached < best_value)
         stacked = torch.stack([last_point[name].detach() for name in names], dim=-1)
         best_point = torch.where(improved[..., None], stacked, best_point)

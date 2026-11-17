@@ -30,7 +30,6 @@ from waveorder.nn import (
     Wiener,
 )
 from waveorder.nn.operators import ReshapedFourierDiagonal
-from waveorder.nn.solvers import Loop
 from waveorder.testing import check_operator
 
 SAMPLING = Sampling(shape=(4, 8, 6), pixel_size=(0.3, 0.1, 0.1))
@@ -190,7 +189,7 @@ def test_problem_rejects_an_operator_bound_to_another_sampling(sampling):
     with pytest.raises(ShapeError, match="operator was bound to"):
         InverseProblem.of(torch.zeros(1, *sampling.shape), model, sampling, operator=other)
     with pytest.raises(ShapeError, match="operator was bound to"):
-        FISTA(loop=Loop(1))(torch.zeros(1, *sampling.shape), model, sampling, operator=other)
+        FISTA(iterations=1)(torch.zeros(1, *sampling.shape), model, sampling, operator=other)
 
 
 def test_problem_rejects_an_operator_with_other_shapes():
@@ -247,7 +246,7 @@ def test_errors_share_one_catchable_base():
     with pytest.raises(WaveorderError):
         Sampling(shape=(0, 1, 1), pixel_size=(1.0, 1.0, 1.0))
     with pytest.raises(WaveorderError):
-        Loop(0)
+        FISTA(iterations=0)
     with pytest.raises(WaveorderError):
         make_system(1.0)(torch.zeros(3), SAMPLING)
 
@@ -424,7 +423,7 @@ def test_operator_type_may_depend_on_the_instance():
     shift_variant = ImagingModel(_SwitchableSystem(shift_variant=True), Tikhonov(), Gaussian())
     with pytest.raises(IncompatibleModelError, match="binds to _Generic"):
         Wiener()(data, shift_variant, SAMPLING)
-    assert FISTA(loop=Loop(2))(data, shift_variant, SAMPLING).estimate.shape == (1, *SAMPLING.shape)
+    assert FISTA(iterations=2)(data, shift_variant, SAMPLING).estimate.shape == (1, *SAMPLING.shape)
 
 
 def test_bind_checks_the_declared_operator_type():

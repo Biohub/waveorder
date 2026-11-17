@@ -29,7 +29,7 @@ from waveorder.nn.functional import (
     to_half_spectrum,
 )
 from waveorder.nn.noise import PoissonGaussian
-from waveorder.nn.solvers import ADMM, Loop
+from waveorder.nn.solvers import ADMM
 from waveorder.nn.solvers import admm as admm_module
 from waveorder.testing import check_noise, check_solver
 
@@ -52,8 +52,8 @@ def test_one_wiener_butterworth_iteration_does_the_work_of_many_matched_ones():
     obj[0, 8, 20:44:6, 20:44:6] = 1000.0  # beads
     with torch.no_grad():
         data = model(obj, SAMPLING) + 1.0
-        one = RichardsonLucy(loop=Loop(1), back_projector="wiener_butterworth")(data, model, SAMPLING)
-        five = RichardsonLucy(loop=Loop(5))(data, model, SAMPLING)
+        one = RichardsonLucy(iterations=1, back_projector="wiener_butterworth")(data, model, SAMPLING)
+        five = RichardsonLucy(iterations=5)(data, model, SAMPLING)
     assert one.objective < five.objective
 
 
@@ -70,18 +70,18 @@ def test_rlgc_and_unmatched_back_projectors_are_refused_where_they_cannot_run():
     with pytest.raises(ParameterError, match="bp_alpha must be positive"):
         RichardsonLucy(back_projector="wiener", bp_alpha=0.0)
     with pytest.warns(ConfigurationWarning, match="reach their result in 1 to 5 iterations"):
-        RichardsonLucy(loop=Loop(6), back_projector="wiener_butterworth")
+        RichardsonLucy(iterations=6, back_projector="wiener_butterworth")
     # They measure the PSF on the host or draw random numbers, which vmap cannot.
     model = ImagingModel(make_system(1.0), NoPrior(), Poisson()).double()
     batch = torch.stack([_poisson_data(model, SMALL)] * 2)
-    for solver in (RichardsonLucy(loop=Loop(1), back_projector="gaussian"), RichardsonLucy(gradient_consensus=True)):
+    for solver in (RichardsonLucy(iterations=1, back_projector="gaussian"), RichardsonLucy(gradient_consensus=True)):
         with pytest.raises(IncompatibleModelError, match="run it eagerly"):
             torch.func.vmap(lambda values, s=solver: s(values, model, SMALL).estimate)(batch)
     # Back projectors need a single-field Fourier-diagonal operator.
     blur = ImagingModel(slice_weighted_blur(SMALL), NoPrior(), Poisson()).double()
     blur.system.preserves_nonnegativity = True
     with pytest.raises(IncompatibleModelError, match="needs a Fourier-diagonal operator"):
-        RichardsonLucy(loop=Loop(1), back_projector="gaussian")(_poisson_data(blur, SMALL).abs(), blur, SMALL)
+        RichardsonLucy(iterations=1, back_projector="gaussian")(_poisson_data(blur, SMALL).abs(), blur, SMALL)
 
 
 def test_rlgc_resists_the_noise_amplification_of_over_iterated_rl():
@@ -90,8 +90,8 @@ def test_rlgc_resists_the_noise_amplification_of_over_iterated_rl():
     obj[0, 8, 24:40, 24:40] = 20.0
     with torch.no_grad():
         data = model.noise.sample(model(obj, SAMPLING) + 2.0, generator=torch.Generator().manual_seed(3))
-        plain = RichardsonLucy(loop=Loop(100))(data, model, SAMPLING).estimate
-        consensus = RichardsonLucy(loop=Loop(100), gradient_consensus=True)(data, model, SAMPLING).estimate
+        plain = RichardsonLucy(iterations=100)(data, model, SAMPLING).estimate
+        consensus = RichardsonLucy(iterations=100, gradient_consensus=True)(data, model, SAMPLING).estimate
     outside = obj == 0
     assert consensus[outside].max() < plain[outside].max()
 
@@ -120,8 +120,8 @@ def test_richardson_lucy_with_read_noise_is_shot_noise_rl_with_the_shifted_backg
     shot = ImagingModel(system, NoPrior(), Poisson(gain=gain, offset=offset - shift)).double()
     data = _poisson_data(read, SMALL)
     with torch.no_grad():
-        mine = RichardsonLucy(loop=Loop(10))(data, read, SMALL)
-        reference = RichardsonLucy(loop=Loop(10), background=shift)(data, shot, SMALL)
+        mine = RichardsonLucy(iterations=10)(data, read, SMALL)
+        reference = RichardsonLucy(iterations=10, background=shift)(data, shot, SMALL)
     torch.testing.assert_close(mine.estimate, reference.estimate, rtol=1e-12, atol=0)
     with pytest.raises(IncompatibleModelError, match="Lipschitz gradient"):
         FISTA()(data, ImagingModel(system, Tikhonov(), PoissonGaussian()).double(), SMALL)
@@ -136,8 +136,8 @@ def test_admm_reaches_the_minimizer_fista_approaches():
     obj[:, 2:6, 4:12, 8:24] = 1.0
     with torch.no_grad():
         data = model.noise.sample(model(obj, SMALL), generator=torch.Generator().manual_seed(0))
-    fista = FISTA(loop=Loop(400))(data, model, SMALL)
-    admm = ADMM(loop=Loop(300), rho=0.1, damping=0.0)(data, model, SMALL)
+    fista = FISTA(iterations=400)(data, model, SMALL)
+    admm = ADMM(iterations=300, rho=0.1, damping=0.0)(data, model, SMALL)
     assert admm.objective <= fista.objective + 1e-6 * fista.objective.abs()
     torch.testing.assert_close(admm.estimate, fista.estimate, rtol=0, atol=2e-2 * obj.max().item())
 
@@ -145,7 +145,7 @@ def test_admm_reaches_the_minimizer_fista_approaches():
 def test_admm_passes_the_solver_kit():
     model = ImagingModel(make_system(1.0), TotalVariation(0.05), Gaussian(0.1)).double()
     data = torch.randn(1, *SMALL.shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
-    check_solver(ADMM(loop=Loop(3), rho=0.1), data=data, model=model, sampling=SMALL)
+    check_solver(ADMM(iterations=3, rho=0.1), data=data, model=model, sampling=SMALL)
 
 
 def _admm_refactoring_every_step(data, model, sampling, *, steps: int, rho: float, damping: float) -> torch.Tensor:
@@ -182,7 +182,7 @@ def test_admm_factors_once_and_matches_refactoring_every_step_bit_for_bit(channe
         return cholesky_hermitian(matrix)
 
     monkeypatch.setattr(admm_module, "cholesky_hermitian", counting)
-    estimate = ADMM(loop=Loop(6), rho=0.1, damping=1e-2)(data, model, SMALL).estimate
+    estimate = ADMM(iterations=6, rho=0.1, damping=1e-2)(data, model, SMALL).estimate
     assert len(factored) == 1
     assert torch.equal(estimate, expected)
 
@@ -198,7 +198,7 @@ def test_admm_first_update_solves_its_normal_equations_for_any_channels_and_fiel
     model = model.double() if dtype == torch.float64 else model
     data = torch.randn(channels, *SMALL.shape, generator=torch.Generator().manual_seed(0), dtype=dtype)
     rho, damping = 0.1, 1e-2
-    x = ADMM(loop=Loop(1), rho=rho, damping=damping)(data, model, SMALL).estimate  # from f = z = u = 0
+    x = ADMM(iterations=1, rho=rho, damping=damping)(data, model, SMALL).estimate  # from f = z = u = 0
     operator, dims = system.bind(SMALL), (-3, -2, -1)
     differences = [torch.roll(x, -1, dims=dim) - x for dim in dims]
     laplacian = sum(torch.roll(d, 1, dims=dim) - d for d, dim in zip(differences, dims, strict=True))
@@ -234,6 +234,6 @@ def test_admm_and_read_noise_richardson_lucy_pass_the_solver_kit_on_cuda():
     # The kit vmaps over candidates and, on CUDA, asserts that a solve without a tolerance never waits on the host.
     data = torch.randn(1, *SMALL.shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64).cuda()
     tv = ImagingModel(make_system(1.0), TotalVariation(0.05), Gaussian(0.1)).double().cuda()
-    check_solver(ADMM(loop=Loop(3), rho=0.1), data=data, model=tv, sampling=SMALL)
+    check_solver(ADMM(iterations=3, rho=0.1), data=data, model=tv, sampling=SMALL)
     read = ImagingModel(make_system(1.0), NoPrior(), PoissonGaussian(gain=2.0, sigma=3.0)).double().cuda()
-    check_solver(RichardsonLucy(loop=Loop(3)), data=10 + data.abs(), model=read, sampling=SMALL)
+    check_solver(RichardsonLucy(iterations=3), data=10 + data.abs(), model=read, sampling=SMALL)

@@ -1,7 +1,7 @@
 """Reconstructing (position, time) units on devices: in the calling process, or in ``spawn`` worker processes.
 
 Each worker unpickles the model once, takes the next device and its share of the CPUs, ignores Ctrl-C and dies with
-its parent (Linux). What a unit emits in a worker (events, warnings, log records) is re-emitted by the parent.
+its parent (Linux). What a unit emits in a worker (warnings, log records) is re-emitted by the parent.
 """
 
 import contextlib
@@ -14,10 +14,11 @@ import pickle
 import signal
 import sys
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -144,49 +145,40 @@ def run_units(  # noqa: PLR0913 (the model, the units and what a run shares)
     payload: bytes | None,
     keep_going: bool,
     report: ReconstructionReport,
+    on_unit: Callable[[UnitResult], None] | None = None,
 ) -> None:
     """Reconstruct ``units`` here or in worker processes; add each result to ``report`` as it ends.
 
-    Emits ``units.start`` and one ``unit.end`` per unit to the observers attached in this process. Raises
+    Logs the units and the devices at INFO, then calls ``on_unit(result)`` in this process as each unit ends. Raises
     ReconstructionFailed for a unit's failure without ``keep_going``, or a worker that could not start or died.
     """
-    from waveorder.observe import context, emit, observing
-
-    if observing():
-        emit(
-            "units.start",
-            {
-                "output": work.output,
-                "total": len(units),
-                "positions": len({unit.position for unit in units}),
-                "devices": list(dict.fromkeys(workers.devices)),
-                "workers": len(workers.devices),
-            },
-        )
     if not units:
         return
+    devices = ", ".join(dict.fromkeys(workers.devices))
+    shared = f" ({len(workers.devices)} workers)" if len(workers.devices) > 1 else ""
+    noun = "unit" if len(units) == 1 else "units"
+    log.info("%s: %d %s on %s%s", Path(work.output).name, len(units), noun, devices, shared)
     if not workers.in_process:
         assert payload is not None
-        _run_workers(units, work=work, workers=workers, payload=payload, keep_going=keep_going, report=report)
+        _run_workers(
+            units, work=work, workers=workers, payload=payload, keep_going=keep_going, report=report, on_unit=on_unit
+        )
         return
     runner = UnitRunner(model, work)
     for unit in units:
-        with context(unit=unit.name):
-            result = runner.run(unit)
-        finish(report, result)
+        result = runner.run(unit)
+        finish(report, result, on_unit=on_unit)
         if result.status == "failed" and not keep_going:
             raise _stop(report, f"unit {unit.name} failed: {result.error}")
 
 
-def finish(report: ReconstructionReport, result: UnitResult) -> None:
-    """Record a unit that ended in ``report``, log a failure and emit ``unit.end``."""
-    from waveorder.observe import emit, observing
-
+def finish(report: ReconstructionReport, result: UnitResult, *, on_unit: Callable[[UnitResult], None] | None) -> None:
+    """Record a unit that ended in ``report``, log a failure and call ``on_unit``."""
     report.results.append(result)
     if result.status == "failed":
         log.error("unit %s failed: %s", result.unit, result.error)
-    if observing():
-        emit("unit.end", result.to_json())
+    if on_unit is not None:
+        on_unit(result)
 
 
 def _stop(report: ReconstructionReport, message: str) -> ReconstructionFailed:
@@ -199,21 +191,17 @@ def _stop(report: ReconstructionReport, message: str) -> ReconstructionFailed:
 
 @dataclass(frozen=True)
 class _Setup:
-    """What every worker needs: the model, the work, its threads, what to forward, the log levels, the parent pid."""
+    """What every worker needs: the model, the work, its threads, the log levels, the parent pid."""
 
     model: bytes
     work: Work
     threads: int
-    events: bool
-    iterations: bool
     levels: dict[str, int]
     parent: int
 
 
 _runner: UnitRunner | None = None
-_worker = 0
 _fatal: str | None = None
-_events = (False, False)
 
 
 def _start(setup: _Setup, slots: multiprocessing.queues.Queue[tuple[int, str]]) -> None:
@@ -221,7 +209,7 @@ def _start(setup: _Setup, slots: multiprocessing.queues.Queue[tuple[int, str]]) 
 
     A failure is kept and reported with every unit, since a pool says nothing of an initializer's error.
     """
-    global _runner, _worker, _fatal, _events
+    global _runner, _fatal
     if sys.platform.startswith("linux"):
         with contextlib.suppress(OSError, AttributeError):
             ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
@@ -233,12 +221,11 @@ def _start(setup: _Setup, slots: multiprocessing.queues.Queue[tuple[int, str]]) 
     logging.getLogger("iohub").handlers.clear()
     for name, level in setup.levels.items():
         logging.getLogger(name).setLevel(level)
-    _events = (setup.events, setup.iterations)
-    _worker, device = slots.get()
+    worker, device = slots.get()
     try:
         _runner = _build(setup, device)
     except BaseException as error:  # noqa: BLE001 (reported to the parent with every unit)
-        _fatal = f"worker {_worker} on {device} could not start: {type(error).__name__}: {error}"
+        _fatal = f"worker {worker} on {device} could not start: {type(error).__name__}: {error}"
 
 
 def _build(setup: _Setup, device: str) -> UnitRunner:
@@ -259,16 +246,11 @@ def _build(setup: _Setup, device: str) -> UnitRunner:
 
 
 class _Captured(logging.Handler):
-    """What one unit emits in a worker: its events and log records, to be re-emitted by the parent."""
+    """The log records of one unit in a worker, to be re-emitted by the parent."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.events: list[tuple[str, dict[str, object]]] = []
         self.records: list[dict[str, object]] = []
-
-    def event(self, name: str, payload: Mapping[str, object]) -> None:
-        """Keep one :mod:`waveorder.observe` event."""
-        self.events.append((name, dict(payload)))
 
     def emit(self, record: logging.LogRecord) -> None:
         """Keep one log record as the fields :func:`logging.makeLogRecord` takes."""
@@ -279,27 +261,21 @@ class _Captured(logging.Handler):
 
 
 type _Shown = list[tuple[Warning, str, int]]
-type _Answer = tuple[dict[str, object], list[tuple[str, dict[str, object]]], _Shown, list[dict[str, object]]]
+type _Answer = tuple[dict[str, object], _Shown, list[dict[str, object]]]
 
 
 def _unit(position: str, time: int) -> _Answer | str:
     """Reconstruct one unit in a worker; return its result with what it emitted, or why the worker cannot run."""
-    from waveorder.observe import context, observe
-
     if _fatal is not None or _runner is None:
         return _fatal or "the worker has no model"
     unit = Unit(position=position, time=time)
     captured = _Captured()
     root = logging.getLogger()
     root.addHandler(captured)
-    events, iterations = _events
     try:
-        with warnings.catch_warnings(record=True) as seen, contextlib.ExitStack() as stack:
+        with warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("default")
-            if events:
-                stack.enter_context(observe(captured, iterations=iterations))
-            with context(unit=unit.name, worker=_worker):
-                result = _runner.run(unit)
+            result = _runner.run(unit)
     finally:
         root.removeHandler(captured)
     shown = [
@@ -307,13 +283,13 @@ def _unit(position: str, time: int) -> _Answer | str:
         for item in seen
         if isinstance(item.message, Warning) and _pickles(item.message)
     ]
-    return result.to_json(), captured.events, shown, captured.records
+    return result.to_json(), shown, captured.records
 
 
 # --- the parent's side -----------------------------------------------------------------------------------------------
 
 
-def _run_workers(
+def _run_workers(  # noqa: PLR0913 (the units, what a run shares, and the callback)
     units: Sequence[Unit],
     *,
     work: Work,
@@ -321,10 +297,9 @@ def _run_workers(
     payload: bytes,
     keep_going: bool,
     report: ReconstructionReport,
+    on_unit: Callable[[UnitResult], None] | None,
 ) -> None:
     """Run ``units`` on spawned workers, each taking the next unit when free; stop once the running units end."""
-    from waveorder.observe import observing, recording
-
     context = multiprocessing.get_context("spawn")
     slots = context.Queue()
     for index, device in enumerate(workers.devices):
@@ -333,8 +308,6 @@ def _run_workers(
         model=payload,
         work=work,
         threads=affinity_threads(len(workers.devices), limit=torch.get_num_threads()),
-        events=observing(),
-        iterations=recording(),
         levels={name: logging.getLogger(name).level for name in _LOGGERS},
         parent=os.getpid(),
     )
@@ -344,7 +317,7 @@ def _run_workers(
         futures: dict[Future[_Answer | str], Unit] = {pool.submit(_unit, u.position, u.time): u for u in units}
         for future in as_completed(futures):
             if not future.cancelled():
-                failure = failure or _answered(future, report, keep_going=keep_going)
+                failure = failure or _answered(future, report, keep_going=keep_going, on_unit=on_unit)
             if failure is not None:
                 for pending in futures:
                     pending.cancel()
@@ -358,26 +331,28 @@ def _run_workers(
         raise _stop(report, failure)
 
 
-def _answered(future: Future[_Answer | str], report: ReconstructionReport, *, keep_going: bool) -> str | None:
+def _answered(
+    future: Future[_Answer | str],
+    report: ReconstructionReport,
+    *,
+    keep_going: bool,
+    on_unit: Callable[[UnitResult], None] | None,
+) -> str | None:
     """Re-emit what a worker's unit emitted and take its result; return why the run stops, if it does."""
-    from waveorder.observe import emit
-
     try:
         answer = future.result()
     except BrokenProcessPool:
         return _died(report)
     if isinstance(answer, str):
         return answer
-    fields, events, shown, records = answer
+    fields, shown, records = answer
     for entry in records:
         record = logging.makeLogRecord(entry)
         logging.getLogger(record.name).handle(record)
     for warning, filename, lineno in shown:
         warnings.warn_explicit(warning, type(warning), filename, lineno, registry=_warned)
-    for name, payload in events:
-        emit(name, payload)
     result = UnitResult(**fields)  # ty: ignore[invalid-argument-type]
-    finish(report, result)
+    finish(report, result, on_unit=on_unit)
     if result.status == "failed" and not keep_going:
         return f"unit {result.unit} failed: {result.error}"
     return None

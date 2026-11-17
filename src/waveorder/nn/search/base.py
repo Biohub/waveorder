@@ -6,9 +6,8 @@
 """
 
 import math
-import time
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal, NamedTuple, Protocol, Self, runtime_checkable
@@ -30,7 +29,6 @@ from waveorder.nn.parameters import (
 )
 from waveorder.nn.sampling import Data, Sampling
 from waveorder.nn.scores import Score
-from waveorder.observe import collect_steps, emit, observing, operation, recording
 
 
 class Estimate(NamedTuple):
@@ -268,6 +266,16 @@ def keep_record(item: object) -> None:
         kept.append(item)
 
 
+_steps: ContextVar[list[Tensor] | None] = ContextVar("waveorder.nn.search.steps", default=None)
+
+
+def record_step(objective: Tensor) -> None:
+    """Hand one evaluation's objective (detached, on the device) to ``calibrate(..., history=True)``."""
+    collected = _steps.get()
+    if collected is not None:
+        collected.append(objective.detach())
+
+
 @dataclass(frozen=True, slots=True)
 class ScoreGrid:
     """The points a grid stage scored and the objective at each.
@@ -367,7 +375,7 @@ class CalibrationResult:
     sweep: SweepResult | None = None
 
 
-def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and the quantities held; the history)
+def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and the quantities held; what to report)
     data: Data,
     model: ImagingModel,
     sampling: Sampling,
@@ -377,11 +385,12 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     prior: ParameterPrior | None = None,
     hold: Iterable[str] = (),
     history: bool = False,
+    callback: Callable[[int, SearchStage, Estimate], None] | None = None,
 ) -> CalibrationResult:
     """Estimate the free quantities of ``model`` by minimizing ``score + prior`` over them, stage by stage.
 
     A :class:`~waveorder.nn.noise.Gaussian` noise with ``sigma="estimate"`` first sets its start and bounds from
-    ``data``. With an observer attached, the call reports ``calibration.stage.end`` per stage and ``calibration.end``.
+    ``data``.
 
     Parameters
     ----------
@@ -404,6 +413,9 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     history : bool
         Also return what the stages saw (:attr:`CalibrationResult.steps`, :attr:`~CalibrationResult.grid`,
         :attr:`~CalibrationResult.sweep`).
+    callback : callable, optional
+        ``callback(index, stage, best)`` runs as each stage ends, with the best :class:`Estimate` so far on the
+        device; reading it back there costs a device sync per stage.
 
     Returns
     -------
@@ -427,46 +439,33 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
         If ``score`` is a likelihood and a free quantity is one it cannot determine, such as the focus offset of a
         3D-object system (:meth:`~waveorder.nn.ImagingSystem.undetermined_by_likelihood`).
     """
-    with operation():
-        search = expect_searchable(data, model, sampling, search=search)
-        prior = start_from_data(model, data, prior)
-        objective = CalibrationObjective.of(data, model, sampling, score=score, prior=prior, hold=hold)
-        specs = objective.specs
-        for stage in search:
-            _expect_stage_names(stage, specs)
-        warn_undetermined(model, score)
-        names = list(specs)
-        watched = observing()
-        record = watched and recording()
-        clock = _StageClock(data.device) if watched else None
-        best, reached, histories, kept = _run_stages(
-            objective, search, record=record or history, keep=history, clock=clock
-        )
-        values, value = best
-        _assign_parameters(model, values)  # the stages' own point: finite and in bounds, so nothing is read back
-        grid, sweep = _seen(kept, names)
-        # The one read-back of calibrate, in float64 so every value survives: stage objectives and bound flags;
-        # then, for an observer, the values its events report; then the step histories and the grid kept.
-        report = [*reached, on_bounds(specs, values)]
-        observed = [v.detach() for v in values.values()] if watched else []
-        steps = [h for h in histories if h is not None] if record or history else []
-        tail = [] if grid is None else [grid.values]
-        parts = [part.reshape(-1).to(torch.float64) for part in [*report, *observed, *steps, *tail]]
-        packed_tensor = torch.cat(parts).cpu()
-        cut = packed_tensor.shape[0] - (0 if grid is None else grid.values.numel())
-        packed = packed_tensor[:cut].tolist()
-        stages, quantities = len(search), len(names)
-        levels, flags, seen = packed[:stages], packed[stages : stages + quantities], packed[stages + quantities :]
-        trace = tuple((type(stage).__name__, level) for stage, level in zip(search, levels, strict=True))
-        at_bound = tuple(name for name, flag in zip(names, flags, strict=True) if flag)
-        if grid is not None:
-            grid = ScoreGrid(grid.names, packed_tensor[cut:].reshape(grid.values.shape))
-        kept_steps = tuple(seen[sum(v.numel() for v in observed) :]) if history else ()
-        result = CalibrationResult(values, value.detach(), at_bound, trace, kept_steps, grid, sweep)
-        if clock is not None:  # observed
-            shown = histories if record else [None] * len(histories)
-            _report(result, seen, histories=shown, elapsed=clock.seconds())
-        return result
+    search = expect_searchable(data, model, sampling, search=search)
+    prior = start_from_data(model, data, prior)
+    objective = CalibrationObjective.of(data, model, sampling, score=score, prior=prior, hold=hold)
+    specs = objective.specs
+    for stage in search:
+        _expect_stage_names(stage, specs)
+    warn_undetermined(model, score)
+    names = list(specs)
+    best, reached, histories, kept = _run_stages(objective, search, keep=history, callback=callback)
+    values, value = best
+    _assign_parameters(model, values)  # the stages' own point: finite and in bounds, so nothing is read back
+    grid, sweep = _seen(kept, names)
+    # The one read-back of calibrate, in float64 so every value survives: stage objectives and bound flags; then
+    # the step histories and the grid kept.
+    report = [*reached, on_bounds(specs, values)]
+    tail = [] if grid is None else [grid.values]
+    parts = [part.reshape(-1).to(torch.float64) for part in [*report, *histories, *tail]]
+    packed_tensor = torch.cat(parts).cpu()
+    cut = packed_tensor.shape[0] - (0 if grid is None else grid.values.numel())
+    packed = packed_tensor[:cut].tolist()
+    stages, quantities = len(search), len(names)
+    levels, flags, steps = packed[:stages], packed[stages : stages + quantities], packed[stages + quantities :]
+    trace = tuple((type(stage).__name__, level) for stage, level in zip(search, levels, strict=True))
+    at_bound = tuple(name for name, flag in zip(names, flags, strict=True) if flag)
+    if grid is not None:
+        grid = ScoreGrid(grid.names, packed_tensor[cut:].reshape(grid.values.shape))
+    return CalibrationResult(values, value.detach(), at_bound, trace, tuple(steps), grid, sweep)
 
 
 def start_from_data(model: ImagingModel, data: Data, prior: ParameterPrior | None = None) -> ParameterPrior:
@@ -562,80 +561,38 @@ def warn_undetermined(model: ImagingModel, score: Score) -> None:
         )
 
 
-class _StageClock:
-    """Seconds from the first stage's start to each stage's end, without a device sync (CUDA events on a GPU)."""
-
-    def __init__(self, device: torch.device) -> None:
-        self._stream = torch.cuda.current_stream(device) if device.type == "cuda" else None
-        self._events: list[torch.cuda.Event] = []
-        self._times: list[float] = []
-        self.mark()
-
-    def mark(self) -> None:
-        """Record the end of a stage (the first call, from ``__init__``, is the start)."""
-        if self._stream is None:
-            self._times.append(time.perf_counter())
-            return
-        event = torch.cuda.Event(enable_timing=True)
-        event.record(self._stream)
-        self._events.append(event)
-
-    def seconds(self) -> list[float]:
-        """Return each stage end's seconds since the start; on a GPU, call it after the read-back."""
-        if self._stream is None:
-            return [end - self._times[0] for end in self._times[1:]]
-        return [self._events[0].elapsed_time(end) / 1000 for end in self._events[1:]]
-
-
 def _run_stages(
     objective: CalibrationObjective,
     search: Sequence[SearchStage],
     *,
-    record: bool,
     keep: bool,
-    clock: _StageClock | None,
-) -> tuple[Estimate, list[Tensor], list[Tensor | None], list[list[object]]]:
-    """Run ``search`` in order from the model's point; return the best and each stage's objective, steps and records."""
+    callback: Callable[[int, SearchStage, Estimate], None] | None,
+) -> tuple[Estimate, list[Tensor], list[Tensor], list[list[object]]]:
+    """Run ``search`` in order from the model's point; return the best and each stage's objective, steps and records.
+
+    With ``keep``, the steps are the objective at each evaluation of the stages that report them, one tensor per
+    such stage, and the records what each stage handed to :func:`keep_record`; both are empty otherwise.
+    """
     best = objective.start()
     reached: list[Tensor] = []
-    histories: list[Tensor | None] = []
+    histories: list[Tensor] = []
     kept: list[list[object]] = []
-    for stage in search:
+    for index, stage in enumerate(search):
         items: list[object] = []
-        token = _records.set(items if keep else None)
+        steps: list[Tensor] = []
+        records, collected = _records.set(items if keep else None), _steps.set(steps if keep else None)
         try:
-            with collect_steps(on=record) as steps:
-                best = stage.run(objective, start=best)
+            best = stage.run(objective, start=best)
         finally:
-            _records.reset(token)
+            _records.reset(records)
+            _steps.reset(collected)
         reached.append(best.objective.detach().reshape(()))
-        histories.append(torch.stack(steps) if steps else None)
+        if steps:
+            histories.append(torch.stack(steps))
         kept.append(items)
-        if clock is not None:
-            clock.mark()
+        if callback is not None:
+            callback(index, stage, best)
     return best, reached, histories, kept
-
-
-def _report(
-    result: CalibrationResult, seen: Sequence[float], *, histories: Sequence[Tensor | None], elapsed: Sequence[float]
-) -> None:
-    """Emit ``calibration.stage.end`` per stage and ``calibration.end`` from the read-back values ``seen``."""
-    names = list(result.parameters)
-    offset = len(names)
-    for index, ((stage, level), history) in enumerate(zip(result.trace, histories, strict=True)):
-        payload: dict[str, object] = {"stage": stage, "index": index, "objective": level, "elapsed_s": elapsed[index]}
-        if history is not None:
-            payload["steps"] = list(seen[offset : offset + history.numel()])
-            offset += history.numel()
-        emit("calibration.stage.end", payload)
-    emit(
-        "calibration.end",
-        {
-            "parameters": dict(zip(names, seen[: len(names)], strict=True)),
-            "at_bound": list(result.at_bound),
-            "trace": [[stage, level] for stage, level in result.trace],
-        },
-    )
 
 
 def expect_known_names(names: Iterable[str], specs: Mapping[str, Free], *, path: str) -> None:

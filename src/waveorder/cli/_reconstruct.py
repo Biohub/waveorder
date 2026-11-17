@@ -5,14 +5,15 @@ This module imports the models and torch; :mod:`waveorder.cli.reconstruct` holds
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import typer
 
 from waveorder.cli._configured import ResolvedConfig, build_model, collecting, located, resolve_config
-from waveorder.cli._observation import Observation, check_wandb, observing, parameter_table
+from waveorder.cli._progress import calibrated, calibrating, parameter_table, progress
 from waveorder.cli.options import devices_argument, expect_store_output
-from waveorder.cli.render import status
+from waveorder.cli.render import RunDisplay, status
 from waveorder.errors import Problems, ReconstructionFailed, ReconstructionReport, named
 from waveorder.io.positions import SINGLE_POSITION, expand_positions, plate_name, read_position_meta
 from waveorder.models import ReconstructionModel
@@ -27,7 +28,6 @@ FAILED_UNITS = 3
 class Flags:
     """The flags of a run command, parsed: one field per argument of the model's methods, or per flag behind one."""
 
-    command: str
     inputs: tuple[str, ...]
     config: Path
     output: Path
@@ -40,11 +40,15 @@ class Flags:
     resume: bool
     keep_going: bool
     write_config_scale_to_output: bool
-    wandb: str | None
 
 
 def _positions(
-    model: ReconstructionModel, flags: Flags, resolved: ResolvedConfig, *, dry_run: bool
+    model: ReconstructionModel,
+    flags: Flags,
+    resolved: ResolvedConfig,
+    *,
+    dry_run: bool,
+    display: RunDisplay | None = None,
 ) -> ReconstructionReport:
     """Call ``model.reconstruct_positions`` with one argument per flag; the ``data`` block gives the rest."""
     return model.reconstruct_positions(
@@ -60,6 +64,8 @@ def _positions(
         overwrite=flags.overwrite,
         resume=flags.resume,
         write_pixel_size=flags.write_config_scale_to_output,
+        on_start=None if display is None else partial(display.start, flags.output),
+        on_unit=None if display is None else display.unit,
     )
 
 
@@ -138,12 +144,12 @@ def _run(
     resolved: ResolvedConfig,
     *,
     calibration: _Calibration | None,
-    observed: Observation,
+    display: RunDisplay,
 ) -> ReconstructionReport:
     """Calibrate first when the command has to, publishing the store beside the output; then reconstruct."""
     with located(resolved):
         if calibration is not None:
-            observed.calibrating(position=calibration.name, time_index=calibration.time)
+            calibrating(position=calibration.name, time_index=calibration.time)
             store = model.calibrate_position(
                 calibration.position,
                 channels=resolved.channels,
@@ -152,8 +158,8 @@ def _run(
             )
             assert store is not None
             store.save(calibration.path, overwrite=True)
-            observed.calibrated(store, path=calibration.path)
-        return _positions(model, flags, resolved, dry_run=False)
+            calibrated(store, path=calibration.path)
+        return _positions(model, flags, resolved, dry_run=False, display=display)
 
 
 def _summary(report: ReconstructionReport) -> list[str]:
@@ -177,14 +183,12 @@ def reconstruct(flags: Flags) -> None:
     Prints the summary, and exits 3 when ``--keep-going`` finished with failed units. A reconstruction a unit
     stopped prints its counts, then the error boundary reports the failure (exit 1).
     """
-    check_wandb(flags.wandb)
     resolved = resolve_config(flags.config, device=flags.device)
     model = build_model(resolved)
     try:
-        with observing(flags.wandb, job_type=flags.command, store=flags.output.name) as observed:
+        with progress() as display:
             calibration = _checked(model, flags, resolved)
-            report = _run(model, flags, resolved, calibration=calibration, observed=observed)
-            observed.exit_code = FAILED_UNITS if report.count("failed") else 0
+            report = _run(model, flags, resolved, calibration=calibration, display=display)
     except ReconstructionFailed as failed:
         typer.echo(_summary(failed.report)[0])  # the failed unit's error follows as the error line
         raise

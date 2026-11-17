@@ -26,7 +26,7 @@ from waveorder.errors import Rejected, WaveorderWarning, argument_names
 # --- logging and help -----------------------------------------------------------------------------------------------
 
 PROGRESS_LOGGER = "waveorder.cli.progress"
-"""The logger of the run commands' progress lines: units as they end, calibration stages, the periodic summary."""
+"""The logger of the run commands' progress lines: what is calibrated, units as they end, the periodic summary."""
 
 
 class _LogToStderr(logging.Handler):
@@ -55,8 +55,10 @@ class _Formatter(logging.Formatter):
 def _configure_logging() -> None:
     """Route log records to stderr through one handler: waveorder's warnings, progress and cache lines, others' errors.
 
-    The cache lines (``waveorder.models._stores``) say which transfer functions a store gave. iohub's own stderr
-    handler (added when it is imported) is removed, so its records take this layout too.
+    The model's own progress lines take this route too: a run's units and devices (``waveorder.models._pool``) and a
+    calibration's stages (``waveorder.models._calibration``). The cache lines (``waveorder.models._stores``) say which
+    transfer functions a store gave. iohub's own stderr handler (added when it is imported) is removed, so its
+    records take this layout too.
     """
     root = logging.getLogger()
     if not any(isinstance(handler, _LogToStderr) for handler in root.handlers):
@@ -71,7 +73,8 @@ def _configure_logging() -> None:
     root.setLevel(logging.ERROR)
     iohub.setLevel(logging.ERROR)
     logging.getLogger(PROGRESS_LOGGER).setLevel(logging.INFO)
-    logging.getLogger("waveorder.models._stores").setLevel(logging.INFO)
+    for name in ("waveorder.models._stores", "waveorder.models._pool", "waveorder.models._calibration"):
+        logging.getLogger(name).setLevel(logging.INFO)
 
 
 ARGUMENT_FLAGS = MappingProxyType(
@@ -361,16 +364,6 @@ KeepGoing = Annotated[
     bool,
     typer.Option(
         "--keep-going", rich_help_panel="Run", help="Report a failed unit and continue with the others (exit 3)."
-    ),
-]
-Wandb = Annotated[
-    str | None,
-    typer.Option(
-        "--wandb",
-        metavar="PROJECT",
-        rich_help_panel="Run",
-        help="Log the run to this Weights & Biases project (pip install waveorder\\[wandb]), grouped by the output "
-        "store's name.",
     ),
 ]
 

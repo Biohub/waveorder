@@ -20,7 +20,7 @@ from waveorder.nn.functional import abs2, from_half_spectrum, is_complex_matrix,
 from waveorder.nn.model import ImagingModel
 from waveorder.nn.parameters import Quantity, can_read_back, read_flag, repr_parts, value_range
 from waveorder.nn.sampling import Data, Object
-from waveorder.nn.solvers.base import IterativeSolver, Loop
+from waveorder.nn.solvers.base import IterativeSolver
 from waveorder.nn.verbs import InverseProblem
 from waveorder.registry import register
 
@@ -218,8 +218,6 @@ def _wiener_cutoff_gain(wiener_magnitude: Tensor, cutoffs: tuple[float, ...]) ->
     return _gain_at(torch.amax(shifted[shifted.shape[0] // 2], dim=0), cutoffs[2])
 
 
-_DEFAULT_LOOP = Loop(25)
-
 _UNMATCHED_ITERATIONS = 5
 """Guo et al.: an unmatched back projector reaches its result in 1 to 5 iterations and adds artifacts beyond."""
 
@@ -246,8 +244,10 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
 
     Parameters
     ----------
-    loop : Loop
-        Iterations and stopping (default ``Loop(25)``).
+    iterations : int
+        Maximum number of iterations.
+    tolerance, check_every
+        Early stopping, as :class:`~waveorder.nn.solvers.IterativeSolver`.
     background : float or Free
         Expected signal ``b >= 0`` added to ``H x``, in data units above the noise offset.
     back_projector : {"matched", "gaussian", "butterworth", "wiener", "wiener_butterworth"}
@@ -273,10 +273,12 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
 
     background: Tensor
 
-    def __init__(  # noqa: PLR0913 (the 3.x rl block: background, back projector, its two knobs, the RLGC switch)
+    def __init__(  # noqa: PLR0913 (stopping, then the 3.x rl block: background, back projector, its knobs, RLGC)
         self,
         *,
-        loop: Loop = _DEFAULT_LOOP,
+        iterations: int = 25,
+        tolerance: float | None = None,
+        check_every: int = 10,
         background: Quantity = 0.0,
         back_projector: BackProjector = "matched",
         bp_alpha: float | None = None,
@@ -284,7 +286,7 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
         gradient_consensus: bool = False,
         start: Literal["mean", "ones"] = "mean",
     ) -> None:
-        super().__init__(loop=loop)
+        super().__init__(iterations=iterations, tolerance=tolerance, check_every=check_every)
         reach = value_range(background)
         if reach is not None and reach[0] < 0:
             raise ParameterError(f"RichardsonLucy.background must be nonnegative, got {background}", path="background")
@@ -305,11 +307,11 @@ class RichardsonLucy(IterativeSolver[RichardsonLucyState]):
                 f"RichardsonLucy gradient_consensus needs back_projector='matched', got {back_projector!r}",
                 path="gradient_consensus",
             )
-        if back_projector != "matched" and loop.iterations > _UNMATCHED_ITERATIONS:
+        if back_projector != "matched" and iterations > _UNMATCHED_ITERATIONS:
             warnings.warn(
-                f"RichardsonLucy with back_projector={back_projector!r} and {loop.iterations} iterations: unmatched "
+                f"RichardsonLucy with back_projector={back_projector!r} and {iterations} iterations: unmatched "
                 f"back projectors reach their result in 1 to {_UNMATCHED_ITERATIONS} iterations and add artifacts "
-                "beyond that; consider Loop(1)",
+                "beyond that; consider iterations=1",
                 ConfigurationWarning,
                 stacklevel=2,
             )

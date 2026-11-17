@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 
 from tests.nn.conftest import SIGMA, make_model, make_system, simulate
-from waveorder.nn import Gaussian, ImagingModel, IterativeSolver, Loop, Noise, NoPrior, Sampling
+from waveorder.nn import Gaussian, ImagingModel, IterativeSolver, Noise, NoPrior, Sampling
 from waveorder.nn.verbs import InverseProblem
 from waveorder.testing import assert_solver_descends, check_noise
 
@@ -56,6 +56,6 @@ def test_an_iterative_solver_runs_on_any_model_without_a_check():
     sampling = Sampling(shape=(8, 16, 16), pixel_size=(0.25, 0.1, 0.1))
     model = ImagingModel(make_system(1.0), NoPrior(), Gaussian(SIGMA))
     _, data = simulate(model, sampling, scale=1.0)
-    solver = _GradientDescent(loop=Loop(5))
+    solver = _GradientDescent(iterations=5)
     solver.check(make_model(1.0))
     assert_solver_descends(solver, data=data, model=model, sampling=sampling)

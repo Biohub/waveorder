@@ -9,11 +9,9 @@ from torch import Tensor
 from waveorder.errors import IncompatibleModelError
 from waveorder.nn.model import ImagingModel
 from waveorder.nn.sampling import Object
-from waveorder.nn.solvers.base import IterativeSolver, Loop
+from waveorder.nn.solvers.base import IterativeSolver
 from waveorder.nn.verbs import InverseProblem
 from waveorder.registry import register
-
-_DEFAULT_LOOP = Loop(50)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +40,14 @@ class FISTA(IterativeSolver[FISTAState]):
 
     Parameters
     ----------
-    loop : Loop
-        Iterations and stopping (default ``Loop(50)``).
+    iterations : int
+        Maximum number of iterations.
+    tolerance, check_every
+        Early stopping, as :class:`~waveorder.nn.solvers.IterativeSolver`.
     """
 
-    def __init__(self, *, loop: Loop = _DEFAULT_LOOP) -> None:
-        super().__init__(loop=loop)
+    def __init__(self, *, iterations: int = 50, tolerance: float | None = None, check_every: int = 10) -> None:
+        super().__init__(iterations=iterations, tolerance=tolerance, check_every=check_every)
 
     @override
     def check(self, model: ImagingModel) -> None:

@@ -28,7 +28,7 @@ type Spec = str | Mapping[str, Mapping[str, object] | None]
 """A part as plain data: a bare name, or ``{name: arguments}``."""
 
 VALUE = "value"
-"""The kind of small frozen dataclasses that are arguments of parts, not parts: ``Free``, ``Loop``."""
+"""The kind of small frozen dataclasses that are arguments of parts, not parts, such as ``Free``."""
 
 _classes: dict[str, tuple[str, type]] = {}
 """Name -> (kind, class)."""

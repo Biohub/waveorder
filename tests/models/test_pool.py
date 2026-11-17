@@ -15,7 +15,6 @@ from waveorder.errors import Rejected
 from waveorder.models import Fluorescence3D, ReconstructionFailed
 from waveorder.models._pool import Workers, affinity_threads, pickled_model, plan_workers
 from waveorder.nn import Detection, Gaussian, ShiftInvariantSystem, Tikhonov
-from waveorder.observe import observe
 
 BRIGHT = 1e6
 ROOT = Path(__file__).resolve().parents[2]
@@ -62,14 +61,6 @@ def _model(kind: type[Fluorescence3D]) -> Fluorescence3D:
         object_prior=Tikhonov(weight=1e-3),
         noise=Gaussian(sigma=0.01),
     )
-
-
-class _Events:
-    def __init__(self) -> None:
-        self.seen: list[tuple[str, dict]] = []
-
-    def event(self, name, payload) -> None:
-        self.seen.append((name, dict(payload)))
 
 
 @pytest.fixture(scope="module")
@@ -239,25 +230,31 @@ def test_a_pickled_cuda_model_gives_its_cached_device_memory_back():
     assert torch.cuda.memory_reserved() < 64 * 2**20
 
 
-def test_workers_forward_their_events_logs_and_failures_to_the_parent(bright_plate, tmp_path, caplog):
+def test_workers_send_their_units_logs_and_failures_to_the_parent(bright_plate, tmp_path, caplog):
     model = _model(Fragile)
-    events = _Events()
-    with observe(events), caplog.at_level(logging.WARNING, logger="waveorder"):
+    parent, totals, ended = os.getpid(), [], []
+
+    def on_unit(result) -> None:
+        assert os.getpid() == parent
+        ended.append(result)
+
+    with caplog.at_level(logging.WARNING, logger="waveorder"):
         report = model.reconstruct_positions(
-            bright_plate, output=tmp_path / "out.zarr", channels=["BF"], workers=2, keep_going=True
+            bright_plate,
+            output=tmp_path / "out.zarr",
+            channels=["BF"],
+            workers=2,
+            keep_going=True,
+            on_start=totals.append,
+            on_unit=on_unit,
         )
     assert (report.status, report.count("complete"), report.count("failed")) == ("failed", 3, 1)
     (failed,) = [result for result in report.results if result.status == "failed"]
     assert (failed.unit, failed.error) == ("A/1/0/t1", "ValueError: too bright")
     assert "refusing a bright block" in caplog.text  # the worker's log record, re-emitted here
     assert "unit A/1/0/t1 failed: ValueError: too bright" in caplog.text
-    start = dict(events.seen)["units.start"]
-    assert (start["total"], start["workers"], start["devices"]) == (4, 2, ["cpu"])
-    ends = [payload for name, payload in events.seen if name == "unit.end"]
-    assert sorted(payload["unit"] for payload in ends) == [f"A/1/0/t{t}" for t in range(4)]
-    forwarded = [payload for name, payload in events.seen if name == "solve.end"]
-    assert sorted(payload["unit"] for payload in forwarded) == ["A/1/0/t0", "A/1/0/t2", "A/1/0/t3"]
-    assert {payload["worker"] for payload in forwarded} <= {0, 1}
+    assert totals == [4]
+    assert sorted(ended, key=lambda result: result.unit) == sorted(report.results, key=lambda result: result.unit)
     _, image, _ = read_output(tmp_path / "out.zarr")
     assert image[1].abs().max() == 0
     assert image[3].abs().max() > 0

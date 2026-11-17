@@ -24,7 +24,6 @@ from waveorder.cli.options import (
     TileOverlap,
     TransferFunctionDirpath,
     UniqueId,
-    Wandb,
     WriteConfigScaleToOutput,
     parse_zyx,
 )
@@ -43,7 +42,6 @@ def reconstruct(  # noqa: PLR0913 (one keyword per flag)
     resume: Resume = False,
     keep_going: KeepGoing = False,
     write_config_scale_to_output: WriteConfigScaleToOutput = False,
-    wandb: Wandb = None,
     unique_id: UniqueId = None,
 ) -> None:
     """Reconstruct every position and time of a dataset into an output plate.
@@ -62,7 +60,6 @@ def reconstruct(  # noqa: PLR0913 (one keyword per flag)
 
     _reconstruct.reconstruct(
         _reconstruct.Flags(
-            command="reconstruct",
             inputs=tuple(str(path) for path in input_position_dirpaths),
             config=config_filepath,
             output=output_dirpath,
@@ -75,7 +72,6 @@ def reconstruct(  # noqa: PLR0913 (one keyword per flag)
             resume=resume,
             keep_going=keep_going,
             write_config_scale_to_output=write_config_scale_to_output,
-            wandb=wandb,
         )
     )
 
@@ -94,7 +90,6 @@ def apply_inverse_transfer_function(  # noqa: PLR0913 (one keyword per flag)
     resume: Resume = False,
     keep_going: KeepGoing = False,
     write_config_scale_to_output: WriteConfigScaleToOutput = False,
-    wandb: Wandb = None,
 ) -> None:
     """Reconstruct a dataset with a transfer-function store's parameters, without calibrating.
 
@@ -108,7 +103,6 @@ def apply_inverse_transfer_function(  # noqa: PLR0913 (one keyword per flag)
 
     _reconstruct.reconstruct(
         _reconstruct.Flags(
-            command="apply-inverse-transfer-function",
             inputs=tuple(str(path) for path in input_position_dirpaths),
             config=config_filepath,
             output=output_dirpath,
@@ -121,7 +115,6 @@ def apply_inverse_transfer_function(  # noqa: PLR0913 (one keyword per flag)
             resume=resume,
             keep_going=keep_going,
             write_config_scale_to_output=write_config_scale_to_output,
-            wandb=wandb,
         )
     )
 

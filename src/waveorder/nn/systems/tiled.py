@@ -41,7 +41,6 @@ from waveorder.nn.search.base import (
 from waveorder.nn.search.descent import GradientSearch
 from waveorder.nn.solvers import Solver, SolveResult
 from waveorder.nn.verbs import InverseProblem
-from waveorder.observe import operation
 
 _WHERE = "calibrate_tiles"
 
@@ -175,74 +174,71 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
     IncompatibleModelError
         As :func:`~waveorder.nn.calibrate`, or if a stage with ``reads_back = False`` drops the tile axis.
     """
-    with operation():
-        if tiles.dim() < 1 or tiles.shape[0] == 0:
-            raise ParameterError(
-                f"{_WHERE} tiles must have a leading tile axis, got shape {tuple(tiles.shape)}", path="tiles"
-            )
-        search = expect_searchable(tiles[0], model, sampling, search=search, where=_WHERE)
-        count = tiles.shape[0]
-        if chunk_size is not None:
-            _expect_count(chunk_size, where=_WHERE, name="chunk_size", minimum=1)
-        work = copy.deepcopy(model)
-        specs = free_specs(work)
-        if not specs:
-            raise ParameterError("the model has no free quantity to calibrate")
-        work.check(score, sampling)
-        warn_undetermined(work, score)
-        origin = _start_table(start, work, count=count)
-        prior = ParameterPrior(specs) if prior is None else prior
-        if prior.tiles not in (1, count):
-            raise ParameterError(
-                f"{_WHERE} prior holds {prior.tiles} tiles for {count} tiles of data; give one row or one per tile",
-                path="prior",
-            )
-        estimated = [
-            f"{prefix}.sigma" for prefix, part in work.named_modules() if isinstance(part, Gaussian) and part.estimated
-        ]
-        started = [name for name in estimated if start is None or name not in start]
-        size = 1 if estimated else count if chunk_size is None else chunk_size
-        names = list(specs)
-        estimates: list[Estimate] = []
-        levels: list[list[Tensor]] = []
-        flags: list[Tensor] = []
-        for first in range(0, count, size):
-            rows = slice(first, min(first + size, count))
-            rows_prior = prior.select(range(rows.start, rows.stop))
-            rows_origin = {name: value[rows] for name, value in origin.items()}
-            if estimated:  # one tile: its noise starts from its own data, as calibrate starts it
-                rows_prior = start_from_data(work, tiles[first], rows_prior)
-                rows_origin |= {name: work.get_parameter(name).detach().reshape(1).clone() for name in started}
-            objective = _TileObjective(
-                data=tiles[rows],
-                model=work,
-                sampling=sampling,
-                score=score,
-                prior=rows_prior,
-                origin=rows_origin,
-            )
-            best, reached = _search(objective, search, length=rows.stop - rows.start)
-            estimates.append(best)
-            levels.append(reached)
-            flags.append(on_bounds(free_specs(work), best.point))
-        point = {name: torch.cat([estimate.point[name] for estimate in estimates]) for name in names}
-        trace = tuple(
-            (type(stage).__name__, torch.cat([chunk[k] for chunk in levels])) for k, stage in enumerate(search)
+    if tiles.dim() < 1 or tiles.shape[0] == 0:
+        raise ParameterError(
+            f"{_WHERE} tiles must have a leading tile axis, got shape {tuple(tiles.shape)}", path="tiles"
         )
-        # One read-back: the trace and which quantities ended on a bound, per tile.
-        steps = [level.tolist() for _, level in trace]
-        bounded = torch.cat(flags, dim=1).tolist()
-        objective = torch.cat([estimate.objective for estimate in estimates])
-        results = tuple(
-            CalibrationResult(
-                {name: point[name][index] for name in names},
-                objective[index],
-                tuple(name for name, row in zip(names, bounded, strict=True) if row[index]),
-                tuple((name, step[index]) for (name, _), step in zip(trace, steps, strict=True)),
-            )
-            for index in range(count)
+    search = expect_searchable(tiles[0], model, sampling, search=search, where=_WHERE)
+    count = tiles.shape[0]
+    if chunk_size is not None:
+        _expect_count(chunk_size, where=_WHERE, name="chunk_size", minimum=1)
+    work = copy.deepcopy(model)
+    specs = free_specs(work)
+    if not specs:
+        raise ParameterError("the model has no free quantity to calibrate")
+    work.check(score, sampling)
+    warn_undetermined(work, score)
+    origin = _start_table(start, work, count=count)
+    prior = ParameterPrior(specs) if prior is None else prior
+    if prior.tiles not in (1, count):
+        raise ParameterError(
+            f"{_WHERE} prior holds {prior.tiles} tiles for {count} tiles of data; give one row or one per tile",
+            path="prior",
         )
-        return TileCalibration(point, objective, results, trace)
+    estimated = [
+        f"{prefix}.sigma" for prefix, part in work.named_modules() if isinstance(part, Gaussian) and part.estimated
+    ]
+    started = [name for name in estimated if start is None or name not in start]
+    size = 1 if estimated else count if chunk_size is None else chunk_size
+    names = list(specs)
+    estimates: list[Estimate] = []
+    levels: list[list[Tensor]] = []
+    flags: list[Tensor] = []
+    for first in range(0, count, size):
+        rows = slice(first, min(first + size, count))
+        rows_prior = prior.select(range(rows.start, rows.stop))
+        rows_origin = {name: value[rows] for name, value in origin.items()}
+        if estimated:  # one tile: its noise starts from its own data, as calibrate starts it
+            rows_prior = start_from_data(work, tiles[first], rows_prior)
+            rows_origin |= {name: work.get_parameter(name).detach().reshape(1).clone() for name in started}
+        objective = _TileObjective(
+            data=tiles[rows],
+            model=work,
+            sampling=sampling,
+            score=score,
+            prior=rows_prior,
+            origin=rows_origin,
+        )
+        best, reached = _search(objective, search, length=rows.stop - rows.start)
+        estimates.append(best)
+        levels.append(reached)
+        flags.append(on_bounds(free_specs(work), best.point))
+    point = {name: torch.cat([estimate.point[name] for estimate in estimates]) for name in names}
+    trace = tuple((type(stage).__name__, torch.cat([chunk[k] for chunk in levels])) for k, stage in enumerate(search))
+    # One read-back: the trace and which quantities ended on a bound, per tile.
+    steps = [level.tolist() for _, level in trace]
+    bounded = torch.cat(flags, dim=1).tolist()
+    objective = torch.cat([estimate.objective for estimate in estimates])
+    results = tuple(
+        CalibrationResult(
+            {name: point[name][index] for name in names},
+            objective[index],
+            tuple(name for name, row in zip(names, bounded, strict=True) if row[index]),
+            tuple((name, step[index]) for (name, _), step in zip(trace, steps, strict=True)),
+        )
+        for index in range(count)
+    )
+    return TileCalibration(point, objective, results, trace)
 
 
 def _start_table(start: Mapping[str, Tensor] | None, model: ImagingModel, *, count: int) -> dict[str, Tensor]:

@@ -22,7 +22,6 @@ from waveorder.config.schema import (
     FieldDependenceTiled,
     FreeParameter,
     IlluminationSettings,
-    LoopOptions,
     Pinhole,
     PriorBeads,
     PriorDenoiser,
@@ -59,7 +58,6 @@ from waveorder.nn import (
     Solver,
     free_specs,
 )
-from waveorder.nn.solvers import Loop
 from waveorder.zernike_names import canonical_name, noll_indices_up_to_order, noll_to_name
 
 _AUTO_WEIGHT = Free(1e-3, bounds=(1e-6, 1.0))
@@ -457,22 +455,20 @@ def _builds_reconstruction(config: V4Config) -> bool:
 # --- the solver, the score and the search ----------------------------------------------------------------------------
 
 
-def _loop(options: LoopOptions) -> Loop:
-    fields = ("tolerance", "check_every")
-    return Loop(options.iterations, **{name: getattr(options, name) for name in fields})
-
-
 def _solver(config: V4Config) -> Solver:
     reconstruction, at = config.solver.reconstruction, "solver.reconstruction"
+    loop = ("iterations", "tolerance", "check_every")
     if isinstance(reconstruction, ReconstructionFista):
-        return _resolve("solver", "fista", {"loop": _loop(reconstruction.fista)}, at=f"{at}.fista")
+        options = reconstruction.fista
+        return _resolve("solver", "fista", {name: getattr(options, name) for name in loop}, at=f"{at}.fista")
     if isinstance(reconstruction, ReconstructionAdmm):
         options = reconstruction.admm
-        return _resolve("solver", "admm", {"loop": Loop(options.iterations), "rho": options.rho}, at=f"{at}.admm")
+        arguments = {"iterations": options.iterations, "rho": options.rho}
+        return _resolve("solver", "admm", arguments, at=f"{at}.admm")
     if isinstance(reconstruction, ReconstructionRichardsonLucy):
         options = reconstruction.richardson_lucy
-        names = ("background", "back_projector", "bp_alpha", "bp_beta", "gradient_consensus", "start")
-        arguments = {"loop": _loop(options), **{name: getattr(options, name) for name in names}}
+        names = (*loop, "background", "back_projector", "bp_alpha", "bp_beta", "gradient_consensus", "start")
+        arguments = {name: getattr(options, name) for name in names}
         return _resolve("solver", "richardson_lucy", arguments, at=f"{at}.richardson_lucy")
     return _resolve("solver", "wiener", {}, at=at)
 
