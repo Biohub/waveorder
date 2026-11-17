@@ -7,6 +7,12 @@ user's side.
 Report bugs and propose features in the [issues](https://github.com/Biohub/waveorder/issues). Search the existing
 ones first, closed ones too.
 
+Participation in waveorder is governed by the
+[Contributor Covenant Code of Conduct](./CODE_OF_CONDUCT.md).
+
+Do not report security vulnerabilities in public issues. Follow our
+[security policy](./SECURITY.md) to report them privately.
+
 ## Setup
 
 Install [Git](https://git-scm.com/) and [uv](https://docs.astral.sh/uv/getting-started/installation/), then clone the

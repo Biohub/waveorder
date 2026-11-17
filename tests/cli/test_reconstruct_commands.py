@@ -17,6 +17,7 @@ from tests.cli.plates import (
     NA,
     THIN_PHASE,
     TRUE_NA,
+    edited,
     read_output,
     series,
     write_plate,
@@ -305,6 +306,33 @@ def test_a_device_list_spreads_the_units_over_one_worker_per_device(plate, tmp_p
     assert absent.exit_code == 2
     assert "wo rec: error: --device: 'cuda:99' is not available here" in absent.stderr
     assert not (tmp_path / "x.zarr").exists()
+
+
+FIXED_FLUORESCENCE = FLUORESCENCE.replace(
+    "numerical_aperture: {nominal: 0.8, tolerance: free, bounds: [0.6, 1.0]}", "numerical_aperture: 0.8"
+).replace("  calibration: {score: evidence, search: [{grid: {points: 3}}]}\n", "  reconstruction: closed_form\n")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("text", [FIXED_PHASE, FIXED_FLUORESCENCE], ids=["phase", "fluorescence"])
+def test_apply_inv_tf_runs_on_the_configurations_device(plate, tmp_path, text):
+    store = tmp_path / "tf.zarr"
+    volumes, peak_gpu_bytes = {}, {}
+    for device in ("cpu", "cuda"):
+        config = edited(_config(tmp_path, text, "base.yml"), f"solver.device={device}")
+        if not store.exists():
+            arguments = ["compute-tf", "-i", str(plate / "A/1/0"), "-c", str(config), "-o", str(store)]
+            computed = runner.invoke(app, arguments)
+            assert computed.exit_code == 0, computed.output
+        torch.cuda.reset_peak_memory_stats()
+        result = _rec(plate, config, tmp_path / f"{device}.zarr", "-t", str(store), command="apply-inv-tf")
+        assert result.exit_code == 0, result.output
+        peak_gpu_bytes[device] = torch.cuda.max_memory_allocated()
+        volumes[device] = read_output(tmp_path / f"{device}.zarr", "A/1/1")[1]
+    assert peak_gpu_bytes["cpu"] == 0
+    assert peak_gpu_bytes["cuda"] > 0  # solver.device: cuda reconstructs on the GPU, to the CPU's result
+    assert volumes["cpu"].abs().max() > 0
+    torch.testing.assert_close(volumes["cuda"], volumes["cpu"], rtol=1e-4, atol=1e-5)
 
 
 def _failing_every_second_unit(monkeypatch) -> list[str]:
