@@ -1,18 +1,19 @@
-"""Generate figures for the label-free screening tutorial.
+"""Generate the data figures for the label-free screening tutorial.
 
-Draws every figure from the 8-bit, display-scaled image crops in ./data/,
-so it runs anywhere::
-
-    uv run --no-project --with matplotlib --with pillow python make_figures.py
+Draws every figure from the 8-bit image crops in ./data/, so it needs no
+data outside this folder. See ../README.md for the exact command and the
+pinned package versions.
 
 Writes vector PDF (for the whitepaper) and PNG (for the docs site) figure
-pairs into this folder. Figures are drawn at final print width so fonts
-match the 9 pt document when included at 100% scale.
+pairs into this folder. Figures are drawn at their print size with 8 pt
+labels: the overview at the full text width, the failure-mode figures at
+the size they take inside their boxes, so the whitepaper includes them
+unscaled.
 
-The crops in ./data/ come from the raw OPS position and the reconstructions
-on the Biohub HPC. To rebuild them there (needs iohub)::
-
-    python make_figures.py --from-hpc
+The crops in ./data/ are cut from one raw OPS position and from
+reconstructions of it on the Biohub HPC. ``--from-hpc`` rebuilds them there
+(needs iohub); the paths are options because they are specific to that
+system.
 
 The Koehler alignment figure has its own script, koehler/make_figure.py.
 """
@@ -33,12 +34,15 @@ plt.rcParams["font.size"] = 8
 FIGURES = Path(__file__).resolve().parent
 DATA = FIGURES / "data"
 
+# Defaults for --from-hpc: the raw OPS position, and the folder of
+# reconstructions of it (one <name>.zarr per variant, see refresh_from_hpc).
 RAW_PATH = "/hpc/projects/icd.fast.ops/ops0105_20260106/0-convert/live_imaging/phenotyping_transform.zarr/A/1/029029"
-# Biohub HPC analysis directory holding the reconstructions.
-RECONS = Path("/hpc/mydata/talon.chandler/2026-11-04-wo-hcs-whitepaper/recons")
+RECONS = "/hpc/mydata/talon.chandler/2026-11-04-wo-hcs-whitepaper/recons"
 
-FULL_W = 7.3  # print width (in) of a full-width figure at 1.3 cm margins
-HALF_W = 3.52  # print width of a boxed half-width figure
+FULL_W = 7.5  # print width (in) of a full-width figure: letter paper, 1.25 cm margins
+BOX_W = 2.9  # print width (in) of a figure inside a failure-mode box
+N_SLICES = 7  # slices in the defocus stack
+CROP_PX = 256  # stored crop size; more than any panel needs at print resolution
 
 # Zoom regions chosen from full-FOV overviews: clean monolayer, no debris.
 YS = slice(384, 896)
@@ -50,31 +54,43 @@ PX_UM = 0.325  # yx pixel size in micrometers
 N_WIDE, N_FOCUS = 512, 320  # source pixels across the wide and focus crops
 
 
-def refresh_from_hpc():
+def refresh_from_hpc(raw_path=RAW_PATH, recons=RECONS):
     """Rebuild the crops in ./data/ from the raw data and reconstructions.
 
-    Each crop is scaled to the contrast limits its panel is shown with and
-    stored as an 8-bit grayscale PNG. Requires Biohub HPC access.
+    Each crop is scaled to the contrast limits its panel is shown with,
+    resampled to ``CROP_PX`` pixels and stored as an 8-bit grayscale PNG.
+
+    Parameters
+    ----------
+    raw_path : str
+        Raw OME-Zarr position with a ``BF`` channel of ``N_SLICES`` slices.
+    recons : str
+        Folder holding one ``<name>.zarr`` phase reconstruction per panel:
+        ``nominal`` (the "correct", "reg 1e-3" and "0 slices" panels),
+        ``flipped``, ``reg_1e-5``, ``reg_1e-1``, ``offset_-2.0`` ("-2
+        slices"), ``defocused`` ("+2 slices"), and, for edge position
+        002029, ``edge_baseline`` ("tilt not modeled") and ``edge_apply``
+        ("tilt fitted").
     """
     from iohub import open_ome_zarr
 
     def load_phase(name, position="029029"):
-        with open_ome_zarr(RECONS / f"{name}.zarr" / f"A/1/{position}") as ds:
+        with open_ome_zarr(Path(recons) / f"{name}.zarr" / f"A/1/{position}") as ds:
             return np.asarray(ds.data[0, 0, 0]).astype(np.float32)
 
     def write(name, img, lo, hi):
-        scaled = np.clip((img - lo) / (hi - lo), 0, 1) * 255
-        Image.fromarray(np.rint(scaled).astype(np.uint8)).save(DATA / f"{name}.png")
+        scaled = np.rint(np.clip((img - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
+        Image.fromarray(scaled).resize((CROP_PX, CROP_PX), Image.LANCZOS).save(DATA / f"{name}.png")
         print(f"wrote data/{name}.png")
 
     DATA.mkdir(exist_ok=True)
-    with open_ome_zarr(RAW_PATH) as raw_ds:
+    with open_ome_zarr(raw_path) as raw_ds:
         bf_idx = raw_ds.channel_names.index("BF")
-        bf = np.asarray(raw_ds.data[0, bf_idx]).astype(np.float32)  # (7, 2048, 2048)
+        bf = np.asarray(raw_ds.data[0, bf_idx]).astype(np.float32)  # (N_SLICES, 2048, 2048)
     # shared grayscale so the background stays consistent across slices
     stack = bf[:, S_YS, S_XS]
     stack_lo, stack_hi = np.percentile(stack, [0.5, 99.5])
-    for z in range(7):
+    for z in range(N_SLICES):
         write(f"stack_{z}", stack[z], stack_lo, stack_hi)
 
     nominal = load_phase("nominal")
@@ -164,6 +180,7 @@ def add_scalebar(ax, n_px, n_src, length_um=25):
     """
     k = n_px / n_src  # displayed pixels per source pixel
     bar_px = length_um / PX_UM * k
+    # inset from the right and bottom edges by 45 and 55 source pixels
     x0, y0 = n_px - bar_px - 45 * k, n_px - 55 * k
     ax.plot(
         [x0, x0 + bar_px],
@@ -174,7 +191,7 @@ def add_scalebar(ax, n_px, n_src, length_um=25):
     )
     ax.text(
         x0 + bar_px,
-        y0 - 10 * k,
+        y0 - 10 * k,  # label 10 source pixels above the bar
         f"{length_um} µm",
         color="white",
         ha="right",
@@ -193,12 +210,24 @@ def panel(ax, name, title, n_src=N_WIDE, scalebar=False):
         add_scalebar(ax, img.shape[-1], n_src)
 
 
-def save(fig, stem):
-    """Save a figure as vector PDF (whitepaper) and PNG (docs site)."""
-    for ext, dpi in (("pdf", 300), ("png", 220)):
+def save(fig, stem, tight=True):
+    """Save a figure as vector PDF (whitepaper) and PNG (docs site).
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        Figure to save and close.
+    stem : str
+        Output basename, without extension.
+    tight : bool, optional
+        Crop to the drawn content. Turn off to keep the exact figure size.
+    """
+    bbox = "tight" if tight else None
+    # 220 dpi shows every stored pixel of the crops at print size and keeps the PDFs small
+    for ext, dpi in (("pdf", 220), ("png", 220)):
         # no creation date, so reruns give byte-identical PDFs
         meta = {"CreationDate": None} if ext == "pdf" else None
-        fig.savefig(FIGURES / f"{stem}.{ext}", dpi=dpi, bbox_inches="tight", transparent=True, metadata=meta)
+        fig.savefig(FIGURES / f"{stem}.{ext}", dpi=dpi, bbox_inches=bbox, transparent=True, metadata=meta)
     plt.close(fig)
     print(f"wrote {stem}.pdf/.png")
 
@@ -328,38 +357,48 @@ def make_overview():
     fig.text(ICON_TEXT_X, 0.03 + mda_h / 2, "7-slice z stack\n2 µm spacing", fontsize=7, va="center", ha="left")
 
     # Defocus stack: all 7 planes fanned bottom-to-top in acquisition order.
-    for k in range(7):
-        ax = fig.add_axes([0.29 + 0.006 * k, 0.085 + 0.053 * k, 0.135, 0.47])
-        show(ax, load(f"stack_{k}"))
+    step_x, step_y, size_x, size_y = 0.006, 0.053, 0.135, 0.47  # fan offsets and slice size, figure units
+    for k in range(N_SLICES):
+        ax = fig.add_axes([0.29 + step_x * k, 0.085 + step_y * k, size_x, size_y])
+        img = load(f"stack_{k}").copy()
+        if k < N_SLICES - 1:
+            # blank the part hidden behind the next slice; it is never seen and only bloats the files
+            h, w = img.shape
+            img[: int(h * (1 - step_y / size_y)) - 2, int(w * step_x / size_x) + 2 :] = 128
+        show(ax, img)
         for spine in ax.spines.values():
             spine.set_color("0.3")
     fig.text(0.3755, 0.025, "7-slice defocus stack", fontsize=8, ha="center")
 
     # WaveOrder box: config + CLI.
-    ax = icon_axes([0.515, 0.05, 0.245, 0.9])
+    ax = icon_axes([0.497, 0.05, 0.3, 0.9])
     ax.add_patch(plt.Rectangle((0.02, 0.02), 0.96, 0.96, fill=False, color="0.3", lw=1.0))
     ax.text(0.5, 0.885, "WaveOrder", fontsize=9, ha="center", weight="bold")
-    ax.text(
-        0.08,
-        0.56,
-        "$ cat config.yml\n...\nyx_pixel_size:   0.325\nz_pixel_size:    2.0\nNA_detection:    0.55\nNA_illumination: 0.4\nz_focus_offset:  auto\n...",
-        fontsize=6.5,
-        va="center",
-    )
-    ax.text(
-        0.08,
-        0.19,
-        "$ waveorder reconstruct \\\n    -i data.zarr \\\n    -c config.yml \\\n    -o phase.zarr",
-        fontsize=6.5,
-        va="center",
-    )
+    config = [
+        "$ cat config.yml",
+        "...",
+        "yx_pixel_size: 0.325",
+        "z_pixel_size: 2.0",
+        "numerical_aperture_detection: 0.55",
+        "numerical_aperture_illumination: 0.4",
+        "z_focus_offset: auto",
+        "...",
+    ]
+    command = [
+        "$ waveorder reconstruct \\",
+        "    -i data.zarr/A/1/029029 \\",
+        "    -c config.yml \\",
+        "    -o phase.zarr",
+    ]
+    ax.text(0.045, 0.56, "\n".join(config), fontsize=6.5, va="center")
+    ax.text(0.045, 0.19, "\n".join(command), fontsize=6.5, va="center")
 
     # Reconstruction.
-    show(fig.add_axes([0.815, 0.13, 0.165, 0.72]), load("nominal"))
-    fig.text(0.8975, 0.025, "quantitative phase", fontsize=8, ha="center")
+    show(fig.add_axes([0.83, 0.13, 0.16, 0.72]), load("nominal"))
+    fig.text(0.91, 0.025, "quantitative phase", fontsize=8, ha="center")
 
     # Arrows in the clear gaps between columns.
-    for x0, x1 in ((0.253, 0.283), (0.475, 0.505), (0.775, 0.805)):
+    for x0, x1 in ((0.253, 0.283), (0.466, 0.494), (0.801, 0.825)):
         fig.add_artist(
             matplotlib.patches.FancyArrowPatch(
                 (x0, 0.5),
@@ -372,34 +411,36 @@ def make_overview():
             )
         )
 
-    save(fig, "fig_overview")
+    save(fig, "fig_overview", tight=False)  # exact width, included at the full text width
 
 
 def make_failure_modes():
-    """Half-width figures for the four failure-mode boxes."""
+    """Figures for the four failure-mode boxes, at their print size."""
+    two, three = (BOX_W, 1.15), (BOX_W, 1.0)  # sizes of the 2- and 3-panel figures (in)
+
     # contrast flip
-    fig, axs = plt.subplots(1, 2, figsize=(HALF_W, 2.0))
+    fig, axs = plt.subplots(1, 2, figsize=two)
     panel(axs[0], "nominal", "correct\n(nucleoli bright)", scalebar=True)
     panel(axs[1], "flipped", "flipped z axis\n(nucleoli dark)")
     save(fig, "fig_flip")
 
     # regularization sweep
-    fig, axs = plt.subplots(1, 3, figsize=(HALF_W, 1.45))
+    fig, axs = plt.subplots(1, 3, figsize=three)
     for ax, reg, note in zip(axs, ["1e-5", "1e-3", "1e-1"], ["too noisy", "chosen", "too smooth"]):
         name = "nominal" if reg == "1e-3" else f"reg_{reg}"
         panel(ax, name, f"reg {reg}\n({note})", scalebar=(reg == "1e-5"))
     save(fig, "fig_reg")
 
     # focus offset
-    fig, axs = plt.subplots(1, 3, figsize=(HALF_W, 1.45))
+    fig, axs = plt.subplots(1, 3, figsize=three)
     for ax, off in zip(axs, ["-2", "0", "+2"]):
-        note = " (chosen)" if off == "0" else ""
-        panel(ax, f"focus_{off}", f"{off} slices{note}", n_src=N_FOCUS, scalebar=(off == "-2"))
+        note = "(chosen)" if off == "0" else ""
+        panel(ax, f"focus_{off}", f"{off} slices\n{note}", n_src=N_FOCUS, scalebar=(off == "-2"))
     save(fig, "fig_focus")
 
     # illumination tilt on an edge FOV
-    fig, axs = plt.subplots(1, 2, figsize=(HALF_W, 2.0))
-    panel(axs[0], "edge_baseline", "tilt not modeled", scalebar=True)
+    fig, axs = plt.subplots(1, 2, figsize=two)
+    panel(axs[0], "edge_baseline", "tilt not modeled\n", scalebar=True)
     panel(axs[1], "edge_tilt", "tilt fitted\n(0.49 rad zenith)")
     save(fig, "fig_tilt")
 
@@ -407,7 +448,10 @@ def make_failure_modes():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--from-hpc", action="store_true", help="rebuild ./data/ from the Biohub HPC stores first")
-    if parser.parse_args().from_hpc:
-        refresh_from_hpc()
+    parser.add_argument("--raw", default=RAW_PATH, help="raw OME-Zarr position used by --from-hpc")
+    parser.add_argument("--recons", default=RECONS, help="folder of reconstructions used by --from-hpc")
+    args = parser.parse_args()
+    if args.from_hpc:
+        refresh_from_hpc(args.raw, args.recons)
     make_overview()
     make_failure_modes()

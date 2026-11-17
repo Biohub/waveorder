@@ -1,12 +1,17 @@
-"""Cartoon-style inverted microscope: 3D model plus flat-shaded outline renderer.
+"""Cartoon inverted microscope: parametric 3D model and flat-shaded renderer.
 
-Geometry is laid out to match a reference cartoon. Units are roughly mm.
-Axes: +x is the user's right, y runs front (0) to back, z is up from the table.
+The model is schematic: an original drawing with the proportions of a
+generic inverted stand, not to scale and not taken from vendor CAD. Units
+are roughly mm. Axes: +x is the user's right, y runs front (0) to back,
+z is up from the table.
+
+`build` returns the parts, `mesh_scene` tessellates them, and `render`
+draws a view with flat tones, soft shading on rounded edges and outlines
+at silhouettes and sharp edges. Used by make_figure.py.
 """
 
 import math
-import sys
-from pathlib import Path
+import warnings
 
 import cadquery as cq
 import numpy as np
@@ -15,6 +20,15 @@ from PIL import Image, ImageFilter
 from vtk.util import numpy_support as ns
 
 AX = 260.0  # y position of the optical axis
+# Positions of the Koehler controls, shared with the arrows in make_figure.py.
+TURRET_Y = AX + 12  # y of the condenser turret axis
+FIELD_RING_Z = (652.0, 664.0)  # bottom and top of the field diaphragm ring
+FOCUS_KNOB_X = 88.0  # outer face of the right condenser focus knob
+FOCUS_KNOB_YZ = (328.0, 650.0)  # axis of the condenser focus knobs
+SCREW_Z = 612.5  # height of the condenser centering screws
+SCREW_ANGLES = (-150, -30)  # their directions about the optical axis, degrees
+SCREW_TIP_R = 86.0  # radius of their outer ends
+LENS_BOTTOM_Z = 508.0  # bottom of the condenser lens
 
 
 def _hex(h):
@@ -48,7 +62,6 @@ def _tones(v):
 
 
 PAL = {k: _tones(v) for k, v in PAL.items()}
-LIGHT = np.array([-0.15, -0.8, 0.58])
 
 
 def box(x0, x1, y0, y1, z0, z1):
@@ -76,28 +89,43 @@ def prism_yz(pts, x0, x1):
     return cq.Workplane("YZ", origin=(x0, 0, 0)).polyline(pts).close().extrude(x1 - x0)
 
 
-def fillet(wp, selector, r):
-    """Fillet selected edges, leaving the solid unchanged on failure."""
-    try:
-        return wp.edges(selector).fillet(r)
-    except Exception:
-        return wp
-
-
 ROUND = 0.45  # global scale on edge radii
 
 
 def soft(wp, r, selector=None, scale=True):
-    """Round edges, retrying with smaller radii if the kernel refuses."""
+    """Round the edges of a solid.
+
+    The CAD kernel refuses a fillet that does not fit the local geometry, so
+    smaller radii are tried in turn. A change of radius is reported, since it
+    changes the drawing.
+
+    Parameters
+    ----------
+    wp : cq.Workplane
+        Solid to round.
+    r : float
+        Edge radius.
+    selector : str, optional
+        CadQuery edge selector; all edges by default.
+    scale : bool, optional
+        Multiply `r` by the global `ROUND` factor.
+
+    Returns
+    -------
+    cq.Workplane
+    """
     if scale:
         r *= ROUND
     for rr in (r, r * 0.6, r * 0.3):
         try:
             e = wp.edges(selector) if selector else wp.edges()
-            return e.fillet(rr)
-        except Exception:
+            rounded = e.fillet(rr)
+        except Exception:  # the kernel raises its own error types
             continue
-    return wp
+        if rr != r:
+            warnings.warn(f"edge radius reduced from {r:g} to {rr:g}", stacklevel=2)
+        return rounded
+    raise RuntimeError(f"could not round edges at radius {r:g} or smaller")
 
 
 def knurled_z(d, z0, z1, n=15, depth=1.8):
@@ -105,11 +133,7 @@ def knurled_z(d, z0, z1, n=15, depth=1.8):
     t = np.linspace(0, 2 * math.pi, n * 12, endpoint=False)
     r = d / 2 + depth * np.cos(n * t)
     pts = [(float(a * math.cos(b)), float(a * math.sin(b))) for a, b in zip(r, t)]
-    wp = cq.Workplane("XY", origin=(0, AX, z0))
-    try:
-        return wp.spline(pts, periodic=True).close().extrude(z1 - z0)
-    except Exception:
-        return wp.polyline(pts).close().extrude(z1 - z0)
+    return cq.Workplane("XY", origin=(0, AX, z0)).spline(pts, periodic=True).close().extrude(z1 - z0)
 
 
 def objective(band_h=5):
@@ -174,9 +198,8 @@ def build(highlight=False):
     Returns
     -------
     list of tuple
-        ``(name, cq.Workplane, palette_name)`` triples. A trailing ``!`` on
-        the palette name renders the part in a single flat tone; a trailing
-        ``~`` shades every curved face smoothly from its normals.
+        ``(name, cq.Workplane, palette_name)`` triples. A trailing ``~`` on
+        the palette name shades every curved face smoothly from its normals.
     """
     P = []
 
@@ -247,29 +270,34 @@ def build(highlight=False):
     add("neck", cyl_z(52, 664, 714), "mid")
 
     # ---------------- Koehler controls ----------------
-    add("A_field_diaphragm_ring", knurled_z(84, 652, 664), hl("red~", "dark~", "A"))
+    add("A_field_diaphragm_ring", knurled_z(84, *FIELD_RING_Z), hl("red~", "dark~", "A"))
     add("focus_block", soft(box(-42, 42, 310, 345, 600, 712), 8), "body")
     for side, sx in (("R", 1), ("L", -1)):
-        add(f"focus_stem_{side}", mirror_x(lambda: cyl_x(14, 40, 62, 328, 650), sx), "white")
+        add(f"focus_stem_{side}", mirror_x(lambda: cyl_x(14, 40, 62, *FOCUS_KNOB_YZ), sx), "white")
         add(
             f"B_condenser_focus_knob_{side}",
-            mirror_x(lambda: soft(cyl_x(38, 62, 88, 328, 650), 5).union(cyl_x(20, 87, 89.5, 328, 650)), sx),
+            mirror_x(
+                lambda: soft(cyl_x(38, 62, FOCUS_KNOB_X, *FOCUS_KNOB_YZ), 5).union(
+                    cyl_x(20, FOCUS_KNOB_X - 1, FOCUS_KNOB_X + 1.5, *FOCUS_KNOB_YZ)
+                ),
+                sx,
+            ),
             hl("orange", "dark", "B"),
         )
     holder = cyl_z(140, 607, 618).union(box(-35, 35, AX, 330, 607, 618))
     holder = holder.cut(cyl_z(70, 600, 625))
     add("condenser_holder", soft(holder, 3), "white")
-    for i, ang in enumerate((-150, -30)):
-        s = soft(cyl_x(10, 66, 86, AX, 612.5), 2).rotate((0, AX, 0), (0, AX, 1), ang)
+    for i, ang in enumerate(SCREW_ANGLES):
+        s = soft(cyl_x(10, 66, SCREW_TIP_R, AX, SCREW_Z), 2).rotate((0, AX, 0), (0, AX, 1), ang)
         add(f"C_centering_screw_{i}", s, hl("cobalt", "dark", "C"))
-    tc = AX + 12
+    tc = TURRET_Y
     add("condenser_turret", soft(cyl_z(185, 575, 607, 0, tc), 4), "white")
     band = cyl_z(188, 584, 598, 0, tc).cut(cyl_z(175, 580, 600, 0, tc))
     add("condenser_turret_band", band, "dark")
     lever = soft(cyl_x(7, 90, 112, tc, 591), 2).rotate((0, tc, 0), (0, tc, 1), -105)
     add("aperture_lever", lever, hl("green", "white", "lever"))
     add("condenser_lens", cyl_z(80, 516, 575), "white")
-    add("condenser_lens_rim", soft(cyl_z(82, 508, 516), 2), "dark")
+    add("condenser_lens_rim", soft(cyl_z(82, LENS_BOTTOM_Z, LENS_BOTTOM_Z + 8), 2), "dark")
     return P
 
 
@@ -283,7 +311,7 @@ def _smooth_groups(faces):
             i = parent[i]
         return i
 
-    edges, pairs = {}, []
+    edges = {}
     for i, f in enumerate(faces):
         for e in f.Edges():
             edges.setdefault(e.hashCode(), []).append((i, e))
@@ -297,10 +325,9 @@ def _smooth_groups(faces):
                     p = e.positionAt(0.5)
                     if faces[i].normalAt(p).dot(faces[j].normalAt(p)) > 0.97:
                         parent[find(i)] = find(j)
-                        pairs.append((i, j))
-                except Exception:
+                except Exception:  # no normal at a degenerate edge: leave the faces apart
                     pass
-    return [find(i) for i in range(len(faces))], pairs
+    return [find(i) for i in range(len(faces))]
 
 
 def _axis_tone(n):
@@ -353,7 +380,7 @@ def _face_shading(face, verts, tris, force=False):
         nv = face.normalAt(cq.Vector(*v[t[k]].mean(axis=0)))
         if np.dot((nv.x, nv.y, nv.z), n[k]) < 0:
             n = -n
-    except Exception:
+    except Exception:  # no normal at this point: keep the triangle winding as is
         pass
     vn = np.zeros_like(v)
     for k in range(3):
@@ -377,19 +404,17 @@ def mesh_scene(parts):
     fill, line, group, tone = [white], [(255, 255, 255)], [0], [0]
     n, gbase = 0, 1
     for _, wp, pal in parts:
-        flat, smooth = pal.endswith("!"), pal.endswith("~")
-        tones = PAL[pal.rstrip("!~")]
+        smooth = pal.endswith("~")
+        tones = PAL[pal.rstrip("~")]
         shape = wp.val()
         shape.mesh(0.2, 0.06)
         faces = shape.Faces()
-        groups, _ = _smooth_groups(faces)
+        groups = _smooth_groups(faces)
         for f, g in zip(faces, groups):
             verts, t = f.tessellate(0.2, 0.06)
             if not t:
                 continue
             ft, vn = _face_shading(f, verts, t, smooth)
-            if flat:
-                ft = 2
             fid = len(fill)
             fill.append(tones[:4])
             line.append(tones[4])
@@ -525,57 +550,3 @@ def render(scene, path, focus, azim, elev, half_height, size=(960, 1060), ss=3, 
     out = color.copy()
     out[mask] = la[mask]
     Image.fromarray(out).resize(size, Image.LANCZOS).save(path)
-
-
-VIEWS = [
-    # name, title, focus, azim, elev, half_height, highlight
-    ("ref_match", "Whole stand (reference angle)", (-25, 249, 402), 35, 10, 540, False),
-    ("ref_match_hl", "Whole stand, Koehler controls coloured", (-25, 249, 402), 35, 10, 540, True),
-    ("illum_right", "Illuminator from front-right", (0, AX, 640), 62, 10, 170, "close"),
-    ("illum_front", "Illuminator from front", (0, AX, 640), 90, 6, 170, "close"),
-    ("stand_left", "Whole stand from front-left", (0, 285, 440), 140, 12, 520, False),
-    ("stand_front", "Whole stand from front", (0, 285, 440), 90, 8, 520, False),
-]
-
-
-def main(out, ref=None):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    plain = build()
-    hi = build(True)
-    close = [q for q in hi if not q[0].startswith(("eyepiece", "tube_"))]
-    scenes = {False: mesh_scene(plain), True: mesh_scene(hi), "close": mesh_scene(close)}
-    for name, _, focus, az, el, hh, h in VIEWS:
-        render(scenes[h], out / f"{name}.png", focus, az, el, hh)
-    assy = cq.Assembly(name="cartoon_inverted_microscope")
-    for name, wp, pal in plain:
-        r, g, b = PAL[pal.rstrip("!~")][2]
-        assy.add(wp, name=name, color=cq.Color(r / 255, g / 255, b / 255))
-    assy.export(str(out / "cartoon_scope.step"))
-    assy.export(str(out / "cartoon_scope.glb"))
-    with PdfPages(out / "summary.pdf") as pdf:
-        pages = []
-        if ref and Path(ref).exists():
-            pages.append([("Reference", ref), ("Model render", out / "ref_match.png")])
-        rest = [(t, out / f"{n}.png") for n, t, *_ in VIEWS[1:]]
-        pages += [rest[i : i + 2] for i in range(0, len(rest), 2)]
-        for group in pages:
-            fig, axes = plt.subplots(1, len(group), figsize=(11, 6.5), squeeze=False)
-            for ax, (title, p) in zip(axes[0], group):
-                ax.imshow(plt.imread(p))
-                ax.set_title(title, fontsize=11)
-                ax.axis("off")
-            fig.tight_layout()
-            pdf.savefig(fig, dpi=170)
-            plt.close(fig)
-    print("parts:", len(plain))
-
-
-if __name__ == "__main__":
-    main(*sys.argv[1:])

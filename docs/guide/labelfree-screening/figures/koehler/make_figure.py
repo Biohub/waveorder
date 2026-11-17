@@ -5,9 +5,10 @@ an overview, then four zoomed panels that step through realigning Koehler
 illumination. Each zoomed panel carries an inset of the field stop as seen
 on the camera, filled with a raw brightfield crop (../data/stack_3.png).
 
-Needs cadquery (which brings vtk): ``uv run --no-project --with cadquery
-python make_figure.py``. Writes fig_koehler.pdf/.png into the parent folder at
-final print width, so fonts match the other tutorial figures.
+Needs cadquery (which brings vtk); see ../../README.md for the exact command
+and pinned versions. Writes fig_koehler.pdf/.png into the parent folder (or
+into the directory given as the first argument) at final print width, so
+its 8 pt labels match the other tutorial figures.
 """
 
 import math
@@ -24,18 +25,20 @@ import scope_model as ts
 from matplotlib.patches import ConnectionPatch, FancyBboxPatch, Polygon, Rectangle
 from PIL import Image, ImageDraw, ImageFilter
 
-S = 2  # render scale relative to the 960 px layout
-SIZE = (960 * S, 1250 * S)
-AZ, EL = 35, 10
+# Arrow geometry is laid out in pixels of a 960 px wide panel; panels are
+# rendered S times larger so the print stays sharp.
+S = 2
+SIZE = (960 * S, 1250 * S)  # panel size in pixels
+AZ, EL = 35, 10  # camera azimuth and elevation in degrees, shared by all panels
 OVERVIEW = dict(focus=(-33.6, 236.7, 407), half_height=492)  # microscope fills the panel
 BLACK = "#1a1a1a"
 RED = "#e2574c"
 ORANGE = "#f39c34"
 BLUE = "#4b83e8"
-TC = ts.AX + 12
 N_IN = 600  # inset image size in pixels
-FULL_W = 7.3  # print width (in), as in make_figures.py
-LW = 0.42  # line-width scale from the large working layout to print width
+FULL_W = 7.5  # print width (in) of a full-width figure, as in make_figures.py
+LW = 0.42  # line widths below are in points for a 5-panel row 2.4x wider than print; this scales them down
+N_BLADES, BLADE_TILT = 10, 11  # field stop blades and their rotation in degrees (also in make_figures.py)
 HERE = Path(__file__).resolve().parent
 CELL = np.asarray(
     Image.open(HERE.parent / "data" / "stack_3.png").convert("L").resize((N_IN, N_IN), Image.LANCZOS), float
@@ -63,6 +66,7 @@ def project(view, pts):
     view : dict
         ``focus`` and ``half_height`` of the orthographic view.
     pts : array-like, shape (n, 3)
+        Points in model coordinates.
 
     Returns
     -------
@@ -85,12 +89,14 @@ def arrow(ax, xy, color, lw=3.2, heads=(True, True), head=(45, 36), scale=S, hal
 
     Parameters
     ----------
-    ax : matplotlib axes
+    ax : matplotlib.axes.Axes
+        Axes to draw on, in pixel coordinates.
     xy : ndarray, shape (n, 2)
         Path in pixels.
     color : str
+        Arrow color.
     lw : float
-        Line width in points.
+        Line width in points (before the `LW` print scaling).
     heads : tuple of bool
         Whether to draw a head at the start and at the end.
     head : tuple of float
@@ -147,12 +153,13 @@ def rotation_arrow(ax, center, axis, radius, a0, a1, color=BLACK, **kw):
 def ring_arrow(ax, heads):
     """Black arrow turning the knurled field diaphragm ring."""
     cam = -AZ
-    pts = arc3d((0, ts.AX, 643), (1, 0, 0), (0, 1, 0), 55, cam - 48, cam + 48)
+    below = ts.FIELD_RING_Z[0] - 9  # just under the ring, on the side facing the camera
+    pts = arc3d((0, ts.AX, below), (1, 0, 0), (0, 1, 0), 55, cam - 48, cam + 48)
     arrow(ax, project(ZOOM, pts), BLACK, lw=3.0, heads=heads, head=(36, 29))
 
 
 # ---------------------------------------------------------------- insets
-def blades(center, radius, n=10, rot=11):
+def blades(center, radius, n=N_BLADES, rot=BLADE_TILT):
     """Vertices of a bladed (polygonal) aperture, in inset pixels."""
     t = np.radians(rot + np.arange(n) * 360 / n)
     return np.stack([center[0] + radius * np.cos(t), center[1] + radius * np.sin(t)], axis=1) * N_IN
@@ -190,14 +197,14 @@ def stop_image(center, radius, blur=0, ghost=None):
     return img
 
 
-def edge_dist(radius, ang, n=10, rot=11):
+def edge_dist(radius, ang, n=N_BLADES, rot=BLADE_TILT):
     """Distance from the aperture centre to its edge along a direction."""
     half = 180 / n
     rel = (ang - rot) % (2 * half) - half
     return radius * math.cos(math.radians(half)) / math.cos(math.radians(rel))
 
 
-INSET_W = 0.25
+INSET_W = 0.25  # inset width as a fraction of the panel width
 
 
 def inset_axes(ax):
@@ -268,17 +275,18 @@ def inset_open(ax):
     x0, y1 = 0.035 * SIZE[0], SIZE[1] * (1 - 0.03)
     c = np.array([x0 + w / 2, y1 - w / 2])
     a = w / 2
-    half = 1.95 * a
+    half = 1.95 * a  # radius of the white patch: just past the stop, which reaches 1.55 a
     g = np.linspace(-1, 1, 500)
     r = np.hypot(*np.meshgrid(g, g))
-    t = np.clip((1.0 - r) / 0.17, 0, 1)
+    t = np.clip((1.0 - r) / 0.17, 0, 1)  # opaque inside, fading over the outer 17%
     rgba = np.ones((500, 500, 4))
     rgba[..., 3] = t * t * (3 - 2 * t)
     ax.imshow(rgba, extent=(c[0] - half, c[0] + half, c[1] + half, c[1] - half), interpolation="bilinear", zorder=2)
     ax.imshow(CELL, extent=(x0, x0 + w, y1, y1 - w), cmap="gray", vmin=0, vmax=255, interpolation="bilinear", zorder=3)
     ax.add_patch(Rectangle((x0, y1 - w), w, w, fc="none", ec=BLACK, lw=0.45, zorder=3.5))
-    rad = 1.47 * a / math.cos(math.radians(18))
-    ang = np.radians(11 + 36 * np.arange(10))
+    # stop just outside the corners of the field of view (corner distance is 1.41 a)
+    rad = 1.47 * a / math.cos(math.pi / N_BLADES)
+    ang = np.radians(BLADE_TILT + 360 / N_BLADES * np.arange(N_BLADES))
     ax.add_patch(
         Polygon(
             c + rad * np.stack([np.cos(ang), np.sin(ang)], 1),
@@ -300,28 +308,34 @@ def inset_open(ax):
 
 # ---------------------------------------------------------------- panels
 def panel_close(ax):
+    """Close the field stop: turn the ring one way; the stop image shrinks."""
     ring_arrow(ax, (False, True))
     inset_close(ax)
 
 
 def panel_focus(ax):
-    rotation_arrow(ax, (95, 328, 650), (1, 0, 0), 24, -60, 170)
+    """Focus the condenser: turn the focus knob; the condenser moves up and down."""
+    knob_face = (ts.FOCUS_KNOB_X + 7, *ts.FOCUS_KNOB_YZ)
+    rotation_arrow(ax, knob_face, (1, 0, 0), 24, -60, 170)
     right, _ = basis()
-    base = np.array([0, TC, 0]) - right * 110
+    base = np.array([0, ts.TURRET_Y, 0]) - right * 110  # clear of the turret, to its left
     line = np.array([base + (0, 0, 560), base + (0, 0, 664)])
     arrow(ax, project(ZOOM, line), ORANGE, lw=4.2)
     inset_focus(ax)
 
 
 def panel_center(ax):
-    for ang, span in ((-30, (-150, 80)), (-150, (100, 330))):
+    """Center the condenser: turn both centering screws; the condenser moves in X and Y."""
+    spans = {-30: (-150, 80), -150: (100, 330)}  # arc of each arrow, on the side facing the camera
+    for ang in ts.SCREW_ANGLES:
+        span = spans[ang]
         a = math.radians(ang)
         d = np.array([math.cos(a), math.sin(a), 0])
-        c = np.array([0, ts.AX, 612.5]) + d * 92
+        c = np.array([0, ts.AX, ts.SCREW_Z]) + d * (ts.SCREW_TIP_R + 6)
         rotation_arrow(ax, c, d, 16, *span, lw=2.8, head=(32, 27))
     # X and Y in the plane perpendicular to the light path, drawn as if
     # that plane were tipped toward the viewer so all four heads read
-    c = project(ZOOM, [(0, ts.AX, 476)])[0]
+    c = project(ZOOM, [(0, ts.AX, ts.LENS_BOTTOM_Z - 32)])[0]
     a, tip = math.radians(AZ), math.sin(math.radians(26))
     k = SIZE[1] / 2 / ZOOM["half_height"] * 44
     for d in ((math.sin(a), math.cos(a) * tip), (math.cos(a), -math.sin(a) * tip)):
@@ -331,6 +345,7 @@ def panel_center(ax):
 
 
 def panel_open(ax):
+    """Open the field stop: turn the ring back until the stop clears the field of view."""
     ring_arrow(ax, (True, False))
     inset_open(ax)
 
@@ -348,10 +363,17 @@ PANELS = [
 
 
 def main(out=HERE.parent):
+    """Render the five panels and save fig_koehler.pdf/.png.
+
+    Parameters
+    ----------
+    out : path-like, optional
+        Output directory; the figures folder by default.
+    """
     out = Path(out)
     plt.rcParams["font.family"] = "monospace"
     plt.rcParams["font.size"] = 8
-    fig, axes = plt.subplots(1, 5, figsize=(FULL_W, 2.0))
+    fig, axes = plt.subplots(1, 5, figsize=(FULL_W, 2.055))
     fig.subplots_adjust(left=0.004, right=0.996, top=0.917, bottom=0.007, wspace=0.05)
     cache = {}
     for ax, (name, title, hl, view, draw) in zip(axes, PANELS):
@@ -411,7 +433,7 @@ def main(out=HERE.parent):
             ls=(0, (3, 2)),
         )
     )
-    for ext, dpi in (("pdf", 450), ("png", 300)):
+    for ext, dpi in (("pdf", 300), ("png", 300)):
         # no creation date, so reruns give byte-identical PDFs
         meta = {"CreationDate": None} if ext == "pdf" else None
         fig.savefig(out / f"fig_koehler.{ext}", dpi=dpi, metadata=meta)

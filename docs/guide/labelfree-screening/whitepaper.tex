@@ -17,6 +17,9 @@
 \setlist{nosep,leftmargin=1.2em}
 \usepackage{fancyhdr}
 \usepackage[colorlinks=true,linkcolor=black,urlcolor=blue!60!black]{hyperref}
+% Reproducible build: no timestamps or random IDs in the PDF.
+\pdfinfoomitdate=1 \pdftrailerid{} \pdfsuppressptexinfo=-1
+\frenchspacing
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{4pt}
 \pagestyle{fancy}
@@ -37,12 +40,13 @@
 % shares its spare space evenly and gaps match above and below every block.
 % A rule is not a paragraph, so the gap above it carries the \parskip that
 % the paragraph below it gets for free.
-\newcommand{\blockgap}{\par\vspace{4pt plus 1fill}}
-\newcommand{\sectionrule}{\par\vspace{\dimexpr4pt+\parskip\relax plus 1fill}%
-{\color{boxframe}\hrule height 0.4pt}\vspace{4pt plus 1fill}}
+\newcommand{\blockgap}{\par\vspace{2pt plus 1fill}}
+\newcommand{\sectionrule}{\par\vspace{\dimexpr2pt+\parskip\relax plus 1fill}%
+{\color{boxframe}\hrule height 0.4pt}\vspace{2pt plus 1fill}}
 \newcommand{\mysection}[1]{\sectionrule\mysectiontop{#1}}
 
-% Failure-mode grid: equal horizontal and vertical gaps; the shorter column
+% Failure-mode grid, read down each column: two equal columns with equal horizontal and vertical
+% gaps, figures at their natural (print) size; the shorter column
 % is padded inside its last box so both columns end on the same line.
 % (The zero-height rule keeps the padding from being stripped at the box end.)
 \newlength{\fmgap}\setlength{\fmgap}{8pt}
@@ -128,7 +132,7 @@ The three settings that matter most are:
 \item \textbf{Z spacing and range.} At 20$\times$, start at 2 \textmu m
   spacing and cover the full cell height with visibly blurred features on either end of the stack (here, 7 slices = 12 \textmu m).
   Center the stack on the focus; otherwise set \texttt{z\_focus\_offset} to the offset in slices or to \texttt{auto}.
-  For different objectives, scale inversely with magnification: e.g.\, 4 \textmu m at 10$\times$, 1 \textmu m
+  For different objectives, scale inversely with magnification: e.g.\ 4 \textmu m at 10$\times$, 1 \textmu m
   at 40$\times$.
 \end{itemize}
 
@@ -144,7 +148,7 @@ Objective & 20$\times$, 0.55 NA, air ($n = 1$) & any objective works; match the 
 Condenser & 0.4 NA & $\approx$2/3 of detection NA, Koehler aligned \\
 Z stack & 7 slices, 2 \textmu m & confirm defocused features on top and bottom slices; use more slices for thicker samples \\
 Camera & 6.5 \textmu m pixels & 6.5 \textmu m / 20$\times$ = 0.325 \textmu m at the sample \\
-Wavelength & 450 nm & any wavelength is fine; ideally use a 10 nm notch filter \\
+Wavelength & 450 nm & any wavelength is fine; ideally use a 10 nm bandpass filter \\
 Exposure & a few ms & fill 1/2--2/3 of the dynamic range \\
 \bottomrule
 \end{tabular}
@@ -155,7 +159,7 @@ Exposure & a few ms & fill 1/2--2/3 of the dynamic range \\
 \noindent\begin{minipage}{\linewidth}
 \includegraphics[width=\linewidth]{figures/fig_koehler.pdf}
 \captionof{figure}{Realign the condenser after changing the objective or the sample.
-After focussing on the sample, \textcolor{kclose}{\textbf{close}} the field
+After focusing on the sample, \textcolor{kclose}{\textbf{close}} the field
 stop, \textcolor{kfocus}{\textbf{focus}} and
 \textcolor{kcenter}{\textbf{center}} the field stop edges, then
 \textcolor{kclose}{\textbf{open}} the field stop.}
@@ -164,7 +168,7 @@ stop, \textcolor{kfocus}{\textbf{focus}} and
 \newpage
 \mysectiontop{Reconstruction}
 
-\begin{minipage}[t]{0.55\linewidth}
+\begin{minipage}[t]{0.55\linewidth}\raggedright
 Convert to OME-Zarr with
 \href{https://github.com/czbiohub-sf/iohub}{iohub}
 (\texttt{iohub convert -i <dataset> -o data.zarr}), record the acquisition
@@ -183,7 +187,7 @@ waveorder view data.zarr/A/1/029029 \
 
 Dense structures (nucleoli, nuclear envelopes, cell margins) should appear
 brighter than background, as in \textbf{Figure~1}. \texttt{reconstruction\_dimension:~2} returns one
-phase image per defocus stack, the best choice for samples that are thin compared to the depth of field of the microscope. If the sample appears to blur all at once as you defocus, use 2. If different regions of the sample blur at different defocus positions, consider trialling 3.
+phase image per defocus stack, the best choice for samples that are thin compared to the depth of field of the microscope. If the sample appears to blur all at once as you defocus, use 2. If different regions of the sample blur at different defocus positions, consider trialing 3.
 \end{minipage}\hfill
 \begin{minipage}[t]{0.42\linewidth}
 \vspace{0pt}
@@ -195,41 +199,41 @@ phase image per defocus stack, the best choice for samples that are thin compare
 \end{minipage}
 
 \sectionrule
-\setlength{\fmwL}{\dimexpr0.566\linewidth-0.566\fmgap\relax}
-\setlength{\fmwR}{\dimexpr0.434\linewidth-0.434\fmgap\relax}
+\setlength{\fmwL}{\dimexpr0.5\linewidth-0.5\fmgap\relax}
+\setlength{\fmwR}{\fmwL}
 \newcommand{\fmleft}{\fmcolumn{\fmwL}{%
 {\small\textbf{Failure mode 1 \textbar{} Flipped z axis}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.69\linewidth]{figures/fig_flip.pdf}
+\includegraphics{figures/fig_flip.pdf}
 \par\vspace{2pt}\raggedright\small
 Stages disagree on the z sign convention---is the first slice above or below focus? If the convention is flipped, contrast
 will be inverted and downstream comparison will be challenging. Dense organelles should be
 bright. Fix: \texttt{invert\_phase\_contrast: true}. Check once per
 microscope by reconstructing one stack both ways.}{%
-{\small\textbf{Failure mode 3 \textbar{} Focus drift}}\par\vspace{2pt}
-\centering
-\includegraphics[width=0.69\linewidth]{figures/fig_focus.pdf}
-\par\vspace{2pt}\raggedright\small
-When the stack center (e.g. the 4th slice in a 7 slice stack) is not in focus, the reconstruction will be blurry.
-Setting \texttt{z\_focus\_offset:~auto} runs
-the search that can recover the defocus offset.
-\par\vskip\fmpadL\hrule height 0pt}}
-\newcommand{\fmright}{\fmcolumn{\fmwR}{%
 {\small\textbf{Failure mode 2 \textbar{} Incorrect regularization}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.69\linewidth]{figures/fig_reg.pdf}
+\includegraphics{figures/fig_reg.pdf}
 \par\vspace{2pt}\raggedright\small
 \texttt{regularization\_strength} balances noise and resolution and varies by
 orders of magnitude across samples and exposures. Sweep decades on one
 position and choose manually. Too small
 amplifies blotchy low-frequency noise; too large leaves a washed-out image. The optimum is usually within a decade of
-\texttt{1e-3}.}{%
+\texttt{1e-3}.
+\par\vskip\fmpadL\hrule height 0pt}}
+\newcommand{\fmright}{\fmcolumn{\fmwR}{%
+{\small\textbf{Failure mode 3 \textbar{} Focus drift}}\par\vspace{2pt}
+\centering
+\includegraphics{figures/fig_focus.pdf}
+\par\vspace{2pt}\raggedright\small
+When the stack center (e.g.\ the 4th slice in a 7-slice stack) is not in focus, the reconstruction will be blurry.
+Setting \texttt{z\_focus\_offset:~auto} runs
+the search that can recover the defocus offset.}{%
 {\small\textbf{Failure mode 4 \textbar{} Tilted illumination at the well edge}}\par\vspace{2pt}
 \centering
-\includegraphics[width=0.69\linewidth]{figures/fig_tilt.pdf}
+\includegraphics{figures/fig_tilt.pdf}
 \par\vspace{2pt}\raggedright\small
-Misaligned Koehler and imaging near a well-edge meniscus tilts the illumination, making cells look shadow-cast
-with reduced contrast. Fit the tilt by gradient descent in the same config:
+Misaligned Koehler and imaging near a well-edge meniscus tilt the illumination, making cells look shadow-cast
+with reduced contrast. Fit the tilt by gradient descent in the same config (tilt keys go under \texttt{transfer\_function}):
 {\footnotesize\UseVerbatim{tiltcfg}}
 \par\vskip\fmpadR\hrule height 0pt}}
 \sbox{\fmcolL}{\fmleft}\sbox{\fmcolR}{\fmright}
@@ -243,10 +247,11 @@ with reduced contrast. Fit the tilt by gradient descent in the same config:
 A single config file should generate good reconstructions across a screen. We suggest parallelizing
 \texttt{waveorder reconstruct} over positions (one process or cluster job
 per position) with \texttt{device:~cuda:0} to reconstruct on a GPU. We recommend
-\texttt{z\_focus\_offset:~auto} to find the focus of each position.
+\texttt{z\_focus\_offset:~auto} to find the focus of each position. Give each job its own copy of the config and
+its own output store; jobs that share them overwrite each other's saved settings and transfer function.
 
 We recommend manual supervision
-to set up the optimized \texttt{tilt\_angle\_\{zenith,azimuth\}} parameters across entire wells. We find that initializing these tilt parameters at good initial tilts generates the stablest reconstructions, so we recommend inspecting
+to set up the optimized \texttt{tilt\_angle\_\{zenith,azimuth\}} parameters across entire wells. We find that initializing these tilt parameters at good initial tilts gives the most stable reconstructions, so we recommend inspecting
 reconstructions at the well edges, then refining the initial values until you reach stable reconstructions that pass QC.
 
 \mysection{References}
