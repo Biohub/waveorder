@@ -32,8 +32,10 @@ The three settings that matter most are:
   resolution.
 - **Z spacing and range.** At 20x, start at 2 µm spacing and cover the full
   cell height with visibly blurred features on either end of the stack
-  (here, 7 slices = 12 µm). For different objectives, scale inversely with
-  magnification: e.g. 4 µm at 10x, 1 µm at 40x.
+  (here, 7 slices = 12 µm). Center the stack on the focus; otherwise set
+  `z_focus_offset` to the offset in slices or to `auto`. For different
+  objectives, scale inversely with magnification: e.g. 4 µm at 10x, 1 µm at
+  40x.
 
 | Parameter | Perturbation atlas value | Notes |
 | --- | --- | --- |
@@ -118,7 +120,7 @@ waveorder view phase_*.zarr/A/1/029029
 
 ![Regularization sweep](./figures/fig_reg.png)
 
-**Failure mode 3 | Autofocus drift.** When the stack center (e.g. the 4th
+**Failure mode 3 | Focus drift.** When the stack center (e.g. the 4th
 slice in a 7 slice stack) is not in focus, the reconstruction will be
 blurry. Setting `z_focus_offset: auto` runs the search that can recover the
 defocus offset:
