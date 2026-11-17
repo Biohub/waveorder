@@ -717,22 +717,15 @@ class CalibrationAdvanced(V4BaseModel):
         default_factory=dict, description="gradient step size per quantity path under imaging_system"
     )
     convergence_tol: FiniteFloat | None = Field(default=None, description="3.x nelder_mead tolerance")
-    convergence_patience: Count | None = Field(default=None, description="wo-4.0's; accepted and not executed")
-    use_gradients: bool | None = Field(default=None, description="wo-4.0's; accepted and not executed")
+    convergence_patience: Count | None = Field(
+        default=None, description="wo-4.0's early-stop patience; accepted and not executed"
+    )
+    use_gradients: bool | None = Field(
+        default=None, description="wo-4.0's; false under a gradient optimizer keeps the free values at nominal"
+    )
     grid_points: Count | None = Field(default=None, description="3.x grid_search points")
     loss: dict[str, Any] | None = Field(default=None, description="3.x sharpness loss: type and parameters")
     log_dir: str | None = Field(default=None, description="wo-4.0's TensorBoard folder; accepted and not written")
-
-    @model_validator(mode="after")
-    def _warn_ignored(self) -> Self:
-        for name in ("convergence_patience", "use_gradients", "log_dir"):
-            if getattr(self, name) is not None:
-                no_effect(
-                    f"solver.calibration.advanced.{name}",
-                    getattr(self, name),
-                    "this version of WaveOrder does not execute it; remove it",
-                )
-        return self
 
 
 def _default_search() -> list[SearchStageSettings]:
@@ -890,6 +883,7 @@ class V4Config(V4BaseModel):
         calibration = self.solver.calibration
         _warn_unexecuted(self)
         _check_scores(self)
+        _check_advanced(self)
         if calibration is None or not free:
             return self
         if calibration.score == "sharpness" and self.object.weight == "auto":
@@ -899,6 +893,85 @@ class V4Config(V4BaseModel):
         for index, stage in enumerate(calibration.search):
             _check_stage(stage, field=f"solver.calibration.search.{index}", free=quantities)
         return self
+
+
+GRADIENT_OPTIMIZERS = ("adam", "nadam", "lbfgs")
+"""The 3.x optimizers that step along the gradient, and read ``use_gradients`` and the early stop."""
+
+
+def wo_rec_optimizer(config: V4Config) -> str | None:
+    """Return the 3.x optimizer wo-4.0's ``wo rec`` ran for ``config``'s calibration, or ``None``.
+
+    That is ``advanced.optimizer`` under score sharpness with one gradient stage, for a shift-invariant system whose
+    free quantities all have ``tolerance: free`` and none is a pupil aberration (wo-4.0's ``calibrate-tf`` recovered
+    those, reading the optimizer and not the other 3.x settings). wo-4.0 refused every other sharpness calibration.
+    """
+    calibration = config.solver.calibration
+    if calibration is None or not calibration.optimizer_drives or calibration.budget is None:
+        return None
+    if isinstance(config.imaging_system.field_dependence, FieldDependenceTiled):
+        return None
+    free = free_parameter_specs(config.imaging_system)
+    if not free or any(path.startswith("detection.pupil_aberrations") for path in free):
+        return None
+    if any(spec.tolerance != "free" for spec in free.values()):
+        return None
+    assert calibration.advanced is not None
+    return calibration.advanced.optimizer
+
+
+def frozen(config: V4Config) -> bool:
+    """Whether wo-4.0 took no optimizer step: ``use_gradients: false`` under a gradient optimizer of ``wo rec``."""
+    calibration = config.solver.calibration
+    advanced = None if calibration is None else calibration.advanced
+    return advanced is not None and advanced.use_gradients is False and wo_rec_optimizer(config) in GRADIENT_OPTIMIZERS
+
+
+def _check_advanced(config: V4Config) -> None:
+    """Warn of each 3.x setting of ``solver.calibration.advanced`` this version does not run, with what wo-4.0 did."""
+    calibration = config.solver.calibration
+    advanced = None if calibration is None else calibration.advanced
+    if advanced is None:
+        return
+    at = "solver.calibration.advanced"
+    method = wo_rec_optimizer(config)
+    stepped = method in GRADIENT_OPTIMIZERS
+    unread = (
+        "wo-4.0 read it only in wo rec's 3.x optimizer (advanced.optimizer under score sharpness with one gradient "
+        "stage, free values with tolerance: free and no pupil aberration), which this calibration is not; remove it"
+    )
+    if method == "lbfgs":
+        warnings.warn(
+            ConfigurationWarning(
+                "lbfgs here is one L-BFGS run with a strong-Wolfe line search inside the bounds (history 10, best "
+                "point kept); wo-4.0 took L-BFGS steps of length 1 without a line search or bounds (history 100, last "
+                "point kept), so the values found differ; wo config migrate writes this stage and says so",
+                field=f"{at}.optimizer",
+            ),
+            stacklevel=3,
+        )
+    patience = advanced.convergence_patience
+    if patience is not None:
+        stops = stepped and advanced.convergence_tol is not None
+        reason = f"wo-4.0's {method} stopped after this many steps without an improvement of convergence_tol"
+        stated = f"{reason}; this version runs every step; remove it"
+        no_effect(f"{at}.convergence_patience", patience, stated if stops else unread)
+    gradients = advanced.use_gradients
+    if gradients is False and stepped:
+        warnings.warn(
+            ConfigurationWarning(
+                f"is false: wo-4.0's {method} then took no step, so the free quantities stay at their nominal values "
+                "and the calibration does not run; remove it to calibrate",
+                field=f"{at}.use_gradients",
+            ),
+            stacklevel=3,
+        )
+    elif gradients is not None:
+        what = f"{method} takes {'gradient steps' if stepped else 'no gradient'} either way, in wo-4.0 too; remove it"
+        no_effect(f"{at}.use_gradients", gradients, unread if method is None else what)
+    if advanced.log_dir is not None:
+        wrote = "wo-4.0 wrote TensorBoard logs there, and this version writes none; remove it"
+        no_effect(f"{at}.log_dir", advanced.log_dir, unread if method is None else wrote)
 
 
 def _warn_unexecuted(config: V4Config) -> None:

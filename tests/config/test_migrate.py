@@ -8,7 +8,7 @@ import yaml
 
 from waveorder.config import load
 from waveorder.config.migrate import _BLOCK_KEYS, TABLE, migrate, render, table_help
-from waveorder.config.schema import ReconstructionRichardsonLucy
+from waveorder.config.schema import FreeParameter, ReconstructionRichardsonLucy
 from waveorder.errors import ConfigurationWarning
 from waveorder.models import ReconstructionModel
 
@@ -314,9 +314,9 @@ def test_learning_rate_frees_a_value():
     assert config["imaging_system"]["illumination"]["numerical_aperture"] == {
         "nominal": 0.8,
         "tolerance": "free",
-        "bounds": [0.01, 1.3],
+        "bounds": [0.02, 1.3],  # within a factor of 100: searched linearly, an Adam step in aperture units as in 3.x
     }
-    assert any("gets bounds [0.01, 1.3]" in note for note in result.notes)
+    assert any("gets bounds [0.02, 1.3]" in note for note in result.notes)
     assert config["solver"]["calibration"] == {
         "score": "sharpness",
         "search": [{"gradient": {"max_iter": 10, "optimizer": "adam"}}],
@@ -338,14 +338,14 @@ def free_thin_phase(**apertures: object) -> dict:
 @pytest.mark.parametrize(
     ("apertures", "bounds"),
     [
-        ({"numerical_aperture_illumination": {"init": 0.4, "lr": 0.01}}, {"illumination": [0.01, 0.55]}),
+        ({"numerical_aperture_illumination": {"init": 0.4, "lr": 0.01}}, {"illumination": [0.02, 0.55]}),
         ({"numerical_aperture_detection": {"init": 0.5, "lr": 0.01}}, {"detection": [0.4, 1.0]}),
         (
             {
                 "numerical_aperture_illumination": {"init": 0.4, "lr": 0.01},
                 "numerical_aperture_detection": {"init": 0.55, "lr": 0.01},
             },
-            {"detection": [0.475, 1.0], "illumination": [0.01, 0.475]},
+            {"detection": [0.475, 1.0], "illumination": [0.02, 0.475]},
         ),
     ],
     ids=["illumination", "detection", "both"],
@@ -360,7 +360,7 @@ def test_preview_free_2d_phase_aperture_is_bounded_by_the_detection():
     raw["object"]["dimension"] = 2
     raw["imaging_system"]["detection"]["numerical_aperture"] = 0.95
     aperture = converted(raw).config["imaging_system"]["illumination"]["numerical_aperture"]
-    assert aperture["bounds"] == [0.01, 0.95]
+    assert aperture["bounds"] == [0.02, 0.95]
 
 
 def test_zero_learning_rate_is_a_plain_number():
@@ -640,6 +640,21 @@ def test_a_592_setting_check_warns_of_is_migrated_with_a_note_into_the_search_ch
     loaded, migrated, notes = _loaded_and_migrated(raw)
     assert any(note.startswith((f"{key}: ", f"{key} dropped")) for note in notes), notes
     assert migrated == loaded
+
+
+def test_a_592_grid_search_spans_wo_40s_grid_and_a_calibration_without_an_optimizer_takes_its_10_steps():
+    raw = preview()
+    raw["imaging_system"]["illumination"]["numerical_aperture"]["bounds"] = [0.5, 1.2]  # wo-4.0's wo rec read none
+    raw["solver"]["calibration"]["advanced"] |= {"optimizer": "grid_search", "grid_points": 5}
+    with pytest.warns(ConfigurationWarning):
+        direct = load(copy.deepcopy(raw)).imaging_system.illumination.numerical_aperture
+    aperture = converted(raw).config["imaging_system"]["illumination"]["numerical_aperture"]
+    assert isinstance(direct, FreeParameter)
+    assert direct.bounds == tuple(aperture["bounds"]) == (0.88, 0.92)  # 5 points 0.01 apart around 0.9, as wo-4.0
+    raw = preview()
+    del raw["solver"]["calibration"]["advanced"]["optimizer"]
+    raw["solver"]["calibration"]["search"] = [{"gradient": {"max_iter": 50}}]
+    assert converted(raw).config["solver"]["calibration"]["search"] == [{"gradient": {"max_iter": 10}}]
 
 
 # --- the table ---------------------------------------------------------------------------------------------------

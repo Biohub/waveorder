@@ -451,10 +451,21 @@ def test_wo_40_optimizer_beside_a_search_it_does_not_read_warns_at_what_has_no_e
 def test_name_keyed_settings_reach_the_stages_under_the_parameter_names():
     path = "detection.numerical_aperture"
     grid, gradient = _stages(
-        search=[{"grid": {"points": {path: 3}}}, "gradient"], advanced={"learning_rates": {path: 0.1}}
+        score="sharpness",
+        search=[{"grid": {"points": {path: 3}}}, "gradient"],
+        advanced={"learning_rates": {path: 0.1}},
     )
     assert grid[1]["points"] == {NA: 3}
     assert gradient[1]["learning_rates"] == {NA: 0.1}
+
+
+def test_learning_rates_under_a_likelihood_are_warned_and_not_applied_as_in_wo_40():
+    # wo-4.0's calibrate-tf ran Adam at lr 0.01 under evidence and gcv, whatever advanced.learning_rates said.
+    raw = _free(solver={"calibration": {"advanced": {"learning_rates": {"detection.numerical_aperture": 0.1}}}})
+    assert list(_no_effect(raw)) == ["solver.calibration.advanced.learning_rates"]
+    with pytest.warns(ConfigurationWarning):
+        ((_, gradient),) = [_spec(stage) for stage in _parts(raw)["search"]]
+    assert gradient["learning_rates"] == {NA: 0.01}
 
 
 @pytest.mark.parametrize(
@@ -466,7 +477,7 @@ def test_name_keyed_settings_reach_the_stages_under_the_parameter_names():
             "write 'detection.pupil_aberrations.spherical'",
         ),
         (
-            {"advanced": {"learning_rates": {"detection.numerical_apertur": 0.1}}},
+            {"score": "sharpness", "advanced": {"learning_rates": {"detection.numerical_apertur": 0.1}}},
             "solver.calibration.advanced.learning_rates.detection.numerical_apertur",
             "the free quantities are",
         ),
@@ -605,6 +616,17 @@ def test_a_rule_based_weight_is_swept_after_a_sharpness_calibration_and_refused_
     assert (gradient, sweep) == ("gradient", "weight_sweep")
     assert given["learning_rates"] == {NA: 0.01}  # the weight is not descended: the model holds it until the sweep
     assert free_specs(parts["object_prior"])["weight"].nominal == 1e-3
+
+
+def test_use_gradients_false_under_a_wo_40_gradient_optimizer_keeps_the_nominal_values():
+    advanced = {"optimizer": "adam", "use_gradients": False}
+    raw = _free(solver={"calibration": {"score": "sharpness", "advanced": advanced}})
+    raw["imaging_system"]["detection"]["numerical_aperture"] = FREE_NA | {"tolerance": "free"}  # as wo rec took it
+    assert list(_no_effect(raw)) == ["solver.calibration.advanced.use_gradients"]
+    with pytest.warns(ConfigurationWarning):
+        parts = _parts(raw)
+    assert (free_specs(parts["system"]), parts["search"]) == ({}, None)
+    assert float(parts["system"].get_buffer("detection.numerical_aperture")) == pytest.approx(FREE_NA["nominal"])
 
 
 def test_a_bead_calibration_with_an_estimated_sigma_runs_one_gradient_search():

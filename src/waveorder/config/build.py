@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from waveorder import registry
 from waveorder.config.schema import (
+    GRADIENT_OPTIMIZERS,
     CalibrationAdvanced,
     DarkFrames,
     DetectionSettings,
@@ -36,9 +37,11 @@ from waveorder.config.schema import (
     V4Config,
     WeightAuto,
     free_parameter_specs,
+    frozen,
     no_effect,
     nominal_of,
     parameter_name,
+    wo_rec_optimizer,
 )
 from waveorder.errors import (
     ConfigurationError,
@@ -96,6 +99,8 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
         At a setting the schema takes and no part runs yet, with the reason.
     """
     thin = _expect_run(config)
+    if frozen(config):  # wo-4.0 took no optimizer step: the free quantities stay at their nominal values
+        config = config.model_copy(update={"imaging_system": _at_nominal(config.imaging_system)})
     system = _system(config)
     written = config.model_fields_set
     object_written = {"prior", "weight", "constraints"} & config.object.model_fields_set
@@ -186,6 +191,18 @@ def _quantity(value: object, *, at: str) -> object:
         return Free(value.nominal, tolerance=tolerance, bounds=value.bounds)
     except ParameterError as error:
         raise ConfigurationError(f"{at}.{error.path}" if error.path else at, str(error)) from error
+
+
+def _at_nominal[M: BaseModel](node: M) -> M:
+    """Return ``node`` with every ``{nominal, tolerance, bounds}`` under it replaced by its nominal value."""
+    changed: dict[str, object] = {}
+    for name in type(node).model_fields:
+        value = getattr(node, name)
+        if isinstance(value, FreeParameter):
+            changed[name] = value.nominal
+        elif isinstance(value, BaseModel) and (held := _at_nominal(value)) is not value:
+            changed[name] = held
+    return node.model_copy(update=changed) if changed else node
 
 
 def _unread(settings: object, default: object, *, at: str, by: str) -> None:
@@ -555,15 +572,34 @@ def _search(config: V4Config, *, profile: tuple[str, ...], free: list[str]) -> t
     advanced = calibration.advanced or CalibrationAdvanced()
     at = "solver.calibration.advanced"
     rate_at = f"{at}.learning_rates"
-    configured = _keyed(advanced.learning_rates, at=rate_at, config=config)
+    if calibration.score == "sharpness":
+        configured = _keyed(advanced.learning_rates, at=rate_at, config=config)
+    else:
+        configured = {}
+        if advanced.learning_rates:
+            no_effect(
+                rate_at,
+                dict(advanced.learning_rates),
+                f"wo-4.0's calibrate-tf did not read it under score {calibration.score} (Adam at lr 0.01 for every "
+                "quantity), and the gradient stages here take that step of 0.01 too; remove it",
+            )
     assert isinstance(configured, Mapping)
     rates = dict.fromkeys(free, _STEP) | dict(configured)
     drives = calibration.optimizer_drives
+    method = wo_rec_optimizer(config)
     reads = {"nelder_mead": "convergence_tol", "grid_search": "grid_points"}
     for name in ("convergence_tol", "grid_points"):
         value = getattr(advanced, name)
-        if value is not None and not (drives and reads.get(advanced.optimizer or "") == name):
-            no_effect(f"{at}.{name}", value, "no stage of this calibration reads it, nor did wo-4.0; remove it")
+        if value is None or (drives and reads.get(advanced.optimizer or "") == name):
+            continue
+        if name == "convergence_tol" and method in GRADIENT_OPTIMIZERS:
+            reason = (
+                f"wo-4.0's {method} stopped early once the loss had not improved by it for convergence_patience "
+                "steps (5 by default); this version runs every step; remove it"
+            )
+        else:
+            reason = "no stage of this calibration reads it, nor did wo-4.0; remove it"
+        no_effect(f"{at}.{name}", value, reason)
     if drives:
         return (_optimizer_stage(advanced, rates, iterations=calibration.budget),)
     grid = None

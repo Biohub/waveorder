@@ -724,7 +724,9 @@ def _translate(migration: _Migration) -> dict[str, Any] | None:
     system = _imaging_system(migration)
     inverse = _inverse(migration)
     calibration = _calibration(migration)
-    _bound_apertures(migration, system, thin=_value(migration, "reconstruction_dimension") == 2)
+    _bound_apertures(
+        migration, system, thin=_value(migration, "reconstruction_dimension") == 2, low=_LINEAR_LOW_APERTURE
+    )
     _bound_zenith(migration, system)
     if inverse is None or migration.rejections:
         return None
@@ -778,7 +780,7 @@ def _from_preview(migration: _Migration) -> MigrationResult:
     if isinstance(solver, dict):
         _preview_solver(migration, solver, system if isinstance(system, dict) else {})
     if isinstance(system, dict):
-        _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2)
+        _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2, low=_LINEAR_LOW_APERTURE)
         _bound_zenith(migration, system)
     return migration.result("592", config)
 
@@ -825,8 +827,16 @@ def _has_free(node: object) -> bool:
     return isinstance(node, list) and any(_has_free(value) for value in node)
 
 
-def _bound_apertures(migration: _Migration, system: dict[str, Any], *, thin: bool) -> None:
-    """Give a free numerical aperture without bounds the range its system takes.
+_LOW_APERTURE = 0.01
+"""The lower bound a free aperture without bounds gets in a 4.x configuration."""
+
+_LINEAR_LOW_APERTURE = 0.02
+"""The lower bound it gets from 3.x or wo-4.0: within a factor of 100 of the index, so the span is searched linearly
+and an Adam step stays in aperture units, as 3.x and wo-4.0 took it (a wider span is searched in log space)."""
+
+
+def _bound_apertures(migration: _Migration, system: dict[str, Any], *, thin: bool, low: float) -> None:
+    """Give a free numerical aperture without bounds the range its system takes, from ``low``.
 
     3.x optimized apertures without bounds; 4.x requires a positive range up to ``index_of_refraction_media``. A 2D
     phase system also needs the illumination aperture at most the detection aperture: a free one is bounded by the
@@ -838,19 +848,21 @@ def _bound_apertures(migration: _Migration, system: dict[str, Any], *, thin: boo
         parameter = _lookup(system, path)
         if not isinstance(parameter, dict) or "nominal" not in parameter or parameter.get("bounds") is not None:
             continue
-        bounds = [0.01, index]
+        bounds = [low, index]
         split = _split(parameter["nominal"], _lookup(system, other), detection=path == _APERTURES[0]) if pair else None
         if split is not None:
             bounds[path == _APERTURES[1]] = split
-            low, high = bounds
-            if not low < high or not low <= parameter["nominal"] <= high:
-                bounds, split = [0.01, index], None  # the apertures conflict at their starts, which the system refuses
+            low_bound, high = bounds
+            if not low_bound < high or not low_bound <= parameter["nominal"] <= high:
+                bounds, split = [low, index], None  # the apertures conflict at their starts, which the system refuses
         parameter["bounds"] = bounds
         reason = (
-            "0.01 to the index of refraction"
+            f"{low} to the index of refraction"
             if split is None
             else f"a 2D phase system keeps the illumination aperture at most the detection aperture, split at {split}"
         )
+        if low == _LINEAR_LOW_APERTURE and bounds[0] == low:
+            reason += ", within a factor of 100 so a gradient step stays in aperture units, as 3.x and wo-4.0 stepped"
         migration.note(
             f"imaging_system.{path} is free without bounds; 4.x needs a positive range, so it gets bounds {bounds} "
             f"({reason})"
@@ -903,20 +915,158 @@ def _bound_zenith(migration: _Migration, system: dict[str, Any]) -> None:
     )
 
 
-def bounded(raw: Mapping[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+def bounded(raw: Mapping[str, Any], *, wo40: bool = False) -> tuple[dict[str, Any], tuple[str, ...]]:
     """Return ``raw`` with the range a migration gives each free aperture and tilt zenith written without bounds.
 
     wo-4.0 took these unbounded, and 4.x needs a range, so :func:`waveorder.config.load` reads such a configuration
-    with the range :func:`migrate` writes. Returns the copy and one note per range, each ``imaging_system.<path> ...``.
+    with the range :func:`migrate` writes: for a file in wo-4.0's spelling (``wo40``), the one that keeps wo-4.0's
+    steps. A wo-4.0 ``advanced.optimizer: grid_search`` gets wo-4.0's grid span as bounds. Returns the copy and one
+    note per range, each ``imaging_system.<path> ...``.
     """
     config = copy.deepcopy(dict(raw))
     system = config.get("imaging_system")
     migration = _Migration(raw)
     if isinstance(system, dict):
         migration.reach = _reach(config)
-        _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2)
+        _grid_span(migration, config)
+        low = _LINEAR_LOW_APERTURE if wo40 else _LOW_APERTURE
+        _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2, low=low)
         _bound_zenith(migration, system)
     return config, tuple(migration.notes)
+
+
+def wo40_differences(raw: Mapping[str, Any]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return what 4.x reads differently in the wo-4.0 file ``raw`` and ``wo config migrate`` writes as wo-4.0 ran it.
+
+    Returns the defaults that differ, named for the file-level warning, and one note per located difference, each
+    ``<path> <message>``.
+    """
+    defaults = []
+    detection = _lookup(raw, "imaging_system.detection")
+    if not isinstance(detection, Mapping) or "edge" not in detection:
+        defaults.append("detection.edge: sigmoid")
+    offset = detection.get("z_focus_offset", 0) if isinstance(detection, Mapping) else 0
+    if _lookup(raw, "object.dimension") in (3, _MISSING) and offset != 0:
+        defaults.append("a 3D z_focus_offset read as 0")
+    rl = _lookup(raw, "solver.reconstruction.richardson_lucy")
+    if isinstance(rl, Mapping) and "start" not in rl:
+        defaults.append("Richardson-Lucy started from ones")
+    notes = []
+    if _wo_rec_steps(raw) is not None:
+        search = _lookup(raw, "solver.calibration.search")
+        at = "solver.calibration.search" if search is _MISSING else "solver.calibration.search.0.gradient"
+        notes.append(
+            f"{at} wo-4.0's wo rec ran 10 adam steps for a sharpness calibration without advanced.optimizer, "
+            f"whatever max_iter said; this runs the gradient stage's max_iter ({_wo_rec_steps(raw)}); wo config "
+            "migrate writes max_iter: 10"
+        )
+    return tuple(defaults), tuple(notes)
+
+
+_WO_REC_STEPS = 10
+"""The adam steps wo-4.0's ``wo rec`` took without ``advanced.optimizer`` (3.x ``OptimizationSettings()``)."""
+
+
+def _wo_rec_steps(config: Mapping[str, Any]) -> int | None:
+    """Return the max_iter 4.x runs where wo-4.0's wo rec ran its default 10 adam steps instead; ``None`` elsewhere."""
+    calibration = _lookup(config, "solver.calibration")
+    advanced = calibration.get("advanced") if isinstance(calibration, Mapping) else None
+    if (isinstance(advanced, Mapping) and advanced.get("optimizer") is not None) or not _wo_rec_free(config):
+        return None
+    search = calibration.get("search", _MISSING) if isinstance(calibration, Mapping) else None
+    if search is _MISSING:
+        return _GRADIENT_STEPS
+    stage = search[0] if isinstance(search, list) and len(search) == 1 else None
+    gradient = stage.get("gradient") if isinstance(stage, Mapping) else None
+    if not isinstance(gradient, Mapping):
+        return None  # wo-4.0's wo rec refused any other search
+    steps = gradient.get("max_iter", _GRADIENT_STEPS)
+    return None if steps == _WO_REC_STEPS else steps
+
+
+def _free_values(node: object, prefix: str = "") -> dict[str, dict[str, Any]]:
+    """Return each free value under ``node``, a mapping with a ``tolerance``, by its dotted path."""
+    if not isinstance(node, dict):
+        return {}
+    if "tolerance" in node:
+        return {prefix: node}
+    found: dict[str, dict[str, Any]] = {}
+    for key, value in node.items():
+        found |= _free_values(value, f"{prefix}.{key}" if prefix else str(key))
+    return found
+
+
+def _wo_rec_free(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the free values wo-4.0's ``wo rec`` calibrated with the 3.x optimizer, by path under imaging_system.
+
+    That is a sharpness calibration with one gradient stage of a shift-invariant system whose free values all have
+    ``tolerance: free`` and none is a pupil aberration (wo-4.0's ``calibrate-tf`` recovered those); none otherwise,
+    as wo-4.0 refused the rest.
+    """
+    calibration = _lookup(config, "solver.calibration")
+    if not isinstance(calibration, Mapping) or calibration.get("score", "evidence") != "sharpness":
+        return {}
+    search = calibration.get("search", [{"gradient": {}}])
+    stage = search[0] if isinstance(search, list) and len(search) == 1 else None
+    if not (isinstance(stage, Mapping) and "gradient" in stage):
+        return {}
+    if _lookup(config, "imaging_system.field_dependence") not in (_MISSING, "shift_invariant"):
+        return {}
+    free = _free_values(config.get("imaging_system"))
+    pupil = any(path.startswith("detection.pupil_aberrations") for path in free)
+    if pupil or any(value["tolerance"] != "free" for value in free.values()):
+        return {}
+    return free
+
+
+def _grid_span(migration: _Migration, config: dict[str, Any]) -> None:
+    """Bound each value a wo-4.0 ``grid_search`` calibrates by the grid wo-4.0 searched.
+
+    wo-4.0 centred ``grid_points`` values on each nominal, its learning rate apart (0.01 by default), and read no
+    bounds; 4.x grids over the bounds.
+    """
+    advanced = _lookup(config, _PREVIEW_ADVANCED)
+    if not isinstance(advanced, Mapping) or advanced.get("optimizer") != "grid_search":
+        return
+    rates = advanced.get("learning_rates") or {}
+    points = advanced.get("grid_points") or _OPTIMIZER_DEFAULTS["grid_points"]
+    if not isinstance(points, int) or points < 2:
+        return  # validation names grid_points
+    for path, parameter in _wo_rec_free(config).items():
+        nominal, rate = parameter.get("nominal"), rates.get(path, 0.01)
+        if not all(isinstance(value, int | float) for value in (nominal, rate)) or rate <= 0:
+            continue  # validation names the setting that is not a positive number
+        half = points // 2 * rate
+        bounds = [round(nominal - half, 9), round(nominal + half, 9)]
+        if parameter.get("bounds") != bounds:
+            parameter["bounds"] = bounds
+            migration.note(
+                f"imaging_system.{path} gets bounds {bounds}: wo-4.0's grid_search spanned {points} points "
+                f"{rate} apart around its nominal, and read no bounds"
+            )
+
+
+def _hold_nominal(migration: _Migration, solver: dict[str, Any], system: dict[str, Any]) -> bool:
+    """Write each free value at its nominal and drop the calibration where wo-4.0's optimizer took no step."""
+    advanced = _lookup(solver, "calibration.advanced")
+    config = {"solver": solver, "imaging_system": system}
+    free = _wo_rec_free(config)
+    if not isinstance(advanced, Mapping) or advanced.get("use_gradients") is not False or not free:
+        return False
+    if advanced.get("optimizer") not in ("adam", "nadam", "lbfgs"):
+        return False
+    for path, parameter in free.items():
+        parent, _, key = path.rpartition(".")
+        holder = _lookup(system, parent) if parent else system
+        assert isinstance(holder, dict)
+        holder[key] = parameter.get("nominal", 0.0)
+    del solver["calibration"]
+    migration.note(
+        f"{_PREVIEW_ADVANCED}.use_gradients: false: wo-4.0's {advanced['optimizer']} took no step with it, so "
+        f"{', '.join(f'imaging_system.{path}' for path in free)} are written at their nominal values and "
+        "solver.calibration is dropped"
+    )
+    return True
 
 
 def _reach(config: Mapping[str, Any]) -> dict[str, float]:
@@ -938,7 +1088,7 @@ def _reach(config: Mapping[str, Any]) -> dict[str, float]:
 _PREVIEW_ADVANCED = "solver.calibration.advanced"
 
 
-def _preview_solver(migration: _Migration, solver: dict[str, Any], system: Mapping[str, Any]) -> None:
+def _preview_solver(migration: _Migration, solver: dict[str, Any], system: dict[str, Any]) -> None:
     """Upgrade the #592 ``solver`` block: Richardson-Lucy's 3.x fields, and the 3.x optimizer settings."""
     reconstruction = solver.get("reconstruction")
     rl = reconstruction.get("richardson_lucy") if isinstance(reconstruction, Mapping) else None
@@ -949,16 +1099,54 @@ def _preview_solver(migration: _Migration, solver: dict[str, Any], system: Mappi
             rl["start"] = "ones"
             migration.note(_START_NOTE)
     calibration = solver.get("calibration")
-    advanced = calibration.get("advanced") if isinstance(calibration, dict) else None
-    if not isinstance(calibration, dict) or not isinstance(advanced, dict):
+    if not isinstance(calibration, dict):
         return
-    for path, rate in (advanced.get("learning_rates") or {}).items():
-        parameter = _lookup(system, path)
-        if isinstance(parameter, dict) and "nominal" in parameter:
-            migration.free[path] = (parameter["nominal"], rate, parameter)
-    migration.reach = _reach({"solver": solver})  # the bounds wo config check gives, whichever stage runs
-    method = advanced.pop("optimizer", None)
+    _wo_rec_budget(migration, calibration, {"solver": solver, "imaging_system": system})
+    advanced = calibration.get("advanced")
+    if isinstance(advanced, dict) and not _hold_nominal(migration, solver, system):
+        _preview_advanced(migration, solver, system=system, advanced=advanced)
+        if not advanced:
+            del calibration["advanced"]
+
+
+def _wo_rec_budget(migration: _Migration, calibration: dict[str, Any], config: Mapping[str, Any]) -> None:
+    """Write the 10 adam steps wo-4.0's ``wo rec`` took without ``advanced.optimizer``, whatever max_iter said."""
+    steps = _wo_rec_steps(config)
+    if steps is None:
+        return
+    search = calibration.get("search")
+    if isinstance(search, list):
+        search[0]["gradient"]["max_iter"] = _WO_REC_STEPS
+    else:
+        calibration["search"] = [{"gradient": {"max_iter": _WO_REC_STEPS}}]
+    migration.note(
+        f"solver.calibration.search: max_iter {steps} written as {_WO_REC_STEPS}: without advanced.optimizer "
+        f"wo-4.0's wo rec ran {_WO_REC_STEPS} adam steps, whatever max_iter said"
+    )
+
+
+def _preview_advanced(
+    migration: _Migration, solver: dict[str, Any], *, system: dict[str, Any], advanced: dict[str, Any]
+) -> None:
+    """Translate #592's ``solver.calibration.advanced``: the 3.x optimizer and the settings wo-4.0 read beside it."""
+    calibration = solver["calibration"]
+    method = advanced.get("optimizer")
     score = calibration.get("score", "evidence")
+    if score != "sharpness" and advanced.get("learning_rates"):
+        migration.note(
+            f"{_PREVIEW_ADVANCED}.learning_rates dropped: wo-4.0's calibrate-tf did not read it under score {score} "
+            "(Adam at lr 0.01 for every quantity, the step 4.x takes without it)"
+        )
+        del advanced["learning_rates"]
+    if method == "grid_search":
+        _grid_span(migration, {"solver": solver, "imaging_system": system})
+    else:
+        for path, rate in (advanced.get("learning_rates") or {}).items():
+            parameter = _lookup(system, path)
+            if isinstance(parameter, dict) and "nominal" in parameter:
+                migration.free[path] = (parameter["nominal"], rate, parameter)
+    migration.reach = _reach({"solver": solver})  # the bounds wo config check gives, whichever stage runs
+    advanced.pop("optimizer", None)
     if method is not None and score != "sharpness":
         migration.note(
             f"{_PREVIEW_ADVANCED}.optimizer: {method} dropped: under score {score} the search stages run, as in "

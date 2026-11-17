@@ -1,5 +1,7 @@
 """``solver.calibration.search``: the gradient optimizer, the Nelder-Mead stage, and the 3.x ``advanced.optimizer``."""
 
+import warnings
+
 import pytest
 import torch
 import yaml
@@ -102,9 +104,14 @@ def test_one_gradient_step_of_a_linear_quantity_is_wo_40s_adam_step():
 )
 def test_the_3x_optimizer_names_the_search(advanced, kind, attributes):
     # A sharpness calibration runs it, for the max_iter of the default lone gradient stage, as wo-4.0 did.
-    (stage,) = _search(score="sharpness", advanced=advanced)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        (stage,) = _search(score="sharpness", advanced=advanced)
     assert type(stage) is kind
     assert {name: getattr(stage, name) for name in attributes} == attributes
+    # wo-4.0's L-BFGS took unit steps without a line search: the one optimizer that runs differently is warned of
+    expected = ["solver.calibration.advanced.optimizer"] if kind is LBFGSSearch else []
+    assert [getattr(warning.message, "location", None) for warning in caught] == expected
 
 
 def test_a_592_file_with_optimizer_and_search_loads_as_wo_40_ran_it():

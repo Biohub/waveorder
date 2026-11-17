@@ -17,7 +17,7 @@ import yaml
 from pydantic import ValidationError
 from yaml.constructor import ConstructorError
 
-from waveorder.config.migrate import bounded
+from waveorder.config.migrate import bounded, wo40_differences
 from waveorder.config.schema import V4Config
 from waveorder.errors import (
     ConfigurationError,
@@ -132,31 +132,43 @@ def load(source: str | Path | Mapping[str, object] | V4Config, *, path: str | Pa
         raise Rejected(problems(error, source=name)) from error
     wo40 = _wo40(data)
     migrate = f"wo config migrate {name if file is not None else 'FILE'}"
-    ranges: tuple[str, ...] = ()
-    if isinstance(data, Mapping):
-        data, ranges = bounded(data)  # wo-4.0 took free apertures and zeniths without bounds
+    data, notes, defaults = _as_wo40_ran(data, wo40=wo40)
     try:
         loaded = V4Config.model_validate(data)
     except CONFIG_ERRORS as error:
         found = problems(error, source=name)
         if wo40:
-            found.append(Problem(f"{_WO40}; convert it with: {migrate}", name))
+            found.append(Problem(f"{_wo40_text(defaults)}; convert it with: {migrate}", name))
         raise Rejected(found) from error
-    for note in ranges:
+    for note in notes:
         field, _, message = note.partition(" ")
         warnings.warn(ConfigurationWarning(message, field=field), stacklevel=2)
     if wo40:
         warnings.warn(
-            ConfigurationWarning(f"{_WO40}; if wo-4.0 wrote it, convert it with: {migrate}", field=name),
+            ConfigurationWarning(f"{_wo40_text(defaults)}; if wo-4.0 wrote it, convert it with: {migrate}", field=name),
             stacklevel=2,
         )
     return loaded
 
 
-_WO40 = (
-    "data.pixel_size is written {z, yx}, as wo-4.0 writes it, and wo-4.0 files have other defaults "
-    "(detection.edge: sigmoid, a 3D z_focus_offset read as 0)"
-)
+def _as_wo40_ran(data: object, *, wo40: bool) -> tuple[object, tuple[str, ...], tuple[str, ...]]:
+    """Return ``data`` with the ranges a migration gives, the located notes to warn of, and wo-4.0's other defaults.
+
+    The notes are ``<path> <message>``; the defaults, for a file in wo-4.0's spelling, name what it read differently.
+    """
+    if not isinstance(data, Mapping):
+        return data, (), ()
+    data, notes = bounded(data, wo40=wo40)  # wo-4.0 took free apertures and zeniths without bounds
+    if not wo40:
+        return data, notes, ()
+    defaults, located = wo40_differences(data)
+    return data, notes + located, defaults
+
+
+def _wo40_text(defaults: tuple[str, ...]) -> str:
+    """Return the file-level message of a file in wo-4.0's spelling, naming the ``defaults`` that differ in it."""
+    text = "data.pixel_size is written {z, yx}, as wo-4.0 writes it"
+    return f"{text}, and wo-4.0 read this file with other defaults ({', '.join(defaults)})" if defaults else text
 
 
 def _wo40(data: object) -> bool:
