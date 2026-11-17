@@ -248,7 +248,7 @@ A single config file should generate good reconstructions across a screen. We su
 \texttt{waveorder reconstruct} over positions (one process or cluster job
 per position) with \texttt{device:~cuda:0} to reconstruct on a GPU. We recommend
 \texttt{z\_focus\_offset:~auto} to find the focus of each position. Give each job its own copy of the config and
-its own output store; jobs that share them overwrite each other's saved settings and transfer function.
+its own output store; jobs that share them overwrite each other's transfer function.
 
 We recommend manual supervision
 to set up the optimized \texttt{tilt\_angle\_\{zenith,azimuth\}} parameters across entire wells. We find that initializing these tilt parameters at good initial tilts gives the most stable reconstructions, so we recommend inspecting

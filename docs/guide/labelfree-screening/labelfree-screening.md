@@ -139,8 +139,6 @@ Resolving z_focus_offset with a per-slice focus search...
 Resolved z_focus_offset = 0 (slice units) from the data; per-crop focus slices [3, 3, 3, 3, 3]
 ```
 
-The resolved offset is saved next to the config as `config_autofocus.yml`.
-
 ![z_focus_offset sweep](./figures/fig_focus.png)
 
 **Failure mode 4 | Tilted illumination at the well edge.** Misaligned
@@ -169,7 +167,7 @@ or cluster job per position) with `device: cuda:0` to reconstruct on a GPU.
 We recommend `z_focus_offset: auto` to find the focus of each position.
 Give each job its own config copy and output store (e.g.
 `config_<position>.yml`, `phase_<position>.zarr`); jobs that share them
-overwrite each other's saved settings and transfer function.
+overwrite each other's transfer function.
 
 We recommend manual supervision to set up the optimized
 `tilt_angle_{zenith,azimuth}` parameters across entire wells. We find that
