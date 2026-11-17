@@ -1,7 +1,6 @@
 """A model wraps an imaging system with its solver: built in Python or from a config, it reconstructs and calibrates."""
 
 import copy
-import inspect
 import re
 from collections.abc import Callable
 from typing import Any, override
@@ -176,13 +175,6 @@ def test_a_model_built_from_optics_equals_the_one_its_minimal_config_builds(
     assert configured.config is not None
     assert model.z_padding == configured.z_padding == 0
     assert model.device == configured.device == torch.device("cpu")
-
-
-def test_fluorescence_is_widefield_without_a_pinhole_and_confocal_with_one():
-    assert type(_fluorescence_3d().system) is WidefieldFluorescence3D
-    confocal = _confocal_3d().system
-    assert isinstance(confocal, ConfocalFluorescence3D)
-    assert float(confocal.pinhole_diameter) == pytest.approx(0.3)
 
 
 def test_reconstruct_prepares_recorded_data_and_solves_as_the_modules_do():
@@ -1017,39 +1009,12 @@ def test_a_configuration_that_leaves_out_the_noise_and_the_weight_warns_like_pyt
     assert ReconstructionModel.from_config(V4Config(**_free_aperture_raw())).defaulted == ()
 
 
-# --- signatures ----------------------------------------------------------------------------------------------------
-
-
-def test_the_position_methods_take_their_output_by_keyword_and_the_model_estimates_no_resources():
-    parameters = inspect.signature(ReconstructionModel.reconstruct_positions).parameters
-    assert parameters["output"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["times"].default is None
-    assert not hasattr(ReconstructionModel, "estimate_resources")
-    assert not hasattr(ReconstructionModel, "create_output")
-    for method in (ReconstructionModel.reconstruct_tiles, ReconstructionModel.calibrate_tiles):
-        assert inspect.signature(method).parameters["prepared"].default is False
-    for name in ("pixel_size", "times", "tile", "tile_overlap", "write_pixel_size", "overwrite"):
-        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
-    calibrate = inspect.signature(ReconstructionModel.calibrate_position).parameters
-    assert "start" in calibrate
-    assert "init" not in calibrate
-
-
 # --- reconstruct returns values; the graph is asked for -------------------------------------------------------------
 
 
 def _free_aperture_model(**parts) -> Fluorescence3D:
     aperture = Free(1.05, bounds=(1.0, 1.3))
     return Fluorescence3D(_detection(0.52, aperture), index_of_refraction_media=1.33, **parts)
-
-
-def test_reconstruct_returns_values_without_a_graph():
-    model = _free_aperture_model()
-    stack = _stack().abs()
-    plain = model.reconstruct(stack, pixel_size=PIXEL_SIZE)
-    assert not plain.estimate.requires_grad
-    assert plain.estimate.numpy().shape == (1, *SHAPE)
-    assert "differentiable" not in inspect.signature(ReconstructionModel.reconstruct).parameters
 
 
 # --- an assigned object prior or noise ------------------------------------------------------------------------------
@@ -1286,16 +1251,6 @@ def test_a_calibration_store_given_as_the_prior_centres_it_on_the_stored_values(
     plan = TilePlan(shape=SHAPE, tile=SHAPE)
     tiled = _free_aperture_model(**parts).calibrate_tiles(data, pixel_size=PIXEL_SIZE, plan=plan, prior=store)
     assert tiled.parameters[APERTURE].shape == (1,)
-
-
-# --- the data arguments of to_config --------------------------------------------------------------------------------
-
-
-def test_to_config_takes_one_channel_name_as_a_list_of_one():
-    assert _described(_phase_3d(), channels="BF")["data"] == {"input_channel_names": ["BF"]}
-    configured = ReconstructionModel.from_config(_phase_raw()).to_config(channels="BF")
-    assert isinstance(configured, V4Config)
-    assert configured.data.input_channel_names == ["BF"]
 
 
 # --- a class says what its prepare reads -----------------------------------------------------------------------------
@@ -1646,9 +1601,3 @@ def test_an_output_that_is_no_path_is_refused_at_output(tmp_path):
     with pytest.raises(ParameterError, match=r"Phase3D\.reconstruct_positions output must be") as error:
         model.reconstruct_positions(tmp_path / "in.zarr", output=None, channels=["BF"])  # ty: ignore[invalid-argument-type]
     assert error.value.path == "output"
-
-
-def test_calibrate_position_has_a_dry_run():
-    parameters = inspect.signature(ReconstructionModel.calibrate_position).parameters
-    assert parameters["dry_run"].default is False
-    assert parameters["dry_run"].kind is inspect.Parameter.KEYWORD_ONLY

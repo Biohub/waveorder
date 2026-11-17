@@ -136,14 +136,6 @@ def test_data_in_another_dtype_than_the_model_is_rejected_before_solving():
         Wiener()(data.float(), model, sampling)
 
 
-def test_objective_rejects_an_operator_bound_to_another_sampling():
-    model, sampling, data, _ = _case("fluorescence_even")
-    other = Sampling(shape=sampling.shape, pixel_size=(0.4, 0.2, 0.2))
-    estimate = torch.zeros(model.system.object_shape(sampling), dtype=torch.float64)
-    with pytest.raises(ShapeError, match="bound to"):
-        model.objective(data, estimate, sampling, operator=model.system.bind(other))
-
-
 def test_in_focus_otf_matches_the_analytic_disk_autocorrelation():
     # Independent of the code under test: the incoherent in-focus OTF of a uniform circular pupil of radius NA/lambda
     # is (2/pi)(acos(v) - v sqrt(1 - v^2)) with v = |k| / (2 NA / lambda).

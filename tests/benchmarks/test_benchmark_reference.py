@@ -18,52 +18,14 @@ from waveorder.models import ReconstructionModel
 from waveorder.nn import free_specs
 
 
-class TestReferenceBoundSchema:
-    def test_min_only(self):
-        rb = ReferenceBound(min=0.7)
-        assert rb.min == 0.7
-        assert rb.max is None
-
-    def test_max_only(self):
-        rb = ReferenceBound(max=1.0)
-        assert rb.max == 1.0
-        assert rb.min is None
-
-    def test_both(self):
-        rb = ReferenceBound(min=-0.25, max=0.25)
-        assert rb.min == -0.25
-        assert rb.max == 0.25
-
-    def test_neither_rejected(self):
-        with pytest.raises(Exception, match="at least one"):
-            ReferenceBound()
-
-    def test_min_gt_max_rejected(self):
-        with pytest.raises(Exception, match="must be <="):
-            ReferenceBound(min=1.0, max=0.5)
-
-    def test_extra_field_rejected(self):
-        with pytest.raises(ValidationError, match="foo"):
-            ReferenceBound.model_validate({"min": 0.0, "foo": 1})
-
-
-class TestCaseConfigReference:
-    def test_parses_mixed_keys(self):
-        case = CaseConfig(
-            type="hpc",
-            input="/a.zarr",
-            position="A/1/000000",
-            reference={
-                "with_phantom.ssim": {"min": 0.7},
-                "parameter.z_focus_offset": {"min": -0.25, "max": 0.25},
-            },
-        )
-        assert case.reference is not None
-        assert case.reference["with_phantom.ssim"].min == 0.7
-        assert case.reference["parameter.z_focus_offset"].max == 0.25
-
-    def test_defaults_to_none(self):
-        assert CaseConfig(type="synthetic").reference is None
+@pytest.mark.parametrize(
+    ("bound", "match"),
+    [({}, "at least one"), ({"min": 1.0, "max": 0.5}, "must be <="), ({"min": 0.0, "foo": 1}, "foo")],
+    ids=["neither", "min_gt_max", "extra_field"],
+)
+def test_invalid_bound_rejected(bound, match):
+    with pytest.raises(ValidationError, match=match):
+        ReferenceBound.model_validate(bound)
 
 
 _METRICS = {
@@ -88,28 +50,23 @@ def check_reference(case_dir: Path, metrics: dict, reference: dict[str, Referenc
 
 
 class TestMetricChecks:
-    def test_returns_none(self, tmp_path):
+    def test_no_bounds_no_verdict(self, tmp_path):
         assert runner.check_reference(tmp_path, _METRICS, None) is None
         assert runner.check_reference(tmp_path, _METRICS, {}) is None
 
-    def test_min_pass(self, tmp_path):
-        refs = {"with_phantom.ssim": ReferenceBound(min=0.7)}
-        result = check_reference(tmp_path, _METRICS, refs)
+    def test_min(self, tmp_path):
+        result = check_reference(tmp_path, _METRICS, {"with_phantom.ssim": ReferenceBound(min=0.7)})
         assert result["all_pass"] is True
         assert result["per_ref"]["with_phantom.ssim"]["value"] == 0.85
+        assert check_reference(tmp_path, _METRICS, {"with_phantom.ssim": ReferenceBound(min=0.95)})["all_pass"] is False
 
-    def test_min_fail(self, tmp_path):
-        refs = {"with_phantom.ssim": ReferenceBound(min=0.95)}
-        result = check_reference(tmp_path, _METRICS, refs)
-        assert result["all_pass"] is False
-
-    def test_max_bounds(self, tmp_path):
+    def test_max(self, tmp_path):
         good = {"with_phantom.mse": ReferenceBound(max=0.01)}
         bad = {"with_phantom.mse": ReferenceBound(max=0.0001)}
         assert check_reference(tmp_path, _METRICS, good)["all_pass"] is True
         assert check_reference(tmp_path, _METRICS, bad)["all_pass"] is False
 
-    def test_two_sided_bounds(self, tmp_path):
+    def test_two_sided(self, tmp_path):
         refs = {"with_phantom.ssim": ReferenceBound(min=0.8, max=0.9)}
         assert check_reference(tmp_path, _METRICS, refs)["all_pass"] is True
 
@@ -144,8 +101,7 @@ class TestParameterChecks:
     def test_store_of_any_config_name_accepted(self, tmp_path):
         _write_store(tmp_path, {"z_focus_offset": -0.05}, config="config")
         refs = {"parameter.z_focus_offset": ReferenceBound(min=-0.25, max=0.25)}
-        result = check_reference(tmp_path, {}, refs)
-        assert result["all_pass"] is True
+        assert check_reference(tmp_path, {}, refs)["all_pass"] is True
 
     def test_raises_when_no_store(self, tmp_path):
         refs = {"parameter.z_focus_offset": ReferenceBound(min=-0.25, max=0.25)}
@@ -188,24 +144,16 @@ class TestParameterChecks:
         assert set(STORE_NAMES.values()) == set(free_specs(model.imaging_model))
 
 
-class TestMixedChecks:
-    def test_both_types_together(self, tmp_path):
-        _write_store(tmp_path, {"z_focus_offset": 0.0})
-        refs = {
-            "with_phantom.ssim": ReferenceBound(min=0.7),
-            "parameter.z_focus_offset": ReferenceBound(min=-0.25, max=0.25),
-        }
-        result = check_reference(tmp_path, _METRICS, refs)
-        assert result["all_pass"] is True
-        assert set(result["per_ref"]) == {"with_phantom.ssim", "parameter.z_focus_offset"}
-
-    def test_metric_fails_param_passes(self, tmp_path):
-        _write_store(tmp_path, {"z_focus_offset": 0.0})
-        refs = {
-            "with_phantom.ssim": ReferenceBound(min=0.95),
-            "parameter.z_focus_offset": ReferenceBound(min=-0.25, max=0.25),
-        }
-        result = check_reference(tmp_path, _METRICS, refs)
-        assert result["all_pass"] is False
-        assert result["per_ref"]["with_phantom.ssim"]["pass"] is False
-        assert result["per_ref"]["parameter.z_focus_offset"]["pass"] is True
+def test_case_bounds_of_both_kinds_are_judged_each(tmp_path):
+    _write_store(tmp_path, {"z_focus_offset": 0.0})
+    case = CaseConfig(
+        type="hpc",
+        input="/a.zarr",
+        position="A/1/000000",
+        reference={"with_phantom.ssim": {"min": 0.95}, "parameter.z_focus_offset": {"min": -0.25, "max": 0.25}},
+    )
+    assert case.reference is not None
+    result = check_reference(tmp_path, _METRICS, case.reference)
+    assert result["all_pass"] is False
+    assert result["per_ref"]["with_phantom.ssim"]["pass"] is False
+    assert result["per_ref"]["parameter.z_focus_offset"]["pass"] is True

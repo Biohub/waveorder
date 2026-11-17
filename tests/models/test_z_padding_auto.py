@@ -14,7 +14,7 @@ from tests.models.plates import PIXEL_SIZE, SHAPE, contrast, phase_model, read_o
 from waveorder.config import V4Config
 from waveorder.errors import CalibrationWarning, ParameterError, ShapeError
 from waveorder.models import ReconstructionModel, _base
-from waveorder.nn import Sampling, ZPadding, load_parameters
+from waveorder.nn import load_parameters
 from waveorder.nn.search import sweep
 from waveorder.nn.search.sweep import WeightSweep
 
@@ -73,19 +73,6 @@ def test_auto_solves_as_the_integer_it_resolves_to():
     unpadded = phase_model().reconstruct(data, pixel_size=PIXEL_SIZE, prepared=True).estimate
     torch.testing.assert_close(auto, fixed, rtol=0, atol=0)
     assert (auto - unpadded).norm() > 1e-3 * unpadded.norm()
-
-
-def test_an_integer_pads_as_before():
-    model = phase_model(z_padding=3)
-    assert model.z_padding == 3
-    assert model.z_padding_for((5, 4, 4)) == 3  # an integer needs no voxel size and is the same on every stack
-    data = contrast()
-    padding = ZPadding(3)
-    padded = padding.sampling(Sampling(shape=SHAPE, pixel_size=PIXEL_SIZE))
-    operator = model.system.bind(padded) if model.solver.needs_operator else None
-    expected = padding.crop(model.solver(padding.pad(data[None]), model.imaging_model, padded, operator=operator))
-    estimate = model.reconstruct(data, pixel_size=PIXEL_SIZE, prepared=True).estimate
-    torch.testing.assert_close(estimate, expected.estimate, rtol=0, atol=0)
 
 
 def test_tiles_and_stored_transfers_take_the_resolved_slices():

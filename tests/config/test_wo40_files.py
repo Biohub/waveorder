@@ -1,14 +1,6 @@
-"""wo-4.0's version 4 files build as wo-4.0 ran them: in the form wo-4.0 writes, and where wo-4.0 read no noise.
-
-The files under ``data/wo40`` were written by wo-4.0's code (85282ce, run from its checkout): ``*_short`` is the
-mapping of its tests (``tests/calibrate/test_beads.py::_bead_config``, ``tests/config/test_simulate_v4.py::SIM_RAW``
-with ``noise: {poisson: {photons: 50}}``), ``*_dump`` is ``yaml.safe_dump(V4Config(**short).model_dump())`` as its
-``test_bead_calibration_cli`` writes a file, and ``*_text`` is its ``v4_to_yaml_text``, both with
-``solver.reconstruction: closed_form`` written out.
-"""
+"""wo-4.0's version 4 files build as wo-4.0 ran them: in the form wo-4.0 writes, and where wo-4.0 read no noise."""
 
 import warnings
-from pathlib import Path
 
 import pytest
 import torch
@@ -19,8 +11,86 @@ from waveorder.errors import ConfigurationError, ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import ADMM, Gaussian, Tikhonov, TotalVariation, Wiener
 
-DATA = Path(__file__).parent / "data" / "wo40"
-FORMS = ("short", "dump", "text")
+# wo-4.0's tests wrote a bead calibration short (BEAD_SHORT); its CLI tests wrote
+# yaml.safe_dump(V4Config(**short).model_dump()): every default and null spelled out, closed_form included.
+BEAD_SHORT = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}}
+imaging_system:
+  contrast: fluorescence
+  index_of_refraction_media: 1.3
+  detection:
+    wavelength: 0.532
+    numerical_aperture: 1.2
+    pupil_aberrations: {astigmatism_0: {nominal: 0.0, tolerance: free}}
+noise: {gaussian: {sigma: 1.0}}
+object: {prior: {beads: {diameter: 0.5}}}
+solver: {calibration: {score: evidence, search: [{gradient: {max_iter: 150}}]}}
+"""
+BEAD_DUMP = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}, time_indices: all}
+imaging_system:
+  contrast: fluorescence
+  field_dependence: shift_invariant
+  index_of_refraction_media: 1.3
+  detection:
+    numerical_aperture: 1.2
+    pinhole: none
+    pupil_aberrations:
+      astigmatism_0: {bounds: null, nominal: 0.0, tolerance: free}
+      zernike_up_to_order: null
+    wavelength: 0.532
+    z_focus_offset: 0.0
+  illumination:
+    invert_phase_contrast: false
+    numerical_aperture: null
+    tilt: {azimuth: 0.0, zenith: 0.0}
+    wavelength: null
+noise: {gaussian: {sigma: 1.0, snr_db: null}, poisson: null, poisson_gaussian: null}
+object:
+  constraints: []
+  dimension: 3
+  prior: {beads: {diameter: 0.5, max_beads: 50, min_separation: 5, snr_threshold: 6.0}}
+  source: null
+  weight: 0.001
+outputs: [reconstruction, transfer_function]
+simulate: null
+solver:
+  apodization_rolloff: 0.0
+  calibration:
+    advanced: null
+    final_estimate: best_H
+    score: evidence
+    search: [{gradient: {max_iter: 150, method: split}}]
+  device: null
+  padding: {yx: 0, z: 0}
+  reconstruction: closed_form
+"""
+SIM_DUMP = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}, time_indices: all}
+imaging_system:
+  contrast: fluorescence
+  field_dependence: shift_invariant
+  index_of_refraction_media: 1.3
+  detection:
+    numerical_aperture: 1.2
+    pinhole: none
+    pupil_aberrations: {spherical: 0.08, zernike_up_to_order: null}
+    wavelength: 0.532
+    z_focus_offset: 0.0
+  illumination:
+    invert_phase_contrast: false
+    numerical_aperture: null
+    tilt: {azimuth: 0.0, zenith: 0.0}
+    wavelength: null
+noise: {gaussian: null, poisson: {gain: 1.0, offset: 0.0, photons: 50.0}, poisson_gaussian: null}
+object: {constraints: [], dimension: 3, prior: tikhonov, source: {gaussian_spectrum: {exponent: 2.0}}, weight: 0.001}
+outputs: [reconstruction, transfer_function]
+simulate: {seed: 0, shape: [16, 32, 32]}
+solver: {apodization_rolloff: 0.0, calibration: null, device: null, padding: {yx: 0, z: 0}, reconstruction: closed_form}
+"""
 
 PHASE = """\
 version: 4
@@ -38,25 +108,21 @@ noise: {gaussian: {sigma: 1.0}}
 PIXEL_SIZE = (0.4, 0.15, 0.15)
 
 
-def _quiet(source: dict | Path) -> ReconstructionModel:
+def _quiet(source: dict) -> ReconstructionModel:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ConfigurationWarning)
         return ReconstructionModel.from_config(source)
 
 
-@pytest.mark.parametrize("form", FORMS)
-def test_a_wo40_bead_calibration_file_builds_in_every_form_wo40_writes(form):
-    # wo-4.0 writes closed_form in every file; a bead calibration never solves with it, as when the key is left out.
-    model = _quiet(DATA / f"bead_{form}.yml")
-    short = _quiet(DATA / "bead_short.yml")
+def test_a_wo40_bead_calibration_dump_builds_as_its_short_form():
+    # A bead calibration never solves with the closed_form the dump writes, as when the key is left out.
+    model, expected = _quiet(yaml.safe_load(BEAD_DUMP)), _quiet(yaml.safe_load(BEAD_SHORT))
     parts = ("system", "object_prior", "noise", "solver")
-    assert [type(getattr(model, name)) for name in parts] == [type(getattr(short, name)) for name in parts]
+    assert [type(getattr(model, name)) for name in parts] == [type(getattr(expected, name)) for name in parts]
 
 
-@pytest.mark.parametrize("form", FORMS)
-def test_a_wo40_poisson_simulation_file_builds_in_every_form_wo40_writes(form):
-    model = _quiet(DATA / f"sim_poisson_{form}.yml")
-    data, _ = model.simulate(seed=0)
+def test_a_wo40_poisson_simulation_dump_simulates_photon_counts():
+    data, _ = _quiet(yaml.safe_load(SIM_DUMP)).simulate(seed=0)
     assert data.shape == (1, 16, 32, 32)
     assert float(data.min()) >= 0  # Poisson counts of photons: 50, as wo-4.0 drew them
     assert torch.equal(data, data.round())

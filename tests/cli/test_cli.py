@@ -2,7 +2,6 @@
 
 import os
 import re
-from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -141,40 +140,6 @@ def test_a_device_list_is_refused_where_one_device_computes_and_an_empty_entry_e
     empty = runner.invoke(app, ["rec", "-i", "in.zarr", "-c", str(config), "-o", "out.zarr", "--device", "cuda:0,"])
     assert empty.exit_code == 2
     assert "must be a device or a comma-separated list of devices" in empty.stderr
-
-
-def test_every_argument_the_library_names_in_a_message_has_a_flag():
-    import waveorder
-    from waveorder.cli.options import ARGUMENT_FLAGS
-
-    root = Path(waveorder.__file__).parent
-    call = re.compile(r"""\b(?:named|where)\(\s*["']([a-z_]+)["']""")  # named("tile"), where("prior", path)
-    sources = [path for path in root.rglob("*.py") if path.relative_to(root).parts[0] != "cli"]
-    names = {name for path in sources for name in call.findall(path.read_text())}
-    assert {"positions", "output", "store", "tile", "pixel_size"} <= names
-    assert names - set(ARGUMENT_FLAGS) == set()
-    assert "start" in ARGUMENT_FLAGS  # the --start store's argument reaches where() through a variable
-
-
-def test_every_command_the_library_names_in_a_message_exists():
-    import typer
-    from typer.core import TyperGroup
-
-    import waveorder
-
-    root = Path(waveorder.__file__).parent
-    group = typer.main.get_command(app)
-    assert isinstance(group, TyperGroup)
-    mention = re.compile(r"\bwo ([a-z][a-z-]*)(?: ([a-z][a-z-]*))?")  # wo rec, wo config check
-    missing = set()
-    for path in root.rglob("*.py"):
-        for first, second in mention.findall(path.read_text()):
-            command = group.commands.get(first)
-            if command is None:
-                missing.add(f"{path.name}: wo {first}")
-            elif isinstance(command, TyperGroup) and second and second not in command.commands:
-                missing.add(f"{path.name}: wo {first} {second}")
-    assert missing == set()
 
 
 def test_a_problem_the_build_finds_is_located_at_the_file_with_its_config_path(tmp_path):

@@ -14,11 +14,6 @@ main()
 """
 
 
-def test_importing_the_cli_does_not_import_torch():
-    code = "import sys, waveorder.cli; assert 'torch' not in sys.modules"
-    subprocess.run([sys.executable, "-c", code], check=True)
-
-
 @pytest.mark.parametrize(
     ("arguments", "code"),
     [

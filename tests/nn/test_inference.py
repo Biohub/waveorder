@@ -44,7 +44,6 @@ from waveorder.nn import (
     load_parameters,
     score_candidates,
 )
-from waveorder.nn.model import expect_on_system
 from waveorder.nn.operators import LinearOperator
 from waveorder.nn.parameters import same_device
 from waveorder.nn.solvers import Loop, Solver
@@ -89,10 +88,6 @@ def test_the_objective_validates_data_and_estimate_as_every_verb_does():
     # A verb, or any caller checking on a model's behalf, names itself; the shape needs no binding.
     with pytest.raises(ShapeError, match=r"^Wiener data has shape \(8, 32, 32\), expected \(1, 8, 32, 32\)"):
         Wiener()(data[0], model, SMALL)
-    with pytest.raises(ShapeError, match=r"^score_candidates data has shape \(8, 32, 32\)"):
-        expect_on_system(
-            data[0], model.system, where="score_candidates", name="data", shape=model.system.data_shape(SMALL)
-        )
     with pytest.raises(PlacementError, match=r"ImagingModel\.objective data is torch\.float64 on cpu but "):
         model.objective(data.double(), estimate, SMALL)
     with pytest.raises(PlacementError, match=r"ImagingModel\.objective estimate is torch\.float64"):

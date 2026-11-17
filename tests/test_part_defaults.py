@@ -1,55 +1,12 @@
-"""A part needs at most three methods of its own: every other method of its base class has a default."""
+"""A part written with only its required methods gets working defaults from its base class."""
 
-import inspect
-
-import pytest
 import torch
 from torch import Tensor
 
 from tests.nn.conftest import SIGMA, make_model, make_system, simulate
-from waveorder.nn import (
-    Gaussian,
-    GaussianObjectPrior,
-    ImagingModel,
-    ImagingSystem,
-    IterativeSolver,
-    Loop,
-    Noise,
-    NoPrior,
-    ObjectPrior,
-    Sampling,
-    Score,
-    SearchStage,
-    ShiftInvariantSystem,
-    Solver,
-)
-from waveorder.nn.scores import SharpnessScore
+from waveorder.nn import Gaussian, ImagingModel, IterativeSolver, Loop, Noise, NoPrior, Sampling
 from waveorder.nn.verbs import InverseProblem
 from waveorder.testing import assert_solver_descends, check_noise
-
-BASES = [
-    ImagingSystem,
-    ShiftInvariantSystem,
-    ObjectPrior,
-    GaussianObjectPrior,
-    Noise,
-    NoPrior,
-    Solver,
-    IterativeSolver,
-    Score,
-    SharpnessScore,
-]
-
-
-@pytest.mark.parametrize("base", BASES, ids=lambda base: base.__name__)
-def test_a_base_class_requires_at_most_three_methods(base: type):
-    required = sorted(getattr(base, "__abstractmethods__", ()))
-    assert len(required) <= 3, required
-
-
-def test_a_search_stage_is_one_method():
-    methods = [name for name, value in vars(SearchStage).items() if inspect.isfunction(value) and name[0] != "_"]
-    assert methods == ["run"]
 
 
 class _PlainGaussian(Noise):

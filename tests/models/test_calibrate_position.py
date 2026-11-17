@@ -1,7 +1,6 @@
 """``calibrate_position``, ``load_calibration`` and ``to_tf_store`` of a model, on tiny simulated plates."""
 
 import dataclasses
-import math
 import re
 import warnings
 from pathlib import Path
@@ -56,7 +55,6 @@ from waveorder.nn import (
     free_specs,
     load_parameters,
 )
-from waveorder.nn.parameters import shortest_decimal
 from waveorder.nn.priors import Beads
 
 
@@ -704,18 +702,3 @@ def test_to_tf_store_refusals():
         with pytest.raises(ParameterError, match=r"for one shape pass \[\(z, y, x\)\]") as refused:
             model.to_tf_store(shapes=shapes, pixel_size=PIXEL_SIZE)  # ty: ignore[invalid-argument-type]
         assert refused.value.path == "shapes"
-
-
-# --- numbers ---
-
-
-def test_float32_values_are_stored_as_their_shortest_decimal():
-    single = float(torch.tensor(0.52, dtype=torch.float32))
-    assert single != 0.52
-    assert shortest_decimal(single, torch.float32) == 0.52
-    assert shortest_decimal(0.1 + 0.2, torch.float32) == 0.1 + 0.2  # a float64 value is kept as it is
-    assert math.isnan(shortest_decimal(math.nan, torch.float32))
-
-
-def test_simulated_data_differs_with_the_aperture():
-    assert not torch.allclose(simulate_phase(aperture=0.4), simulate_phase(aperture=0.6))

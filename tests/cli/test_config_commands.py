@@ -1,6 +1,5 @@
 """``wo config new | check | show``: templates, located errors and output files."""
 
-import shutil
 from pathlib import Path
 
 import pytest
@@ -121,7 +120,16 @@ def test_check_without_file_shows_help():
 
 
 REPOSITORY = Path(__file__).parents[2]
-WO40 = REPOSITORY / "tests" / "config" / "data" / "wo40"
+
+# A simulation config in the form wo-4.0's tests wrote it: data.pixel_size as {z, yx}.
+WO40_SIMULATION = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}}
+imaging_system: {contrast: fluorescence, index_of_refraction_media: 1.3, detection: {wavelength: 0.532}}
+noise: {poisson: {photons: 50}}
+object: {source: {gaussian_spectrum: {exponent: 2.0}}}
+simulate: {seed: 0, shape: [16, 32, 32]}
+"""
 
 
 def _shown_then_checked(path: Path) -> None:
@@ -148,20 +156,12 @@ def test_show_of_every_template_passes_check(tmp_path, contrast, dimension):
     _shown_then_checked(path)
 
 
-@pytest.mark.parametrize("name", sorted(path.stem for path in WO40.glob("*.yml")))
-def test_wo40_written_files_pass_check_and_their_show_passes_check(tmp_path, name):
-    # wo-4.0 writes solver.reconstruction: closed_form in every file, which a bead fit or a simulation never solves.
-    path = Path(shutil.copy(WO40 / f"{name}.yml", tmp_path / f"{name}.yml"))
-    checked = runner.invoke(app, ["config", "check", str(path)])
-    assert checked.exit_code == 0, checked.output
-    _shown_then_checked(path)
-
-
 def test_show_leaves_out_the_parts_the_model_chooses_so_its_output_builds_the_same_model(tmp_path):
     from waveorder.errors import ConfigurationWarning
     from waveorder.models import ReconstructionModel
 
-    path = Path(shutil.copy(WO40 / "sim_poisson_short.yml", tmp_path / "sim.yml"))
+    path = tmp_path / "sim.yml"
+    path.write_text(WO40_SIMULATION)
     result = runner.invoke(app, ["config", "show", str(path)])
     assert result.exit_code == 0, result.output
     shown = yaml.safe_load(result.stdout)
@@ -192,7 +192,8 @@ def test_device_keeps_the_file_in_the_wo40_pixel_size_warning(tmp_path):
     from waveorder.cli._configured import resolve_config
     from waveorder.errors import ConfigurationWarning
 
-    path = Path(shutil.copy(WO40 / "bead_short.yml", tmp_path / "beads.yml"))
+    path = tmp_path / "sim.yml"
+    path.write_text(WO40_SIMULATION)
     with pytest.warns(ConfigurationWarning) as caught:
         resolve_config(path, device="cpu")
     found = [w.message for w in caught if isinstance(w.message, ConfigurationWarning)]

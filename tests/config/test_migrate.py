@@ -1,8 +1,7 @@
-"""``waveorder.config.migrate``: the 3.x examples, every rule of the per-key table, and #592 version-4 files."""
+"""``waveorder.config.migrate``: every rule of the per-key table, 3.x files and #592 version-4 files."""
 
 import copy
 import warnings
-from pathlib import Path
 
 import pytest
 import yaml
@@ -13,25 +12,38 @@ from waveorder.config.schema import ReconstructionRichardsonLucy
 from waveorder.errors import ConfigurationWarning
 from waveorder.models import ReconstructionModel
 
-DATA = Path(__file__).parent / "data"
-EXAMPLES = DATA / "3x"
-MIGRATED = ["phase_3d", "phase_2d", "fluorescence_3d", "fluorescence_2d"]
-REJECTED = {
-    "birefringence_3d": ["birefringence"],
-    "birefringence-and-phase_3d": ["birefringence"],
-    "tile-stitch_phase_3d": ["tile"],
-}
-
-
-def example(name: str) -> dict:
-    data = yaml.safe_load((EXAMPLES / f"{name}.yml").read_text())
-    assert isinstance(data, dict)
-    return data
+PREVIEW = """\
+version: 4
+data:
+  input_channel_names: [Brightfield]
+  time_indices: all
+  pixel_size: {yx: {y: 0.1, x: 0.1}, z: 0.25}
+imaging_system:
+  contrast: phase
+  index_of_refraction_media: 1.3
+  detection: {numerical_aperture: 1.2, z_focus_offset: 0.0}
+  illumination:
+    wavelength: 0.532
+    numerical_aperture: {nominal: 0.9, tolerance: free}
+    tilt: {zenith: 0.0, azimuth: 0.0}
+object: {dimension: 3, prior: tikhonov, weight: 0.001}
+noise: {gaussian: {sigma: 1.0}}
+solver:
+  calibration:
+    score: sharpness
+    search: [{gradient: {max_iter: 10, method: split}}]
+    advanced:
+      optimizer: adam
+      learning_rates: {illumination.numerical_aperture: 0.01}
+      convergence_patience: 5
+      grid_points: 7
+      loss: {type: midband_power, midband_fractions: [0.125, 0.25]}
+"""
 
 
 def preview() -> dict:
-    """Return the #592 fixture, a fresh copy per call."""
-    return copy.deepcopy(example("../592/phase_3d_optimized"))
+    """A #592 file of a free illumination aperture under adam, as #592's migrate wrote it; a fresh copy per call."""
+    return yaml.safe_load(PREVIEW)
 
 
 def phase(**transfer_function) -> dict:
@@ -67,78 +79,54 @@ def rejected_keys(raw: dict) -> list[str]:
     return [rejection.key for rejection in result.rejections]
 
 
-# --- the 3.x examples --------------------------------------------------------------------------------------------
+# --- whole files ---------------------------------------------------------------------------------------------------
 
 
-def test_fixtures_name_their_source_commit():
-    for path in EXAMPLES.glob("*.yml"):
-        assert "4ea8027:docs/examples/cli/configs/" in path.read_text().splitlines()[0]
-
-
-@pytest.mark.parametrize("name", MIGRATED)
-def test_examples_migrate_and_validate(name):
-    result = converted(example(name))
+@pytest.mark.parametrize(
+    ("contrast", "dimension"), [("phase", 3), ("phase", 2), ("fluorescence", 3), ("fluorescence", 2)]
+)
+def test_a_3x_file_migrates_and_its_rendering_loads_to_the_same_config(contrast, dimension):
+    raw = (phase() if contrast == "phase" else fluorescence()) | {"reconstruction_dimension": dimension}
+    result = converted(raw)
     assert result.dialect == "3.x"
     config = load(result.config)
-    assert config.imaging_system.contrast == name.split("_")[0]
-    assert config.object.dimension == int(name[-2])
-    assert config.imaging_system.detection.edge == "sigmoid"
-    text = render(result, source=f"{name}.yml")
-    assert text.startswith(f"# WaveOrder 4 configuration migrated by wo config migrate from waveorder 3.x: {name}.yml")
+    assert (config.imaging_system.contrast, config.object.dimension) == (contrast, dimension)
+    text = render(result, source="old.yml")
+    assert text.startswith("# WaveOrder 4 configuration migrated by wo config migrate from waveorder 3.x: old.yml")
     assert "# - data.pixel_size is used as written, as in 3.x: wo rec warns where it differs" in text
     assert yaml.safe_load(text) == result.config
-    load(yaml.safe_load(text))
 
 
-@pytest.mark.parametrize(("name", "keys"), REJECTED.items())
-def test_examples_rejected_with_their_keys(name, keys):
-    assert rejected_keys(example(name)) == keys
+@pytest.mark.parametrize(
+    "raw",
+    [{"input_channel_names": ["S0"], "birefringence": {}}, phase() | {"birefringence": {}}],
+    ids=["birefringence", "birefringence_and_phase"],
+)
+def test_birefringence_is_rejected(raw):
+    (rejection,) = migrate(raw).rejections
+    assert rejection.key == "birefringence"
+    assert rejection.message == "birefringence is not in waveorder 4; use waveorder 3.x"
 
 
-def test_phase_3d_example_in_full():
-    assert converted(example("phase_3d")).config == {
-        "version": 4,
-        "data": {
-            "input_channel_names": ["Brightfield"],
-            "time_indices": "all",
-            "pixel_size": {"z": 0.25, "y": 0.1, "x": 0.1},
-        },
-        "imaging_system": {
-            "contrast": "phase",
-            "index_of_refraction_media": 1.3,
-            "detection": {"numerical_aperture": 1.2, "z_focus_offset": 0, "edge": "sigmoid"},
-            "illumination": {
-                "wavelength": 0.532,
-                "numerical_aperture": 0.9,
-                "tilt": {"zenith": 0.0, "azimuth": 0.0},
-                "invert_phase_contrast": False,
-            },
-        },
-        "object": {"dimension": 3, "prior": "tikhonov", "weight": 0.001},
-        "noise": {"gaussian": {"sigma": 1.0}},
-        "solver": {
-            "padding": {"z": 0},
-            "reconstruction": "closed_form",
-            "apodization_rolloff": 0.0,
-            "device": None,
-        },
-    }
+def test_tile_stitch_is_rejected_with_the_tile_hint():
+    tile_stitch = {"tile": {"tile_size": {"z": 10, "y": 64, "x": 64}}, "blend": {}, "recon": phase()}
+    assert rejected_keys(tile_stitch) == ["tile"]
+    (rejection,) = migrate(tile_stitch).rejections
+    assert rejection.message.startswith("tile-stitch (tile, blend, recon) is not in waveorder 4")
+    assert "wo rec --tile" in rejection.message
 
 
-def test_rejection_messages():
-    (biref,) = migrate(example("birefringence_3d")).rejections
-    assert biref.message == "birefringence is not in waveorder 4; use waveorder 3.x"
-    (tile,) = migrate(example("tile-stitch_phase_3d")).rejections
-    assert tile.message.startswith("tile-stitch (tile, blend, recon) is not in waveorder 4")
-    assert "wo rec --tile" in tile.message
+def auto_regularized(**auto_regularization: object) -> dict:
+    raw = phase()
+    raw["phase"]["apply_inverse"] = {"auto_regularization": auto_regularization}
+    return raw
 
 
 def test_3d_tikhonov_auto_regularization_becomes_the_rule_based_weight():
-    result = converted(example("phase_3d_auto_regularization"))
     rule = {"rule": "otsu_cnr", "search_min": -6.0, "search_max": 2.0, "num_samples": 25, "search_scale": "relative"}
+    result = converted(auto_regularized(**rule, report_path=None, plot_path=None))
     assert result.config["object"] == {"dimension": 3, "prior": "tikhonov", "weight": {"auto": rule}}
-    raw = example("phase_3d_auto_regularization")
-    raw["phase"]["apply_inverse"]["auto_regularization"] = {"rule": "l_curve"}
+    raw = auto_regularized(rule="l_curve")
     raw["phase"]["apply_inverse"]["regularization_strength"] = 0.5
     result = converted(raw)
     assert result.config["object"]["weight"] == {"auto": {"rule": "l_curve"}}
@@ -147,8 +135,7 @@ def test_3d_tikhonov_auto_regularization_becomes_the_rule_based_weight():
 
 @pytest.mark.parametrize("name", ["report_path", "plot_path"])
 def test_a_sweep_report_or_plot_path_is_kept(name):
-    raw = example("phase_3d_auto_regularization")
-    raw["phase"]["apply_inverse"]["auto_regularization"][name] = "sweep.out"
+    raw = auto_regularized(rule="otsu_cnr", **{name: "sweep.out"})
     assert converted(raw).config["object"]["weight"]["auto"][name] == "sweep.out"
     preview_raw = preview()
     del preview_raw["solver"]["calibration"]

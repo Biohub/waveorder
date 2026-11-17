@@ -1,7 +1,5 @@
 """``solver.calibration.search``: the gradient optimizer, the Nelder-Mead stage, and the 3.x ``advanced.optimizer``."""
 
-from pathlib import Path
-
 import pytest
 import torch
 import yaml
@@ -111,7 +109,21 @@ def test_the_3x_optimizer_names_the_search(advanced, kind, attributes):
 
 def test_a_592_file_with_optimizer_and_search_loads_as_wo_40_ran_it():
     # wo-4.0's wo config migrate writes advanced.optimizer beside the gradient stage that holds its max_iter.
-    raw = yaml.safe_load((Path(__file__).parent / "data/592/phase_3d_optimized.yml").read_text())
+    raw = _raw(
+        score="sharpness",
+        search=[{"gradient": {"max_iter": 10, "method": "split"}}],
+        advanced={
+            "optimizer": "adam",
+            "learning_rates": {"illumination.numerical_aperture": 0.01},
+            "convergence_patience": 5,
+        },
+    )
+    raw["imaging_system"] = {
+        "contrast": "phase",
+        "index_of_refraction_media": 1.3,
+        "detection": {"numerical_aperture": 1.2},
+        "illumination": {"wavelength": 0.532, "numerical_aperture": {"nominal": 0.9, "tolerance": "free"}},
+    }
     with pytest.warns(ConfigurationWarning) as caught:
         model = ReconstructionModel.from_config(raw)
     assert {warning.message.location for warning in caught if isinstance(warning.message, ConfigurationWarning)} >= {

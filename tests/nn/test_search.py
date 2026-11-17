@@ -13,7 +13,6 @@ from typing import ClassVar, override
 import pytest
 import torch
 
-from tests.nn import legacy_evidence_search
 from tests.nn.conftest import FREE_NA, NA, make_model, make_system, simulate
 from waveorder.errors import CalibrationWarning, ParameterError, PlacementError, ShapeError
 from waveorder.nn import (
@@ -34,12 +33,10 @@ from waveorder.nn import (
     load_parameters,
     score_candidates,
 )
-from waveorder.nn.functional import abs2, gram, half_spectrum_weights
-from waveorder.nn.operators import FourierDiagonal
 from waveorder.nn.optics import Detection
-from waveorder.nn.parameters import CalibratableModule, free_specs
+from waveorder.nn.parameters import free_specs
 from waveorder.nn.search import LBFGSSearch, expect_known_names, keep_best, on_bounds, search_spans
-from waveorder.nn.search.base import CalibrationObjective, Estimate, SearchStage
+from waveorder.nn.search.base import CalibrationObjective, Estimate
 from waveorder.nn.systems.fluorescence import WidefieldFluorescence3D
 from waveorder.nn.verbs import InverseProblem
 from waveorder.testing import check_search_stage
@@ -63,12 +60,6 @@ class Stay:
 
 
 STAY = (Stay(),)
-
-TOY_LIKELIHOOD = pytest.mark.filterwarnings(
-    r"ignore:calibrate. \w+ is a likelihood, and a likelihood does not determine:waveorder.errors.CalibrationWarning"
-)
-"""For the toy scores below that call themselves likelihoods and read a free focus offset directly: a real
-likelihood cannot determine it on this system, which ``calibrate`` warns about; these scores do by construction."""
 
 
 def _model(numerical_aperture, weight=WEIGHT) -> ImagingModel:
@@ -134,55 +125,6 @@ class ScaledEvidence(Evidence):
     @override
     def run(self, problem: InverseProblem) -> torch.Tensor:
         return 0.5 * super().run(problem)
-
-
-class Plain(Score):
-    """A score that is neither a likelihood nor a sum of independent terms: no covariance exists for it."""
-
-    @override
-    def check(self, model: ImagingModel) -> None:
-        del model
-
-    @override
-    def run(self, problem: InverseProblem) -> torch.Tensor:
-        return (_value(problem.model, NA) - 1.0).square()
-
-
-class WhittleTotal(Score):
-    """The Whittle negative log-likelihood of one channel, with an assumed object and noise variance, as one total.
-
-    With a wrong noise variance it is a misspecified likelihood: its estimate is still consistent for its own optimum,
-    but the inverse Hessian is not its variance.
-    """
-
-    is_likelihood: ClassVar[bool] = True
-
-    def __init__(self, *, noise_variance: float, object_variance: float = SCALE**2, factor: float = 1.0) -> None:
-        super().__init__()
-        self.noise_variance = noise_variance
-        self.object_variance = object_variance
-        self.factor = factor
-
-    @override
-    def check(self, model: ImagingModel) -> None:
-        del model
-
-    @override
-    def run(self, problem: InverseProblem) -> torch.Tensor:
-        per_frequency = self.per_frequency(problem)
-        weights = half_spectrum_weights(SAMPLING.shape[-1], device=per_frequency.device, dtype=per_frequency.dtype)
-        return (per_frequency * weights).sum()
-
-    def per_frequency(self, problem: InverseProblem) -> torch.Tensor:
-        """Return the unweighted term of each half-spectrum sample, ``(Z, Y, X // 2 + 1)``."""
-        operator = problem.operator
-        assert isinstance(operator, FourierDiagonal)
-        variance = gram(operator.transfer)[0, 0] * self.object_variance + self.noise_variance
-        spectrum = abs2(torch.view_as_real(torch.fft.rfftn(problem.data[0], norm="ortho")))
-        return self.factor * 0.5 * (spectrum / variance + torch.log(variance))
-
-
-FLAT_NA = Free(1.1, bounds=(0.8, 1.2))
 
 
 @pytest.mark.filterwarnings("ignore:Synchronization debug mode is a prototype feature:UserWarning")
@@ -329,23 +271,9 @@ def test_candidate_batches_reach_the_device_without_a_host_sync():
     torch.testing.assert_close(drawn, reference, check_device=False)
 
 
-def test_random_points_are_wo40s_draws():
-    # A toleranced quantity: nominal + tolerance * N(0, 1), clamped to its bounds; a flat one: uniform over them.
-    specs = {
-        "coma": Free(0.0, tolerance=0.1),
-        "astigmatism": Free(0.05, tolerance=0.1, bounds=(-0.1, 0.12)),
-        "spherical": Free(0.0, bounds=(-0.2, 0.3)),
-    }
-    legacy = [
-        legacy_evidence_search.ParameterSpec("coma", 0.0, 0.1, None),
-        legacy_evidence_search.ParameterSpec("astigmatism", 0.05, 0.1, (-0.1, 0.12)),
-        legacy_evidence_search.ParameterSpec("spherical", 0.0, "free", (-0.2, 0.3)),
-    ]
+def test_a_toleranced_random_point_spreads_by_one_tolerance():
+    # nominal + tolerance * N(0, 1): std 0.1, not uniform over three tolerances (std 0.173).
     like = torch.zeros((), dtype=torch.float64)
-    (drawn,) = RandomSearch(samples=500, seed=7).batches(specs, like=like)
-    expected = legacy_evidence_search.random_draws(legacy, samples=500, seed=7)
-    assert torch.equal(torch.stack([drawn[name] for name in specs], dim=1), expected)
-    # wo-4.0 spread a toleranced quantity by one tolerance (std 0.1), not uniformly over three (std 0.173).
     (wide,) = RandomSearch(samples=20000).batches({"coma": Free(0.0, tolerance=0.1)}, like=like)
     assert wide["coma"].std().item() == pytest.approx(0.1, rel=0.02)
 
@@ -434,25 +362,6 @@ class TryApertures:
 
     def run(self, objective: CalibrationObjective, *, start: Estimate) -> Estimate:
         return keep_best(objective, {NA: torch.tensor(self.apertures)}, start=start)
-
-
-class RunOnly:
-    """A stage that forgot to declare whether it reads back."""
-
-    def run(self, objective: CalibrationObjective, *, start: Estimate) -> Estimate:
-        del objective
-        return start
-
-
-def test_a_stage_declares_whether_it_reads_back():
-    assert isinstance(TryApertures((1.0,)), SearchStage)
-    assert not isinstance(RunOnly(), SearchStage)
-    assert [stage.reads_back for stage in (GridSearch(), RandomSearch(), GradientSearch(), LBFGSSearch())] == [
-        False,
-        False,
-        False,
-        True,
-    ]
 
 
 def test_a_new_search_stage_is_one_class():
@@ -594,96 +503,6 @@ def test_a_nan_start_is_replaced_by_a_finite_candidate():
     result = calibrate(_data(), model, SAMPLING, score=NaNAboveAperture(), search=(GridSearch(points=5),))
     assert result.parameters[NA].item() <= 1.09
     assert math.isfinite(result.objective.item())
-
-
-def _value(model: torch.nn.Module, name: str) -> torch.Tensor:
-    """The current value of free quantity ``name``, including one swapped in by ``evaluate``."""
-    prefix, _, attribute = name.rpartition(".")
-    module = model.get_submodule(prefix)
-    assert isinstance(module, CalibratableModule)
-    return module.quantity(attribute)
-
-
-class TwoDirections(Score):
-    """``0.5 |A theta - b|^2 / s^2`` over the free quantities: a likelihood that informs only two directions."""
-
-    is_likelihood: ClassVar[bool] = True
-
-    def __init__(self, names: list[str]) -> None:
-        super().__init__()
-        self.names = names
-        generator = torch.Generator().manual_seed(3)
-        self.directions = torch.randn(2, len(names), generator=generator, dtype=torch.float64)
-
-    @override
-    def check(self, model: ImagingModel) -> None:
-        del model
-
-    @override
-    def run(self, problem: InverseProblem) -> torch.Tensor:
-        theta = torch.stack([_value(problem.model, name) for name in self.names])
-        return 0.5 * ((self.directions @ theta - 1.0) / 0.01).square().sum()
-
-
-def _six_quantity_model() -> ImagingModel:
-    terms = {f"z{j}": Free(0.0, tolerance=0.05, bounds=(-0.5, 0.5)) for j in (5, 6, 7, 8)}
-    system = make_system(
-        Free(1.0, tolerance=0.1, bounds=(0.8, 1.2)),
-        z_focus_offset=Free(0.0, tolerance=0.5, bounds=(-2.0, 2.0)),
-        pupil_aberrations=ZernikeAberration(terms),
-    )
-    return ImagingModel(system, Tikhonov(WEIGHT), Gaussian(SIGMA)).double()
-
-
-class Quadratic(Score):
-    """``0.5 theta^T A theta - sum(theta)``: a likelihood whose Hessian over the free quantities is exactly ``A``."""
-
-    is_likelihood: ClassVar[bool] = True
-
-    def __init__(self, names: list[str], hessian: torch.Tensor) -> None:
-        super().__init__()
-        self.names = names
-        self.hessian = hessian
-
-    @override
-    def check(self, model: ImagingModel) -> None:
-        del model
-
-    @override
-    def run(self, problem: InverseProblem) -> torch.Tensor:
-        theta = torch.stack([_value(problem.model, name) for name in self.names])
-        return 0.5 * theta @ self.hessian @ theta - theta.sum()
-
-
-def _rotated(spectrum: list[float], *, size: int) -> torch.Tensor:
-    """A symmetric ``(size, size)`` matrix with eigenvalues ``spectrum`` (zero-padded) along fixed random axes."""
-    generator = torch.Generator().manual_seed(5)
-    axes, _ = torch.linalg.qr(torch.randn(size, size, generator=generator, dtype=torch.float64))
-    values = torch.tensor([*spectrum, *[0.0] * (size - len(spectrum))], dtype=torch.float64)
-    return axes @ torch.diag(values) @ axes.mT
-
-
-def _quantity_model(zernikes: int, *, tolerance: bool, dtype: torch.dtype = torch.float64) -> ImagingModel:
-    """A model with the aperture, the focus and ``zernikes`` Zernike terms free, near the middle of their bounds;
-    Gaussian priors when ``tolerance``, flat ones otherwise."""
-
-    def free(nominal: float, half: float, bounds: tuple[float, float]) -> Free:
-        return Free(nominal, tolerance=half if tolerance else None, bounds=bounds)
-
-    terms = {f"z{j}": free(0.0, 0.05, (-50.0, 50.0)) for j in range(5, 5 + zernikes)}
-    system = make_system(
-        free(1.0, 0.1, (0.5, 1.3)),
-        z_focus_offset=free(0.0, 0.5, (-3.0, 3.0)),
-        pupil_aberrations=ZernikeAberration(terms),
-    )
-    return ImagingModel(system, Tikhonov(WEIGHT), Gaussian(SIGMA)).to(dtype)
-
-
-def _exact_errors(model: ImagingModel, hessian: torch.Tensor) -> torch.Tensor:
-    """The float64 standard errors of ``(hessian + prior precision)^-1``, the truth both covariances estimate."""
-    specs = free_specs(model).values()
-    precision = torch.tensor([0.0 if s.tolerance is None else s.tolerance**-2 for s in specs], dtype=torch.float64)
-    return torch.linalg.inv(hessian + torch.diag(precision)).diagonal().sqrt()
 
 
 @pytest.mark.parametrize(

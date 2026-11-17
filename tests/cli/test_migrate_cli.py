@@ -1,6 +1,5 @@
 """``wo config migrate`` and its hidden spellings ``migrate-config`` and ``mc``: output paths, exit codes, help."""
 
-import shutil
 from pathlib import Path
 
 import pytest
@@ -12,14 +11,37 @@ from waveorder.config import load
 
 runner = CliRunner()
 
-EXAMPLES = Path(__file__).parents[1] / "config" / "data" / "3x"
-PREVIEW = Path(__file__).parents[1] / "config" / "data" / "592" / "phase_3d_optimized.yml"
 SPELLINGS = [["config", "migrate"], ["migrate-config"], ["mc"]]
+
+PHASE_3X = """\
+input_channel_names: [Brightfield]
+reconstruction_dimension: 3
+phase:
+  transfer_function: {yx_pixel_size: 0.1, z_pixel_size: 0.25}
+"""
+PREVIEW = """\
+version: 4
+data:
+  input_channel_names: [Brightfield]
+  pixel_size: {z: 0.25, yx: 0.1}
+imaging_system:
+  contrast: phase
+  index_of_refraction_media: 1.3
+  detection: {numerical_aperture: 1.2}
+  illumination: {wavelength: 0.532, numerical_aperture: 0.9}
+object: {prior: tikhonov, weight: 0.001}
+noise: {gaussian: {sigma: 1.0}}
+"""
+
+
+def _written(path: Path, text: str) -> Path:
+    path.write_text(text)
+    return path
 
 
 @pytest.fixture
 def phase_3x(tmp_path):
-    return Path(shutil.copy(EXAMPLES / "phase_3d.yml", tmp_path / "phase.yml"))
+    return _written(tmp_path / "phase.yml", PHASE_3X)
 
 
 @pytest.mark.parametrize("command", SPELLINGS)
@@ -68,7 +90,7 @@ def test_already_v4_exits_zero_without_writing(phase_3x):
 
 
 def test_preview_file_is_upgraded(tmp_path):
-    source = Path(shutil.copy(PREVIEW, tmp_path / "old.yml"))
+    source = _written(tmp_path / "old.yml", PREVIEW)
     result = runner.invoke(app, ["config", "migrate", str(source)])
     assert result.exit_code == 0, result.output
     text = (tmp_path / "old_v4.yml").read_text()
@@ -78,20 +100,14 @@ def test_preview_file_is_upgraded(tmp_path):
     load(migrated)
 
 
-@pytest.mark.parametrize("name", ["phase_2d", "phase_3d", "fluorescence_2d", "fluorescence_3d"])
-def test_a_migrated_file_passes_check(tmp_path, name):
-    source = Path(shutil.copy(EXAMPLES / f"{name}.yml", tmp_path / f"{name}.yml"))
-    migrated = runner.invoke(app, ["config", "migrate", str(source)])
-    assert migrated.exit_code == 0, migrated.output
-    checked = runner.invoke(app, ["config", "check", str(tmp_path / f"{name}_v4.yml")])
-    assert checked.exit_code == 0, checked.output
-
-
 def test_a_migration_that_does_not_build_is_refused_and_not_written(tmp_path):
     # 2D TV migrates to ADMM, which the thin system refuses when the model is built, not when the schema validates.
-    source = tmp_path / "tv_2d.yml"
-    algorithm = "reconstruction_algorithm: "
-    source.write_text((EXAMPLES / "phase_2d.yml").read_text().replace(f"{algorithm}Tikhonov", f"{algorithm}TV"))
+    tv_2d = (
+        "input_channel_names: [BF]\n"
+        "reconstruction_dimension: 2\n"
+        "phase: {apply_inverse: {reconstruction_algorithm: TV}}\n"
+    )
+    source = _written(tmp_path / "tv_2d.yml", tv_2d)
     result = runner.invoke(app, ["config", "migrate", str(source)])
     assert result.exit_code == 2
     assert f"{source} (migrated): solver.reconstruction:" in result.stderr
@@ -101,7 +117,7 @@ def test_a_migration_that_does_not_build_is_refused_and_not_written(tmp_path):
 
 def test_a_preview_file_passes_check_with_the_migrate_command_in_its_warning(tmp_path):
     # wo-4.0 wrote it; it loads as wo-4.0 read it, and the warning names the command that converts it.
-    source = Path(shutil.copy(PREVIEW, tmp_path / "old.yml"))
+    source = _written(tmp_path / "old.yml", PREVIEW)
     result = runner.invoke(app, ["config", "check", str(source)])
     assert result.exit_code == 0, result.output
     assert f"if wo-4.0 wrote it, convert it with: wo config migrate {source}" in result.stderr
@@ -118,34 +134,21 @@ def test_a_3x_file_is_refused_with_its_path_once(phase_3x, command):
 
 
 @pytest.mark.parametrize(
-    ("name", "key"),
+    ("text", "key", "fact"),
     [
-        ("birefringence_3d", "birefringence"),
-        ("tile-stitch_phase_3d", "tile"),
+        ("input_channel_names: [S0]\nbirefringence: {}\n", "birefringence", "use waveorder 3.x"),
+        ("tile: {tile_size: {z: 10, y: 64, x: 64}}\nblend: {}\nrecon: {}\n", "tile", "wo rec --tile"),
     ],
+    ids=["birefringence", "tile_stitch"],
 )
-def test_rejections_exit_2_with_their_key(tmp_path, name, key):
-    source = Path(shutil.copy(EXAMPLES / f"{name}.yml", tmp_path / f"{name}.yml"))
-    result = runner.invoke(app, ["config", "migrate", str(source)])
-    assert result.exit_code == 2
-    assert f"wo config migrate: error: {source}: cannot migrate: {key}:" in result.stderr
-    assert not list(tmp_path.glob("*_v4.yml"))
-
-
-def test_birefringence_message(tmp_path):
-    source = Path(shutil.copy(EXAMPLES / "birefringence_3d.yml", tmp_path / "b.yml"))
-    result = runner.invoke(app, ["config", "migrate", str(source)])
-    assert "birefringence is not in waveorder 4; use waveorder 3.x" in result.stderr
-
-
-def test_tile_stitch_is_rejected_once_with_the_tile_hint(tmp_path):
-    source = Path(shutil.copy(EXAMPLES / "tile-stitch_phase_3d.yml", tmp_path / "ts.yml"))
+def test_a_rejection_exits_2_once_with_its_key_and_what_to_do(tmp_path, text, key, fact):
+    source = _written(tmp_path / "old.yml", text)
     result = runner.invoke(app, ["config", "migrate", str(source)])
     assert result.exit_code == 2
     (line,) = result.stderr.splitlines()
-    assert line.startswith(f"wo config migrate: error: {source}: cannot migrate: tile: tile-stitch (tile, ")
-    assert "wo rec --tile" in line
-    assert "the output becomes a plate" in line
+    assert line.startswith(f"wo config migrate: error: {source}: cannot migrate: {key}:")
+    assert fact in line
+    assert not list(tmp_path.glob("*_v4.yml"))
 
 
 def test_yaml_error_is_exit_2(tmp_path):

@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from tests.nn.legacy_phase import frequencies, generate_pupil
 from waveorder.errors import ParameterError
 from waveorder.nn import Detection, Free, Sampling
 from waveorder.nn.optics import PupilGrid
@@ -19,9 +18,11 @@ def _grid() -> PupilGrid:
 def test_the_sigmoid_edge_is_the_3x_pupil():
     detection = Detection(wavelength=WAVELENGTH, numerical_aperture=1.2, edge="sigmoid").double()
     pupil = detection.pupil(_grid())
-    fyy, fxx = frequencies(SAMPLING.shape[1:], *SAMPLING.pixel_size[1:], dtype=torch.float64)
-    legacy = generate_pupil(torch.sqrt(fxx**2 + fyy**2), 1.2, WAVELENGTH)
-    torch.testing.assert_close(pupil[..., 0], legacy, atol=1e-12, rtol=0)
+    fy = torch.fft.fftfreq(SAMPLING.shape[1], SAMPLING.pixel_size[1], dtype=torch.float64)
+    fx = torch.fft.fftfreq(SAMPLING.shape[2], SAMPLING.pixel_size[2], dtype=torch.float64)
+    radius = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2)
+    expected = torch.sigmoid(1e4 * (1.2 / WAVELENGTH - radius))  # the 3.x pupil
+    torch.testing.assert_close(pupil[..., 0], expected, atol=1e-12, rtol=0)
     assert bool((pupil[..., 1] == 0).all())
 
 

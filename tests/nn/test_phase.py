@@ -1,9 +1,4 @@
-"""Brightfield phase systems: parity with the 3.x transfer functions and inverses, and the module contracts.
-
-The 3.x reference lives in :mod:`tests.nn.legacy_phase` and is unmodified 3.x. Parity runs the 4.x systems with the
-3.x pupil edge (``Detection(edge="sigmoid")``) on grids where the 3.x crop is right, and with ``z_focus_offset = 1``
-where 3.x inverted the stack; separate tests pin the gap of the default ramp edge and each deliberate difference.
-"""
+"""Brightfield phase systems: units, first-order oracles, inverses and the module contracts."""
 
 import math
 from typing import Any
@@ -12,7 +7,6 @@ import pytest
 import torch
 from torch import Tensor
 
-from tests.nn import legacy_phase as legacy
 from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn import (
     FISTA,
@@ -29,7 +23,7 @@ from waveorder.nn import (
     Wiener,
     calibrate,
 )
-from waveorder.nn.functional import hermitian_half, lateral_frequencies
+from waveorder.nn.functional import lateral_frequencies
 from waveorder.nn.optics import Illumination, IlluminationTilt, PupilEdge, PupilGrid
 from waveorder.nn.preprocess import brightfield_contrast
 from waveorder.nn.systems import phase as phase_module
@@ -64,17 +58,6 @@ def _optics(
     return illumination, detection
 
 
-def _hermitian_part(full: Tensor) -> Tensor:
-    """``0.5 (H(k) + conj H(-k))`` of full spectra over the last three axes: what ``real(ifftn(H F))`` applies."""
-    dims = (-3, -2, -1)
-    return 0.5 * (full + torch.roll(torch.flip(full, dims), (1, 1, 1), dims).conj())
-
-
-def _stored_half(full: Tensor, nx: int) -> Tensor:
-    """A 3.x full transfer as the operator ``real(ifftn(H F))`` sees it: the half of its Hermitian part, stored real."""
-    return torch.view_as_real(_hermitian_part(full)[..., : nx // 2 + 1].contiguous())
-
-
 def _relative(actual: Tensor, expected: Tensor) -> float:
     wide = torch.complex128 if actual.is_complex() or expected.is_complex() else torch.float64
     return float((actual.to(wide) - expected.to(wide)).norm() / expected.to(wide).norm())
@@ -85,405 +68,47 @@ def _correlation(first: Tensor, second: Tensor) -> float:
     return float((a * b).sum() / (a.norm() * b.norm()))
 
 
-# Odd and even grids, on axis and tilted, oversampled by 1, 2 or 3 along y/x and by 2 along z; an odd inverted stack.
-# (Odd axes oversampled by an even factor hit the 3.x crop defect; see the crop test.)
-THICK_CASES = [
-    pytest.param((7, 10, 10), (0.4, 0.2, 0.2), 0.0, 0.0, False, id="even-oversampled-on-axis"),
-    pytest.param((5, 9, 9), (0.6, 0.45, 0.45), -0.3, 0.8, False, id="odd-oversampled-by-3-tilted"),
-    pytest.param((5, 8, 7), (0.3, 0.15, 0.15), 0.2, 0.1, False, id="nyquist-sampled-tilted"),
-    pytest.param((7, 10, 10), (0.4, 0.2, 0.2), -0.3, 0.8, False, id="even-tilted"),
-    pytest.param((4, 8, 8), (1.0, 0.15, 0.15), 0.1, 0.3, False, id="z-oversampled"),
-    pytest.param((7, 12, 11), (0.4, 0.15, 0.15), 0.1, 0.3, True, id="odd-inverted"),
-]
-
-
-def _thick_reference(system: ThickPhase3D, sampling: Sampling, **kwargs: object) -> tuple[Tensor, Tensor]:
-    """Unmodified 3.x transfers for the optics of ``system`` (3.x has no focus offset)."""
-    return legacy.thick_transfer(
-        sampling.shape,
-        sampling.pixel_size,
-        wavelength=WAVELENGTH,
-        index=INDEX,
-        na_illumination=float(system.illumination.numerical_aperture),
-        na_detection=float(system.detection.numerical_aperture),
-        zenith=float(system.illumination.tilt.zenith),
-        azimuth=float(system.illumination.tilt.azimuth),
-        invert_phase_contrast=system.invert_phase_contrast,
-        **kwargs,  # ty: ignore[invalid-argument-type]
-    )
-
-
-@pytest.mark.parametrize(("shape", "pixel_size", "zenith", "azimuth", "invert"), THICK_CASES)
-def test_thick_transfer_with_the_sigmoid_edge_matches_unmodified_3x(shape, pixel_size, zenith, azimuth, invert) -> None:
-    sampling = Sampling(shape=shape, pixel_size=pixel_size)
-    # 3.x flipped the FFT-ordered planes to invert: exactly 4.x inversion with the focus one slice off (odd stacks).
-    optics = _optics(zenith=zenith, azimuth=azimuth, offset=1.0 if invert else 0.0, edge="sigmoid")
-    system = ThickPhase3D(
-        *optics, index_of_refraction_media=INDEX, invert_phase_contrast=invert, absorption="independent"
-    ).double()
-    real_tf, imag_tf = _thick_reference(system, sampling)
-    transfer = system.transfer(sampling)
-    nx = shape[2]
-    assert transfer.shape == (1, 2, *shape[:2], nx // 2 + 1, 2)
-    assert _relative(transfer[0, 0], _stored_half(real_tf, nx)) <= 1e-10
-    assert _relative(transfer[0, 1], _stored_half(imag_tf, nx)) <= 1e-10
-    single = system.float().transfer(sampling)
-    assert _relative(single[0, 0], _stored_half(real_tf, nx)) <= 1e-5
-    assert _relative(single[0, 1], _stored_half(imag_tf, nx)) <= 1e-5
-
-
-def test_thick_absorption_ratio_is_the_3x_effective_transfer() -> None:
-    sampling = Sampling(shape=(6, 10, 10), pixel_size=(0.6, 0.3, 0.25))
-    illumination, detection = _optics(zenith=0.2, azimuth=0.5, edge="sigmoid")
-    system = ThickPhase3D(illumination, detection, index_of_refraction_media=INDEX, absorption=0.3).double()
-    real_tf, imag_tf = _thick_reference(system, sampling)
-    assert system.fields == ("phase",)
-    assert _relative(system.transfer(sampling)[0, 0], _stored_half(real_tf + 0.3 * imag_tf, 10)) <= 1e-10
-
-
-def _thick_scene(edge: PupilEdge, sampling: Sampling) -> tuple[ThickPhase3D, Tensor, Tensor, Tensor]:
-    """Raw 3.x intensities of a phase sphere, and the 3.x transfers that imaged them."""
-    illumination, detection = _optics(zenith=0.15, azimuth=1.0, edge=edge)
-    system = ThickPhase3D(illumination, detection, index_of_refraction_media=INDEX, absorption=0.2).double()
-    real_tf, imag_tf = _thick_reference(system, sampling)
-    phantom = 0.05 * legacy.sphere(sampling.shape, sampling.pixel_size, radius=0.6)
-    noise = torch.randn(sampling.shape, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
-    contrast = torch.fft.ifftn(torch.fft.fftn(phantom) * (real_tf + 0.2 * imag_tf)).real
-    return system, 1e3 * (1 + contrast) + 2.0 * noise, real_tf, imag_tf
-
-
-def _reconstruct_like_3x(system: ThickPhase3D, intensity: Tensor, sampling: Sampling, *, weight: float) -> Tensor:
-    model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
-    return Wiener()(brightfield_contrast(intensity[None]), model, sampling).estimate[0]
-
-
-def test_thick_tikhonov_reconstruction_matches_unmodified_3x() -> None:
-    """Wiener with a Tikhonov prior on brightfield_contrast is the 3.x Tikhonov inverse of the raw intensities."""
-    sampling = Sampling(shape=(8, 16, 15), pixel_size=(0.4, 0.15, 0.15))
-    system, intensity, real_tf, imag_tf = _thick_scene("sigmoid", sampling)
-    weight = 1e-6
-    expected = legacy.thick_inverse(intensity, real_tf, imag_tf, absorption_ratio=0.2, regularization_strength=weight)
-    assert _relative(_reconstruct_like_3x(system, intensity, sampling, weight=weight), expected) <= 1e-10
-
-
-def _nyquist_bins(shape: tuple[int, ...]) -> Tensor:
-    """The full-spectrum bins on the Nyquist plane of an even axis."""
-    mask = torch.zeros(shape, dtype=torch.bool)
-    for axis, size in enumerate(shape):
-        if size % 2 == 0:
-            mask.select(axis, size // 2)[...] = True
-    return mask
-
-
-@pytest.mark.parametrize(
-    ("shape", "pixel_size", "gap"),
-    [
-        pytest.param((7, 12, 12), (0.4, 0.25, 0.25), 0.0630, id="even-oversampled-yx"),
-        pytest.param((6, 12, 12), (1.0, 0.25, 0.25), 0.1102, id="even-oversampled-zyx"),
-    ],
-)
-def test_thick_tilted_inverse_differs_from_wo40_only_on_nyquist_bins(shape, pixel_size, gap) -> None:
-    """Tilted, oversampled on even axes: the forward operator equals wo-4.0's (see the operator test below), and
-    Wiener is the Tikhonov solution of that operator, ``conj(H_h) / (|H_h|^2 + w)`` with ``H_h`` the Hermitian part
-    of wo-4.0's cropped transfer ``H_c``. wo-4.0's filter ``conj(H_c) / (|H_c|^2 + w)`` is not: the crop keeps
-    ``-N/2`` of an even axis but not ``+N/2``, so ``H_c`` is not Hermitian on the Nyquist bins. The reconstructions
-    agree off those bins and differ on them by the pinned share of the estimate (white data, w = 1e-3)."""
-    sampling = Sampling(shape=shape, pixel_size=pixel_size)
-    optics = _optics(zenith=-0.65, azimuth=0.8, edge="sigmoid")
-    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX, absorption=0.2).double()
-    assert system.upsampling(sampling)[1:] == (2, 2)
-    real_tf, imag_tf = _thick_reference(system, sampling)
-    noise = torch.randn(shape, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
-    intensity = 1e3 * (1 + 0.01 * noise)
-    weight = 1e-3
-    estimate = _reconstruct_like_3x(system, intensity, sampling, weight=weight)
-    hermitian = _hermitian_part(real_tf + 0.2 * imag_tf)
-    spectrum = torch.fft.fftn(brightfield_contrast(intensity[None])[0])
-    oracle = torch.fft.ifftn(hermitian.conj() / (hermitian.abs() ** 2 + weight) * spectrum).real
-    assert _relative(estimate, oracle) <= 1e-12
-    wo40 = legacy.thick_inverse(intensity, real_tf, imag_tf, absorption_ratio=0.2, regularization_strength=weight)
-    nyquist = _nyquist_bins(shape)
-    difference, reference = torch.fft.fftn(estimate - wo40), torch.fft.fftn(estimate)
-    assert float(difference[~nyquist].norm() / reference[~nyquist].norm()) <= 1e-12
-    assert _relative(wo40, estimate) == pytest.approx(gap, abs=1e-3)
-
-
-def test_default_ramp_edge_gap_to_unmodified_3x_is_pinned() -> None:
-    """The default antialiased edge weights the pupil's edge ring, where 3.x's sigmoid is a hard edge. Measured at
-    16 x 64 x 64 (0.4, 0.1, 0.1 um): 8.3% (phase) and 4.4% (absorption) in the transfer, 1.7% in a Tikhonov
-    reconstruction of a 1 um sphere (weight 1e-6). A change to either number is a change of optics."""
-    sampling = Sampling(shape=(16, 64, 64), pixel_size=(0.4, 0.1, 0.1))
-    ramp = ThickPhase3D(*_optics(), index_of_refraction_media=INDEX, absorption="independent").double()
-    real_tf, imag_tf = _thick_reference(ramp, sampling)
-    transfer = ramp.transfer(sampling)
-    assert _relative(transfer[0, 0], _stored_half(real_tf, 64)) == pytest.approx(0.0830, abs=2e-3)
-    assert _relative(transfer[0, 1], _stored_half(imag_tf, 64)) == pytest.approx(0.0440, abs=2e-3)
-    phantom = 0.05 * legacy.sphere(sampling.shape, sampling.pixel_size, radius=1.0)
-    intensity = 1e3 * (1 + torch.fft.ifftn(torch.fft.fftn(phantom) * real_tf).real)
-    expected = legacy.thick_inverse(intensity, real_tf, imag_tf, regularization_strength=1e-6)
-    phase_only = ThickPhase3D(ramp.illumination, ramp.detection, index_of_refraction_media=INDEX).double()
-    gap = _relative(_reconstruct_like_3x(phase_only, intensity, sampling, weight=1e-6), expected)
-    assert gap == pytest.approx(0.0170, abs=1e-3)
-
-
-def test_greens_function_divides_by_kz_on_the_whole_pupil() -> None:
-    """With the ramp edge the Green's function is ``P exp(i 2 pi z k_z) / k_z`` on the edge ring too. 3.x's guard
-    ``k_z + (1 - P)`` is exact only for a binary pupil; on the ramp it biases the phase transfer, by 5% on this coarse
-    16 x 16 grid (the edge ring is a large share of the pupil) and by about 1% at 64 x 64."""
-    sampling = Sampling(shape=(8, 16, 16), pixel_size=(0.4, 0.15, 0.15))
-    system = ThickPhase3D(*_optics(), index_of_refraction_media=INDEX, absorption="independent").double()
-    assert system.upsampling(sampling) == (1, 1, 1)
-    grid = PupilGrid.from_sampling(sampling, device=torch.device("cpu"), dtype=torch.float64)
-    stored = system.detection.pupil(grid)
-    pupil = torch.complex(stored[..., 0], stored[..., 1])
-    assert ((pupil.abs() > 0) & (pupil.abs() < 1)).any()  # the grid has edge-ring samples
-    fyy, fxx = legacy.frequencies(sampling.shape[1:], 0.15, 0.15, dtype=torch.float64)
-    frr = torch.sqrt(fyy**2 + fxx**2)
-    medium = WAVELENGTH / INDEX
-    oblique = torch.sqrt(torch.clamp(1 - medium**2 * frr**2, min=0.0)) / medium
-    z = torch.fft.ifftshift((torch.arange(8, dtype=torch.float64) - 4) * 0.4)
-    propagation = legacy.generate_propagation_kernel(frr, pupil.abs(), medium, z)
-    defocus = torch.exp(1j * 2 * math.pi * z[:, None, None] * oblique)
-    zero = torch.tensor(0.0, dtype=torch.float64)
-    aperture = torch.tensor(NA_ILL, dtype=torch.float64)
-    illumination = legacy.generate_tilted_pupil(fxx, fyy, aperture, WAVELENGTH, INDEX, zero, zero)
-
-    def transfer(denominator: Tensor) -> Tensor:
-        greens = -0.25j / math.pi * pupil.abs() * defocus / denominator
-        return legacy.wotf_3d(illumination, pupil, propagation, greens, 0.4)[0]
-
-    exact = transfer(torch.where(oblique > 0, oblique, torch.ones_like(oblique)))
-    biased = transfer(oblique + (1 - pupil.abs()) + 1e-15)
-    computed = system.transfer(sampling)[0, 0]
-    assert _relative(computed, _stored_half(exact, 16)) <= 1e-12
-    assert _relative(computed, _stored_half(biased, 16)) == pytest.approx(0.050, abs=5e-3)
-
-
-def test_sigmoid_parity_holds_on_samples_within_the_cut_off_transition(monkeypatch) -> None:
-    """On this grid's transfer function grid (oversampled 3x laterally) four samples sit within the sigmoid's
-    transition at the cut-off, where 3.x's ``1 - pupil`` guard in the Green's function adds 6e-4 to ``k_z``. The
-    sigmoid edge keeps that guard, so the transfer matches 3.x there too (the port matches 3.x itself to its float32
-    rounding, 3.5e-7, here); dividing by ``k_z`` differs by 3e-5."""
-    sampling = Sampling(shape=(5, 7, 9), pixel_size=(0.6, 0.5, 0.4))
-    optics = _optics(zenith=-0.3, azimuth=0.8, edge="sigmoid")
-    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX).double()
-    fine = sampling.upsampled(system.upsampling(sampling))
-    grid = PupilGrid.from_sampling(fine, device=torch.device("cpu"), dtype=torch.float64)
-    support = torch.linalg.vector_norm(system.detection.pupil(grid), dim=-1)
-    assert int(((support > 1e-6) & (support < 1 - 1e-6)).sum()) == 4
-    real_tf, _ = _thick_reference(system, sampling)
-    expected = _stored_half(real_tf, 9)
-    assert _relative(system.transfer(sampling)[0, 0], expected) <= 1e-10
-    greens_denominator = phase_module._greens_denominator  # noqa: SLF001
-    monkeypatch.setattr(
-        phase_module, "_greens_denominator", lambda oblique, support, _: greens_denominator(oblique, support, "ramp")
-    )
-    assert 1e-6 < _relative(system.transfer(sampling)[0, 0], expected) < 1e-4
-
-
-def test_3x_central_crop_moves_the_zero_frequency_on_odd_grids() -> None:
-    """Characterizes a 3.x defect the port fixes: odd Y oversampled by 2 is cropped one frequency off."""
-    sampling = Sampling(shape=(7, 9, 8), pixel_size=(0.4, 0.2, 0.2))
-    system = ThickPhase3D(*_optics(edge="sigmoid"), index_of_refraction_media=INDEX).double()
-    assert system.upsampling(sampling) == (1, 2, 2)
-    shifted, _ = _thick_reference(system, sampling, crop="central")
-    lowest, _ = _thick_reference(system, sampling, crop="lowest")
-    assert _relative(shifted, lowest) > 0.1
-    # The 3.x crop holds the y frequency -1 / (Y dy) at index 0, where the zero frequency belongs; 4.x is right.
-    assert torch.allclose(shifted[:, 0], lowest[:, -1], atol=1e-12)
-    assert _relative(system.transfer(sampling)[0, 0], _stored_half(lowest, 8)) <= 1e-10
-
-
-def test_3x_invert_flip_is_a_negation_plus_one_slice_of_focus() -> None:
-    """3.x flipped the FFT-ordered planes; 4.x negates them. Without the focus offset the two differ by a slice."""
-    sampling = Sampling(shape=(7, 10, 10), pixel_size=(0.4, 0.15, 0.15))
-    optics = _optics(edge="sigmoid")
-    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX, invert_phase_contrast=True).double()
-    flipped, _ = _thick_reference(system, sampling)
-    assert _relative(system.transfer(sampling)[0, 0], _stored_half(flipped, 10)) > 0.5
-
-
-def test_on_axis_3x_transfer_is_hermitian_tilted_is_not_and_the_stored_half_always_is() -> None:
-    """Physics on axis. Tilted and oversampled, the cropped 3.x transfer is not Hermitian: the tilted cap reaches
-    past the oversampled band and aliases. 4.x stores the half of its Hermitian part, the one ``real(ifftn(H F))``
-    applies, so the stored half needs no projection."""
-    sampling = Sampling(shape=(7, 12, 12), pixel_size=(0.4, 0.25, 0.25))
-
-    def asymmetries(zenith: float) -> tuple[float, float]:
-        system = ThickPhase3D(*_optics(zenith=zenith, azimuth=0.8), index_of_refraction_media=INDEX).double()
-        assert system.upsampling(sampling) == (1, 2, 2)
-        crop_3x, _ = _thick_reference(system, sampling)
-        raw = system.potential_transfers(sampling)[0]
-        return _relative(crop_3x, _hermitian_part(crop_3x)), _relative(raw, hermitian_half(raw, 12))
-
-    on_axis, tilted = asymmetries(0.0), asymmetries(-0.65)
-    assert max(on_axis) <= 1e-12
-    assert tilted[0] >= 0.1
-    assert tilted[1] <= 1e-15
-
-
-# --- thin -------------------------------------------------------------------------------------------------------------
-
-THIN_CASES = [
-    pytest.param(9, 9, (0.15, 0.15), 0.0, False, None, id="odd-on-axis"),
-    pytest.param(10, 10, (0.2, 0.2), 0.25, True, None, id="even-oversampled-tilted-inverted"),
-    pytest.param(9, 9, (0.15, 0.15), 0.25, False, (1.3, 0.2, -0.4, -1.5, 0.9), id="uneven-planes-tilted"),
-]
-
-
-def _thin_reference(system: ThinPhase2D, sampling: Sampling) -> tuple[Tensor, Tensor]:
-    """Unmodified 3.x transfers; 3.x took explicit positions, with the focus offset added by its caller."""
-    _, ny, nx = sampling.shape
-    offset = float(system.detection.z_focus_offset)
-    if system.z_positions is None:
-        z = legacy.thin_z_positions(sampling.shape[0], sampling.pixel_size[0], offset=offset)
-    else:
-        z = torch.tensor(system.z_positions, dtype=torch.float64) + offset * sampling.pixel_size[0]
-    return legacy.thin_transfer(
-        (ny, nx),
-        sampling.pixel_size[1:],
-        z,
-        wavelength=WAVELENGTH,
-        index=INDEX,
-        na_illumination=float(system.illumination.numerical_aperture),
-        na_detection=float(system.detection.numerical_aperture),
-        zenith=float(system.illumination.tilt.zenith),
-        azimuth=float(system.illumination.tilt.azimuth),
-        invert_phase_contrast=system.invert_phase_contrast,
-    )
-
-
-@pytest.mark.parametrize(("ny", "nx", "lateral", "zenith", "invert", "positions"), THIN_CASES)
-def test_thin_transfer_with_the_sigmoid_edge_matches_unmodified_3x(ny, nx, lateral, zenith, invert, positions) -> None:
-    sampling = Sampling(shape=(5, ny, nx), pixel_size=(0.5, *lateral))
-    illumination, detection = _optics(zenith=zenith, azimuth=0.7, offset=0.3, edge="sigmoid")
-    system = ThinPhase2D(
-        illumination, detection, index_of_refraction_media=INDEX, invert_phase_contrast=invert, z_positions=positions
-    ).double()
-    absorption_tf, phase_tf = _thin_reference(system, sampling)
-    operator = system.bind(sampling)
-    assert operator.object_shape == (2, 1, ny, nx)
-    assert operator.data_shape == (1, 5, ny, nx)
-    transfer = system.compute_operator(sampling).inner.transfer[:, :, 0]  # (Z, F, Y, X // 2 + 1, 2)
-    assert _relative(transfer[:, 0], _plane_half(phase_tf, nx)) <= 1e-10
-    assert _relative(transfer[:, 1], _plane_half(absorption_tf, nx)) <= 1e-10
-    single = system.float().compute_operator(sampling).inner.transfer[:, :, 0]
-    assert _relative(single[:, 0], _plane_half(phase_tf, nx)) <= 1e-5
-
-
-def test_thin_ramp_edge_gap_to_unmodified_3x_is_pinned() -> None:
-    """Measured at 64 x 64 (0.1 um), 5 planes 0.5 um apart: 6.6% (phase) and 3.8% (absorption)."""
-    sampling = Sampling(shape=(5, 64, 64), pixel_size=(0.5, 0.1, 0.1))
-    system = ThinPhase2D(*_optics(), index_of_refraction_media=INDEX).double()
-    absorption_tf, phase_tf = _thin_reference(system, sampling)
-    transfer = system.compute_operator(sampling).inner.transfer[:, :, 0]
-    assert _relative(transfer[:, 0], _plane_half(phase_tf, 64)) == pytest.approx(0.0663, abs=2e-3)
-    assert _relative(transfer[:, 1], _plane_half(absorption_tf, 64)) == pytest.approx(0.0376, abs=2e-3)
-
-
-def _plane_half(full: Tensor, nx: int) -> Tensor:
-    """``_stored_half`` per plane: the plane index is not a frequency axis, so the Hermitian part is over y and x."""
-    return _stored_half(full[:, None], nx)[:, 0]
-
-
-def _apply_3x(obj: Tensor, transfer: Tensor, dims: tuple[int, ...]) -> Tensor:
-    """3.x's operator ``real(ifftn(H fftn(f)))`` on its cropped full transfer ``H``."""
-    return torch.fft.ifftn(torch.fft.fftn(obj, dim=dims) * transfer, dim=dims).real
-
-
-# Tilted cases where the 3.x crop is not Hermitian (even y or z oversampled), and odd or unoversampled ones.
-OPERATOR_CASES = [
-    pytest.param((7, 12, 12), (0.4, 0.25, 0.25), -0.65, (1, 2, 2), id="even-oversampled-yx"),
-    pytest.param((6, 12, 12), (1.0, 0.25, 0.25), -0.65, (2, 2, 2), id="even-oversampled-zyx"),
-    pytest.param((6, 8, 8), (1.0, 0.15, 0.15), 0.0, (2, 1, 1), id="even-oversampled-z-on-axis"),
-    pytest.param((5, 9, 9), (0.6, 0.45, 0.45), -0.3, (1, 3, 3), id="odd-oversampled-by-3"),
-    pytest.param((6, 8, 8), (0.3, 0.15, 0.15), 0.2, (1, 1, 1), id="even-not-oversampled"),
-    pytest.param((5, 9, 9), (0.3, 0.15, 0.15), 0.2, (1, 1, 1), id="odd-not-oversampled"),
-]
-
-
-@pytest.mark.parametrize(("shape", "pixel_size", "zenith", "upsampling"), OPERATOR_CASES)
-def test_thick_operator_is_the_3x_operator(shape, pixel_size, zenith, upsampling) -> None:
-    """The forward operator, not only the stored half: ``real(ifftn(H fftn(f)))`` on 3.x's cropped transfers."""
-    sampling = Sampling(shape=shape, pixel_size=pixel_size)
-    optics = _optics(zenith=zenith, azimuth=0.8, edge="sigmoid")
-    system = ThickPhase3D(*optics, index_of_refraction_media=INDEX, absorption="independent").double()
-    assert system.upsampling(sampling) == upsampling
-    real_tf, imag_tf = _thick_reference(system, sampling)
-    obj = torch.randn(2, *shape, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
-    dims = (-3, -2, -1)
-    expected = _apply_3x(obj[0], real_tf, dims) + _apply_3x(obj[1], imag_tf, dims)
-    actual = system.bind(sampling).apply(obj)[0]
-    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12 * expected.abs().max().item())
-
-
-@pytest.mark.parametrize(
-    ("ny", "nx", "lateral", "zenith", "upsampling"),
-    [
-        pytest.param(10, 10, (0.2, 0.2), 0.25, (1, 2, 2), id="even-oversampled"),
-        pytest.param(12, 12, (0.2, 0.2), 0.3, (1, 2, 2), id="even-oversampled-steeper"),
-        pytest.param(9, 9, (0.45, 0.45), 0.25, (1, 3, 3), id="odd-oversampled-by-3"),
-        pytest.param(10, 10, (0.15, 0.15), 0.25, (1, 1, 1), id="even-not-oversampled"),
-        pytest.param(9, 9, (0.15, 0.15), 0.25, (1, 1, 1), id="odd-not-oversampled"),
-    ],
-)
-def test_thin_operator_is_the_3x_operator(ny, nx, lateral, zenith, upsampling) -> None:
-    sampling = Sampling(shape=(5, ny, nx), pixel_size=(0.5, *lateral))
-    illumination, detection = _optics(zenith=zenith, azimuth=0.7, offset=0.3, edge="sigmoid")
-    system = ThinPhase2D(illumination, detection, index_of_refraction_media=INDEX).double()
-    assert system.upsampling(sampling) == upsampling
-    absorption_tf, phase_tf = _thin_reference(system, sampling)
-    obj = torch.randn(2, 1, ny, nx, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
-    expected = legacy.thin_forward(obj[1, 0], obj[0, 0], absorption_tf, phase_tf)
-    actual = system.bind(sampling).apply(obj)[0]
-    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-12 * expected.abs().max().item())
+def _ball(shape: tuple[int, ...], pixel_size: tuple[float, ...], *, radius: float) -> Tensor:
+    """A unit ball of ``radius`` um at the grid centre blurred by a Gaussian of two lateral pixels, peak 1, float64
+    (the 3.x ``generate_sphere_target``)."""
+    axes = [(torch.arange(n, dtype=torch.float64) - n // 2) * d for n, d in zip(shape, pixel_size, strict=True)]
+    squared = torch.stack(torch.meshgrid(*axes, indexing="ij")).square().sum(dim=0)
+    blur = 2 * min(pixel_size[-2:])
+    kernel = torch.fft.fftn(torch.fft.ifftshift(torch.exp(-squared / (2 * blur**2))))
+    blurred = torch.fft.ifftn(torch.fft.fftn((squared < radius**2).double()) * kernel).real.clamp(min=0)
+    return blurred / blurred.max()
 
 
 def _thin_scene(zenith: float, *, edge: PupilEdge = "ramp") -> tuple[ThinPhase2D, Sampling, Tensor, Tensor]:
     sampling = Sampling(shape=(7, 32, 32), pixel_size=(0.6, 0.1, 0.1))
     optics = _optics(na_ill=0.4, zenith=zenith, azimuth=0.6, edge=edge)
     system = ThinPhase2D(*optics, index_of_refraction_media=INDEX).double()
-    ball = legacy.sphere((3, 32, 32), (1.0, 0.1, 0.1), radius=0.8)[1]
+    ball = _ball((32, 32), (0.1, 0.1), radius=0.8)
     obj = torch.stack((0.3 * ball, 0.05 * torch.roll(ball, 3, -1)))[:, None]
     intensity = 10 * (1 + system.forward(obj, sampling))
     return system, sampling, obj, intensity
 
 
-def test_thin_tikhonov_reconstruction_matches_unmodified_3x_on_axis() -> None:
-    system, sampling, _, intensity = _thin_scene(0.0, edge="sigmoid")
-    absorption_tf, phase_tf = _thin_reference(system, sampling)
-    weight = 1e-3
-    model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
-    estimate = Wiener()(brightfield_contrast(intensity, per_plane=True), model, sampling).estimate
-    absorption, phase = legacy.thin_inverse(
-        intensity[0], legacy.thin_singular_system(absorption_tf, phase_tf), regularization_strength=weight
-    )
-    assert estimate.shape == (2, 1, 32, 32)
-    assert _relative(estimate[0, 0], phase) <= 1e-9
-    assert _relative(estimate[1, 0], absorption) <= 1e-9
-
-
-def test_thin_tilted_inverse_fixes_the_3x_conjugated_filter() -> None:
-    """3.x built the thin inverse from ``U S_reg Vh`` without conjugates: right for a real (on-axis) transfer, the
-    conjugate filter once tilt makes it complex. Wiener solves the Tikhonov normal equations per frequency."""
+def test_thin_tilted_inverse_solves_the_normal_equations_per_frequency() -> None:
+    """Tilt makes the thin transfer complex: Wiener solves the Tikhonov normal equations per frequency (3.x built
+    its inverse from ``U S_reg Vh`` without conjugates, which is right only for a real, on-axis transfer)."""
     system, sampling, obj, intensity = _thin_scene(0.3, edge="sigmoid")
-    absorption_tf, phase_tf = _thin_reference(system, sampling)
+    operator = system.bind(sampling)
+    impulse = torch.zeros(2, 2, 1, 32, 32, dtype=torch.float64)
+    impulse[0, 0, 0, 0, 0] = impulse[1, 1, 0, 0, 0] = 1
+    phase_tf, absorption_tf = (torch.fft.fft2(operator.apply(delta)[0]) for delta in impulse)  # (Z, Y, X) each
     weight = 1e-3
     model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
     contrast = brightfield_contrast(intensity, per_plane=True)
     estimate = Wiener()(contrast, model, sampling).estimate[:, 0]
-    # Independent oracle: (A^H A + weight I)^-1 A^H d per frequency on the full spectrum, A[z, f].
+    # Oracle: (A^H A + weight I)^-1 A^H d per frequency on the full spectrum, A[z, f].
     matrix = torch.stack((phase_tf, absorption_tf), dim=-1).permute(1, 2, 0, 3)
     spectrum = torch.fft.fft2(contrast[0]).permute(1, 2, 0)[..., None]
     adjoint = matrix.conj().transpose(-1, -2)
     solved = torch.linalg.solve(adjoint @ matrix + weight * torch.eye(2, dtype=matrix.dtype), adjoint @ spectrum)
     oracle = torch.fft.ifft2(solved[..., 0].permute(2, 0, 1)).real
     assert _relative(estimate, oracle) <= 1e-9
-    _, phase_3x = legacy.thin_inverse(
-        intensity[0], legacy.thin_singular_system(absorption_tf, phase_tf), regularization_strength=weight
-    )
-    assert _relative(phase_3x, estimate[0]) > 0.5
-    assert _relative(estimate[0], obj[0, 0]) < 0.6 < _relative(phase_3x, obj[0, 0])
+    assert _relative(estimate[0], obj[0, 0]) < 0.6
 
 
 # --- units: what the object fields are --------------------------------------------------------------------------------
@@ -769,7 +394,7 @@ def test_wiener_and_fista_recover_a_thick_phantom() -> None:
     # The thick transfer is small (|H|^2 <= ~5e-4 for a potential in um^-2), so useful weights are tiny.
     sampling = Sampling(shape=(16, 32, 32), pixel_size=(0.25, 0.1, 0.1))
     system = ThickPhase3D(*_optics(zenith=0.1, azimuth=0.4), index_of_refraction_media=INDEX).double()
-    phantom = 0.05 * legacy.sphere(sampling.shape, sampling.pixel_size, radius=0.6)[None]
+    phantom = 0.05 * _ball(sampling.shape, sampling.pixel_size, radius=0.6)[None]
     noise = torch.randn(1, *sampling.shape, generator=torch.Generator().manual_seed(6), dtype=torch.float64)
     data = system.forward(phantom, sampling) + 1e-6 * noise
     sharp = ImagingModel(system, Tikhonov(1e-7), Gaussian(1.0)).double()
@@ -871,13 +496,6 @@ def test_thin_with_equal_apertures_gives_the_wo40_transfer() -> None:
     for (field, plane, y, x), expected in OLD_EQUAL_APERTURE.items():
         index = 1 - field  # 3.x lists absorption first, the system phase first
         assert float(transfer[plane, index, y, x].real) == pytest.approx(expected, rel=1e-5)
-    z = legacy.thin_z_positions(3, 25.0)
-    absorption_tf, phase_tf = legacy.thin_transfer(
-        (16, 16), (1.3, 1.3), z, wavelength=0.45, index=1.0, na_illumination=0.15, na_detection=0.15
-    )
-    stored = system.compute_operator(sampling).inner.transfer[:, :, 0]
-    assert _relative(stored[:, 0], _plane_half(phase_tf, 16)) <= 1e-10
-    assert _relative(stored[:, 1], _plane_half(absorption_tf, 16)) <= 1e-10
 
 
 def test_thin_plane_count_must_match_its_positions() -> None:

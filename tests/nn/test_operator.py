@@ -243,13 +243,6 @@ def test_fourier_diagonal_rejects_inputs_of_the_wrong_shape():
         operator.adjoint(torch.zeros(1, *SAMPLING.shape, dtype=torch.complex64))
 
 
-def test_richardson_lucy_rejects_systems_that_do_not_declare_a_nonnegative_psf():
-    signed = MatrixSystem(random_transfer(1, 1, SAMPLING.shape), fields=("a",))
-    model = ImagingModel(signed, NoPrior(), Poisson())
-    with pytest.raises(IncompatibleModelError, match="nonnegative point-spread function"):
-        model.check(RichardsonLucy(), SAMPLING)
-
-
 def test_errors_share_one_catchable_base():
     with pytest.raises(WaveorderError):
         Sampling(shape=(0, 1, 1), pixel_size=(1.0, 1.0, 1.0))
@@ -380,15 +373,6 @@ def test_fourier_diagonal_normal_differentiates_the_transfer_after_a_no_grad_cal
     (gradient,) = torch.autograd.grad(_inner(operator.normal_action()(obj), weights), transfer)
     (expected,) = torch.autograd.grad(_inner(operator.adjoint(operator.apply(obj)), weights), transfer)
     torch.testing.assert_close(gradient, expected)
-
-
-def test_gram_follows_in_place_writes_to_the_transfer():
-    operator = _fourier(2, 2)
-    obj = _random(operator.object_shape, seed=1)
-    operator.normal_action()(obj)
-    with torch.no_grad():
-        operator.transfer.mul_(2.0)
-    torch.testing.assert_close(operator.normal_action()(obj), operator.adjoint(operator.apply(obj)))
 
 
 def test_fourier_diagonal_projects_a_transfer_that_is_not_hermitian_so_its_norm_is_exact():

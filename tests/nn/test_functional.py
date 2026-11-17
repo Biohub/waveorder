@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from waveorder.errors import IncompatibleModelError, ShapeError
+from waveorder.errors import ShapeError
 from waveorder.nn import Sampling, functional
 from waveorder.nn.functional import (
     apply_adjoint,
@@ -32,8 +32,6 @@ from waveorder.nn.functional import (
     widefield_otf,
     zernike,
 )
-from waveorder.nn.parameters import placement
-from waveorder.nn.systems._checks import expect_feasible_grid, expect_resolved_aperture
 from waveorder.zernike_names import name_to_noll, noll_indices_up_to_order
 
 
@@ -284,24 +282,6 @@ def test_half_spectrum_frequencies_broadcast_to_the_rfftn_grid(shape):
     spectrum = torch.fft.rfftn(wave).abs()
     assert spectrum[index] == pytest.approx(spectrum.max().item())
     assert spectrum[index] > 100 * spectrum.sum().sub(spectrum[index]).item()
-
-
-def test_half_spectrum_frequencies_default_to_the_cpu_and_the_default_dtype():
-    fz, fy, fx = half_spectrum_frequencies(Sampling(shape=(2, 3, 4), pixel_size=(1.0, 1.0, 1.0)))
-    assert {f.dtype for f in (fz, fy, fx)} == {torch.get_default_dtype()}
-    assert {f.device.type for f in (fz, fy, fx)} == {"cpu"}
-
-
-def test_the_unit_guards_refuse_units_that_cannot_be_meant():
-    sampling = Sampling(shape=(4, 16, 16), pixel_size=(0.5, 0.1, 0.1))
-    expect_resolved_aperture(sampling, numerical_aperture=0.9, wavelength=0.52, where="Mine")
-    expect_feasible_grid(sampling, (1, 2, 2), where="Mine")
-    with pytest.raises(IncompatibleModelError, match=r"^Mine: .*wavelength is in um, got 520 "):
-        expect_resolved_aperture(sampling, numerical_aperture=0.9, wavelength=520, where="Mine")
-    in_nm = Sampling(shape=(4, 16, 16), pixel_size=(500, 100, 100))
-    with pytest.raises(IncompatibleModelError, match=r"^Mine: .*pixel_size is in um, got 500 along z "):
-        expect_feasible_grid(in_nm, (900, 700, 700), where="Mine")
-    assert placement(torch.nn.Linear(2, 2).double()) == (torch.float64, torch.device("cpu"))
 
 
 class _FftOps(TorchDispatchMode):

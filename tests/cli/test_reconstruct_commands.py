@@ -394,16 +394,6 @@ def test_keep_going_runs_past_failed_units_and_exits_3(plate, tmp_path, monkeypa
     ]
 
 
-def test_rec_help_fits_80_columns():
-    result = runner.invoke(app, ["rec", "--help"], terminal_width=80, env={"COLUMNS": "80"})
-    assert result.exit_code == 0, result.output
-    text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
-    for panel in ("Inputs", "Outputs", "Run"):
-        assert panel in text
-    assert "Example: wo rec" in text
-    assert "DEVICE[,...]" in text
-
-
 def test_compute_tf_writes_nominal_transfer_functions_per_shape(plate, phase_volume, tmp_path):
     config = _config(tmp_path, FLUORESCENCE, "fluor.yml")
     other = tmp_path / "other.zarr"

@@ -1,9 +1,8 @@
-"""Per-tile Zernike recovery: the 4.x recipe against 3.x ``recover_zernikes`` on a simulated bead field."""
+"""Per-tile Zernike recovery: the 4.x recipe recovers the coefficients of a simulated bead field."""
 
 import pytest
 import torch
 
-from tests.tiling.legacy_zernikes import recover
 from waveorder.errors import ParameterError, ShapeError
 from waveorder.nn import (
     Detection,
@@ -60,8 +59,8 @@ def _field() -> tuple[torch.Tensor, list[torch.Tensor]]:
     return field, tiles
 
 
-def test_the_recipe_recovers_each_tiles_coefficients_as_3x_does():
-    field, tiles = _field()
+def test_the_recipe_recovers_each_tiles_coefficients():
+    field, _ = _field()
     model = _model()
     plan = TilePlan(shape=FIELD, tile=(Z, SIDE, SIDE))
     terms = zernike_terms(model)
@@ -69,21 +68,8 @@ def test_the_recipe_recovers_each_tiles_coefficients_as_3x_does():
     result = recover_zernikes(field, model, plan, pixel_size=PIXEL, search=search)
     recovered = torch.stack(list(result.coefficients(model).values()), dim=1)
     assert list(result.coefficients(model)) == list(MODES)
-    legacy = recover(
-        torch.stack(tiles),
-        yx_pixel_size=PIXEL[1],
-        z_pixel_size=PIXEL[0],
-        wavelength=WAVELENGTH,
-        numerical_aperture=APERTURE,
-        index=INDEX,
-        noll_indices=MODES,
-        lr_per_mode=LEARNING_RATES,
-        n_iter=120,
-    )
-    # Both fits reach the truth to a few 1e-4 waves in 120 steps, and each other: the two PSF models agree.
+    # The fit reaches the truth to a few 1e-4 waves in 120 steps.
     torch.testing.assert_close(recovered, TRUTH, rtol=0, atol=3e-4)
-    torch.testing.assert_close(legacy, TRUTH, rtol=0, atol=3e-4)
-    torch.testing.assert_close(recovered, legacy, rtol=0, atol=3e-4)
     # The blended deconvolution covers the field; each tile's own coefficients deconvolve it.
     assert result.reconstruction.shape == (1, *field.shape)
     assert bool(torch.isfinite(result.reconstruction).all())

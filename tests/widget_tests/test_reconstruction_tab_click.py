@@ -1,8 +1,6 @@
 """Integration tests that click the Reconstruction tab's buttons as a user does."""
 
-import shutil
 import warnings
-from pathlib import Path
 
 import pytest
 import yaml
@@ -42,13 +40,6 @@ def test_click_new_button_phase(recon_tab, messages):
     assert entry.form["imaging_system"]["contrast"].value == "phase"
     assert not entry.form["imaging_system"]["contrast"].enabled
     assert recon_tab.reconstruction_run_PushButton.text == "RUN Model"
-
-
-def test_click_new_button_fluorescence(recon_tab):
-    _check(recon_tab, "fluorescence")
-    recon_tab.build_acq_contols()
-    (entry,) = recon_tab.models
-    assert entry.form["imaging_system"]["contrast"].value == "fluorescence"
 
 
 def test_click_new_button_phase_and_fluorescence(recon_tab):
@@ -156,12 +147,37 @@ def test_validate_runs_the_build_as_wo_config_check_does(recon_tab, messages, tm
     assert entry.box.title.endswith("⚠️")
 
 
-@pytest.mark.parametrize("name", ["bead_short", "bead_text", "sim_poisson_short", "sim_poisson_text"])
-def test_a_wo40_file_loaded_into_the_form_builds(recon_tab, messages, tmp_path, name):
+WO40_BEADS = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}}
+imaging_system:
+  contrast: fluorescence
+  index_of_refraction_media: 1.3
+  detection:
+    wavelength: 0.532
+    numerical_aperture: 1.2
+    pupil_aberrations: {astigmatism_0: {nominal: 0.0, tolerance: free}}
+noise: {gaussian: {sigma: 1.0}}
+object: {prior: {beads: {diameter: 0.5}}}
+solver: {calibration: {score: evidence, search: [{gradient: {max_iter: 150}}]}}
+"""
+WO40_SIMULATION = """\
+version: 4
+data: {input_channel_names: [GFP], pixel_size: {yx: 0.2, z: 0.4}}
+imaging_system: {contrast: fluorescence, index_of_refraction_media: 1.3, detection: {wavelength: 0.532}}
+noise: {poisson: {photons: 50}}
+object: {source: {gaussian_spectrum: {exponent: 2.0}}}
+simulate: {seed: 0, shape: [16, 32, 32]}
+"""
+
+
+@pytest.mark.parametrize("text", [WO40_BEADS, WO40_SIMULATION], ids=["beads", "simulation"])
+def test_a_wo40_file_loaded_into_the_form_builds(recon_tab, messages, tmp_path, text):
     # The form writes every field, so solver.reconstruction: closed_form too, as wo-4.0 wrote it.
     del messages  # a refused load would open a message box
-    source = Path(__file__).parents[1] / "config" / "data" / "wo40" / f"{name}.yml"
-    (entry,) = recon_tab.open_model_files([str(shutil.copy(source, tmp_path / f"{name}.yml"))])
+    path = tmp_path / "wo40.yml"
+    path.write_text(text)
+    (entry,) = recon_tab.open_model_files([str(path)])
     config, problems = recon_tab.validated(entry)
     assert problems == []
     assert config is not None

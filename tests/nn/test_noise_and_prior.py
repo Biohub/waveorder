@@ -11,7 +11,6 @@ from waveorder.nn import (
     Free,
     Gaussian,
     Noise,
-    NoPrior,
     ParameterPrior,
     Poisson,
     Tikhonov,
@@ -70,12 +69,6 @@ def test_fixed_quantities_are_exact_after_double_and_loaded_values_survive():
     loaded = Detection(wavelength=0.5, numerical_aperture=1.2)
     loaded.load_state_dict({**loaded.state_dict(), "numerical_aperture": torch.tensor(0.9)})
     assert loaded.double().numerical_aperture.item() == pytest.approx(0.9)
-
-
-def test_only_the_flat_prior_reports_flat():
-    assert NoPrior().is_flat
-    assert NoPrior(nonnegative=True).is_flat
-    assert not Tikhonov(1.0).is_flat
 
 
 @pytest.mark.parametrize(

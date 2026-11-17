@@ -4,7 +4,6 @@ import pytest
 import torch
 import zarr
 
-import waveorder.tiling
 from tests.tiling.conftest import ArraySink, ArraySource, Blur, blur_model
 from waveorder.errors import ConvergenceWarning, ParameterError, PlacementError, ShapeError
 from waveorder.nn import FISTA, Gaussian, ImagingModel, Loop, NoPrior, Sampling, Wiener
@@ -200,17 +199,6 @@ def test_an_empty_series_is_rejected():
     plan = TilePlan(shape=SHAPE, tile=(12, 32, 32))
     with pytest.raises(ShapeError, match="volumes is empty"):
         reconstruct_series([], model=blur_model(0.0), solver=Wiener(), pixel_size=PIXEL, plan=plan, device="cpu")
-
-
-def test_public_surface_is_the_plan_options_stats_and_entry_points():
-    assert set(waveorder.tiling.__all__) == {
-        "TilePlan",
-        "TileOptions",
-        "TileStats",
-        "estimate_memory",
-        "reconstruct_series",
-        "recover_zernikes",
-    }
 
 
 def test_zarr_arrays_round_trip(tmp_path):

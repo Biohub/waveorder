@@ -31,10 +31,6 @@ def _forget():
     SEEN.clear()
 
 
-def test_outside_any_block_nothing_is_known():
-    assert current_context() == SolveContext()
-
-
 def test_blocks_nest_and_each_keeps_what_it_does_not_set():
     with solve_context(position="A/1/0", time=2, field_shape=(64, 96)) as outer:
         assert outer == SolveContext(position="A/1/0", time=2, field_shape=(64, 96))

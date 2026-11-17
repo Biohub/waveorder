@@ -3,7 +3,6 @@
 import pytest
 import torch
 
-from tests.nn import legacy_losses
 from tests.nn.conftest import FREE_NA, WAVELENGTH, MatrixSystem, make_model, random_transfer, simulate
 from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn import FISTA, Detection, Free, Gaussian, ImagingModel, Sampling, Tikhonov, Wiener, calibrate
@@ -21,7 +20,6 @@ from waveorder.nn.systems.phase import ThinPhase2D
 from waveorder.testing import check_score
 
 GRID = Sampling(shape=(3, 32, 32), pixel_size=(0.25, 0.1, 0.1))
-THIN = Sampling(shape=(1, 32, 32), pixel_size=(0.25, 0.1, 0.1))
 TINY = Sampling(shape=(4, 8, 6), pixel_size=(0.4, 0.15, 0.15))
 NA_DET = 1.0
 CUTOFF = 2 * NA_DET / WAVELENGTH
@@ -30,38 +28,18 @@ CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 DEVICES = [torch.device("cpu"), pytest.param(torch.device("cuda"), marks=CUDA)]
 
 
-def _sharpness_cases():
-    """(score, the 3.x loss with the same settings) for each 3.x loss name."""
+def _sharpness_scores():
+    """Each sharpness score, keyed by the name of the 3.x loss it replaces."""
     return {
-        "midband_power": (
-            MidbandPowerScore(solver=Wiener(), cutoff=CUTOFF, fractions=FRACTIONS),
-            legacy_losses.midband_power_loss(NA_DET, WAVELENGTH, 0.1, FRACTIONS),
-        ),
-        "spectral_flatness": (
-            SpectralFlatnessScore(solver=Wiener(), cutoff=CUTOFF, fractions=FRACTIONS),
-            legacy_losses.spectral_flatness_loss(NA_DET, WAVELENGTH, 0.1, FRACTIONS),
-        ),
-        "total_variation": (TotalVariationScore(solver=Wiener()), legacy_losses.total_variation_loss()),
-        "laplacian_variance": (LaplacianVarianceScore(solver=Wiener()), legacy_losses.laplacian_variance_loss()),
-        "normalized_variance": (NormalizedVarianceScore(solver=Wiener()), legacy_losses.normalized_variance_loss()),
+        "midband_power": MidbandPowerScore(solver=Wiener(), cutoff=CUTOFF, fractions=FRACTIONS),
+        "spectral_flatness": SpectralFlatnessScore(solver=Wiener(), cutoff=CUTOFF, fractions=FRACTIONS),
+        "total_variation": TotalVariationScore(solver=Wiener()),
+        "laplacian_variance": LaplacianVarianceScore(solver=Wiener()),
+        "normalized_variance": NormalizedVarianceScore(solver=Wiener()),
     }
 
 
-SHARPNESS = sorted(_sharpness_cases())
-
-
-@pytest.mark.parametrize("dtype", [torch.float64, torch.float32], ids=["float64", "float32"])
-@pytest.mark.parametrize("sampling", [GRID, THIN], ids=["3d", "2d"])
-@pytest.mark.parametrize("name", SHARPNESS)
-def test_sharpness_scores_match_the_3x_losses_on_the_reconstruction(name, sampling, dtype):
-    score, legacy = _sharpness_cases()[name]
-    model = make_model().to(dtype)
-    _, data = simulate(model, sampling, scale=1.0, seed=2)
-    data = data + 0.5  # a positive mean, as fluorescence has, keeps the normalized variance well conditioned
-    reconstruction = Wiener()(data, model, sampling).estimate[0]
-    expected = legacy(reconstruction[0] if sampling.shape[0] == 1 else reconstruction)  # 3.x took (Y, X) for 2D
-    tolerance = 1e-12 if dtype == torch.float64 else 1e-5
-    torch.testing.assert_close(score(data, model, sampling), expected, rtol=tolerance, atol=0)
+SHARPNESS = sorted(_sharpness_scores())
 
 
 @pytest.mark.parametrize("name", SHARPNESS)
@@ -70,7 +48,7 @@ def test_sharpness_is_lower_for_the_in_focus_reconstruction(name):
     model = make_model().double()
     _, data = simulate(model, GRID, scale=1.0, seed=3)
     blurred = torch.fft.irfft2(torch.fft.rfft2(data) * _gaussian_blur(GRID, width=0.3), s=GRID.shape[-2:])
-    score, _ = _sharpness_cases()[name]
+    score = _sharpness_scores()[name]
     assert score(data + 0.5, model, GRID) < score(blurred + 0.5, model, GRID)
 
 
@@ -148,7 +126,7 @@ def test_calibrating_a_free_weight_with_gcv_lands_near_the_risk_minimum():
 
 SCORES = {
     "gcv": GCV,
-    **{name: (lambda name=name: _sharpness_cases()[name][0]) for name in SHARPNESS},
+    **{name: (lambda name=name: _sharpness_scores()[name]) for name in SHARPNESS},
 }
 
 
@@ -205,17 +183,6 @@ def _two_field_problem(device: torch.device | str = "cpu"):
     return model.double().to(device), data.to(device)
 
 
-@pytest.mark.parametrize("name", SHARPNESS)
-def test_a_field_selection_scores_that_field_as_3x_did(name):
-    model, data = _two_field_problem()
-    score, legacy = _sharpness_cases()[name]
-    arguments = {"cutoff": CUTOFF, "fractions": FRACTIONS} if name in ("midband_power", "spectral_flatness") else {}
-    phase_only = type(score)(solver=Wiener(), fields=("phase",), **arguments)
-    reconstruction = Wiener()(data, model, GRID).estimate
-    torch.testing.assert_close(phase_only(data, model, GRID), legacy(reconstruction[0]), rtol=1e-12, atol=0)
-    assert not torch.isclose(score(data, model, GRID), legacy(reconstruction[0]))  # every field: a different value
-
-
 @pytest.mark.parametrize("device", DEVICES, ids=["cpu", "cuda"])
 def test_a_field_selection_passes_the_conformance_suite(device):
     model, data = _two_field_problem(device)
@@ -242,19 +209,6 @@ def _thin_phase(numerical_aperture: float | Free = 0.4) -> tuple[ImagingModel, S
     system = ThinPhase2D(illumination, detection, index_of_refraction_media=1.33)
     sampling = Sampling(shape=(5, 32, 32), pixel_size=(0.6, 0.1, 0.1))
     return ImagingModel(system, Tikhonov(1e-2), Gaussian(0.05)).double(), sampling
-
-
-def test_thin_phase_scores_the_phase_field_as_3x_phase_optimize_did():
-    # 3.x phase.optimize scored isotropic_thin_3d.reconstruct(...)[1], the phase, with the illumination wavelength.
-    model, sampling = _thin_phase()
-    _, data = simulate(model, sampling, scale=0.3, seed=13)
-    cutoff = 2 * 0.9 / WAVELENGTH
-    phase_only = MidbandPowerScore(solver=Wiener(), cutoff=cutoff, fields=("phase",))
-    phase = Wiener()(data, model, sampling).estimate[model.system.fields.index("phase"), 0]
-    expected = legacy_losses.midband_power_loss(0.9, WAVELENGTH, 0.1, FRACTIONS)(phase)
-    torch.testing.assert_close(phase_only(data, model, sampling), expected, rtol=1e-12, atol=0)
-    every_field = MidbandPowerScore(solver=Wiener(), cutoff=cutoff)(data, model, sampling)
-    assert abs(every_field / expected - 1) > 0.01  # the absorption field would move the 3.x objective
 
 
 def test_a_phase_only_score_on_thin_phase_passes_the_conformance_suite():

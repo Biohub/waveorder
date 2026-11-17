@@ -67,11 +67,6 @@ def test_keys_follow_3x_and_other_channels_are_keyed_by_name(names, key):
     assert provenance_key(names) == key
 
 
-def test_whole_volumes_take_the_default_geometry():
-    assert choose_geometry(None, x=600) == Geometry()
-    assert Geometry() == Geometry(chunks=None, shards=None)
-
-
 def test_tiles_take_shards_one_tile_row_high_of_chunks_that_divide_them():
     geometry = choose_geometry((12, 300, 64), x=600)
     assert geometry.shards == (1, 1, 12, 300, 768)

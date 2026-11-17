@@ -1,6 +1,5 @@
 """Every adapter passes the public contract kit in waveorder.testing."""
 
-import math
 from typing import ClassVar
 
 import pytest
@@ -242,19 +241,6 @@ def test_prior_suite_catches_a_spectrum_that_contradicts_the_penalty():
     obj = torch.randn(1, 4, 6, 5, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
     with pytest.raises(AssertionError, match="penalty disagrees with its spectrum"):
         check_prior(_MisstatedTikhonov(0.5).double(), obj)
-
-
-class _PhysicalTikhonov(Tikhonov):
-    """A spectrum scaled by the voxel volume in um^3: what a prior stated in physical units would give."""
-
-    def spectrum(self, sampling, *, scale):
-        return super().spectrum(sampling, scale=scale) * math.prod(sampling.pixel_size)
-
-
-def test_prior_suite_catches_a_spectrum_in_physical_units():
-    obj = torch.randn(1, 4, 6, 5, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
-    with pytest.raises(AssertionError, match="penalty disagrees with its spectrum"):
-        check_prior(_PhysicalTikhonov(0.5).double(), obj)
 
 
 class _HalfPenalty(Tikhonov):

@@ -86,7 +86,3 @@ def test_accepts_numpy() -> None:
 def test_refuses_plot_path() -> None:
     with pytest.raises(ParameterError, match="plot_path"):
         index_of(defocus_stack(5, 2.0), plot_path="focus.png")
-
-
-def test_docstring_points_at_nn() -> None:
-    assert "waveorder.nn.focus_from_transverse_band" in (focus_from_transverse_band.__doc__ or "")

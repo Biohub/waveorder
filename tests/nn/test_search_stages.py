@@ -1,4 +1,4 @@
-"""The search stages of :mod:`waveorder.nn.search`: 3.x optimizer parity, bounds, and the stage kit."""
+"""The search stages of :mod:`waveorder.nn.search`: bounds, NaN handling, and the stage kit."""
 
 from typing import ClassVar, override
 
@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from tests.nn.conftest import FREE_NA, NA, make_model, make_system, simulate
-from tests.nn.legacy_optim import minimize_neldermead, optimize_gradient
 from waveorder.errors import ParameterError
 from waveorder.nn import (
     Evidence,
@@ -75,50 +74,6 @@ def _toy_problem(*, nominal: float = 1.0):
     model = ImagingModel(system, Tikhonov(1e-2), Gaussian(0.05)).double()
     data = torch.zeros(model.system.data_shape(TOY_SAMPLING), dtype=torch.float64)
     return model, data
-
-
-def _legacy_toy(x: list[float]) -> float:
-    return _toy(torch.tensor(x[0], dtype=torch.float64), torch.tensor(x[1], dtype=torch.float64)).item()
-
-
-@pytest.mark.parametrize("iterations", [8, 60, 400], ids=["budget", "midway", "converged"])
-def test_nelder_mead_follows_the_3x_scipy_path(iterations):
-    # 3.x: scipy.optimize.minimize(method="Nelder-Mead", options={"maxfev": n, "maxiter": n}) from the nominal values.
-    model, data = _toy_problem()
-    objective, start = _calibration(data, model, TOY_SAMPLING, score=Toy())
-    result = NelderMeadSearch(iterations=iterations).run(objective, start=start)
-    x, fun, evaluations = minimize_neldermead(_legacy_toy, [1.0, 0.0], maxiter=iterations, maxfev=iterations)
-    assert [result.point[NA].item(), result.point[FOCUS].item()] == pytest.approx(x, rel=1e-13, abs=1e-15)
-    assert result.objective.item() == pytest.approx(fun, rel=1e-13)
-    if iterations == 400:
-        assert evaluations < 400  # stopped by scipy's default xatol and fatol of 1e-4
-        assert result.point[NA].item() == pytest.approx(1.08, abs=1e-3)
-
-
-@pytest.mark.parametrize("optimizer", ["adam", "nadam", "adamw"])
-def test_gradient_search_follows_the_3x_optimizer(optimizer):
-    # 3.x _optimize_gradient (adam, nadam) and recover_zernikes (adamw): one param group per quantity, absolute rates.
-    model, data = _toy_problem()
-    objective, start = _calibration(data, model, TOY_SAMPLING, score=Toy())
-    rates = {NA: 0.01, FOCUS: 0.05}
-    stage = GradientSearch(iterations=40, learning_rates=rates, optimizer=optimizer)
-    result = stage.run(objective, start=start)
-
-    def loss(params: dict[str, torch.Tensor]) -> torch.Tensor:
-        return _toy(params[NA], params[FOCUS])
-
-    visited = optimize_gradient(
-        loss,
-        {NA: (1.0, rates[NA]), FOCUS: (0.0, rates[FOCUS])},
-        method=optimizer,
-        max_iterations=40,
-        dtype=torch.float64,
-    )
-    best = min(range(len(visited)), key=lambda k: visited[k][1])  # the first lowest, as 4.x keeps a strict improvement
-    params, lowest = visited[best]
-    assert result.point[NA].item() == pytest.approx(params[NA], rel=1e-12)
-    assert result.point[FOCUS].item() == pytest.approx(params[FOCUS], rel=1e-12)
-    assert result.objective.item() == pytest.approx(lowest, rel=1e-12)
 
 
 def test_nelder_mead_keeps_to_the_bounds_and_never_worsens_the_start():

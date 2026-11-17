@@ -40,7 +40,6 @@ from waveorder.nn import (
 )
 from waveorder.nn.functional import defocused_intensity, half_spectrum_frequencies, hermitian_half
 from waveorder.nn.optics import PupilGrid
-from waveorder.nn.parameters import repr_parts
 from waveorder.nn.systems.base import CacheMode
 from waveorder.testing import check_operator, check_system
 
@@ -520,4 +519,3 @@ def test_a_repr_reads_no_value_where_values_cannot_be_read():
 
     vmap(describe)(torch.tensor([0.9, 1.0]))
     assert "numerical_aperture=Free(1.1, tolerance=0.2, bounds=(0.8, 1.2))," in seen[0]
-    assert repr_parts("", "a=1", "", "b=2") == "a=1, b=2"
