@@ -764,8 +764,9 @@ class ReconstructionModel:
         pixel_size : float, (z, yx) or (z, y, x), optional
             Voxel size in um for this call; by default the model's :attr:`pixel_size`.
         prior : ParameterPrior or TfStore, optional
-            Prior over the free quantities; a store's values become the prior centres. By default the prior the
-            quantities' tolerances declare.
+            Prior over the free quantities; a store's values become the prior centres and its covariance, where
+            usable, their correlated Gaussian prior (:meth:`TfStore.to_prior`). By default the prior the quantities'
+            tolerances declare.
         prepared : bool
             The data is already what the system measures, so :meth:`prepare` is skipped.
         history : bool
@@ -1301,7 +1302,8 @@ class ReconstructionModel:
         time : int, optional
             The absolute time index; the first by default.
         prior : TfStore, str or Path, optional
-            A previous calibration (a store or its path) whose values become the prior centres.
+            A previous calibration (a store or its path) whose values become the prior centres and whose covariance,
+            where usable, their width (:meth:`~waveorder.io.TfStore.to_prior`).
         start : TfStore, str or Path, optional
             A previous calibration whose values start the search.
         dry_run : bool

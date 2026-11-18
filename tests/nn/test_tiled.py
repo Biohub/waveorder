@@ -20,6 +20,7 @@ from waveorder.nn import (
     RandomSearch,
     Sampling,
     Tikhonov,
+    ZernikeAberration,
     calibrate,
     calibrate_tiles,
     free_specs,
@@ -107,6 +108,28 @@ def test_a_prior_of_one_row_per_tile_gives_each_tile_its_row():
         )
         assert result.parameters[NA][index].item() == pytest.approx(alone.parameters[NA].item(), rel=1e-12)
         assert result.objective[index].item() == pytest.approx(alone.objective.item(), rel=1e-12)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2], ids=["all_at_once", "chunks_of_two"])
+def test_each_tile_gets_the_covariance_calibrate_gives_it_alone(chunk_size):
+    """Two system quantities, so the per-tile blocks of the batched Hessian carry their off-diagonal terms."""
+    stages = (GridSearch(points=5), GradientSearch(iterations=10))
+    tiles = _tiles(torch.float64)
+
+    def model():
+        aberration = ZernikeAberration({"defocus": Free(0.0, tolerance=0.1, bounds=(-0.3, 0.3))})
+        return make_model(FREE_NA, pupil_aberrations=aberration).double()
+
+    result = calibrate_tiles(tiles, model(), SAMPLING, score=Evidence(), search=stages, chunk_size=chunk_size)
+    for index, tile in enumerate(tiles):
+        alone = calibrate(tile, model(), SAMPLING, score=Evidence(), search=stages)
+        assert alone.covariance is not None
+        assert alone.covariance.shape == (2, 2)
+        assert result.tiles[index].covariance_names == alone.covariance_names
+        batched = result.tiles[index].covariance
+        assert batched is not None
+        assert torch.allclose(batched, alone.covariance, rtol=1e-8)
+        assert float(alone.covariance[0, 1].abs()) > 0
 
 
 def test_each_tile_reports_its_own_bounds():

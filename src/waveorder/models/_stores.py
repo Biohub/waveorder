@@ -457,8 +457,11 @@ def _checked_store(
     return None
 
 
-def _warn_prior(store: TfStore, specs: Mapping[str, Free]) -> None:
-    """Warn of a prior mean on its quantity's bound, and of named quantities without a tolerance (a flat prior)."""
+def _warn_prior(store: TfStore, specs: Mapping[str, Free], prior: ParameterPrior) -> None:
+    """Warn of a prior mean on its quantity's bound, and of named quantities with no prior term (a flat prior).
+
+    A named quantity has a term from the store's covariance (``prior.precision_names``) or else from its tolerance.
+    """
     location = where("prior", store.path)
     at_bound = store.provenance.get("at_bound")
     ended = set()
@@ -476,11 +479,13 @@ def _warn_prior(store: TfStore, specs: Mapping[str, Free]) -> None:
                 "there, so the prior may hold the search on the bound",
                 location=location,
             )
-    flat = [name for name, spec in specs.items() if name in store.parameter_names and spec.tolerance is None]
+    covered = set(prior.covered)
+    flat = [name for name in specs if name in store.parameter_names and name not in covered]
     if flat:
         warn(
-            f"sets no prior on {', '.join(flat)}: the model gives them no tolerance, so their prior stays flat and "
-            "only the search starts at the stored values; give them a tolerance",
+            f"sets no prior on {', '.join(flat)}: the store holds no covariance for them and the model gives them no "
+            "tolerance, so their prior stays flat and only the search starts at the stored values; give them a "
+            "tolerance",
             location=location,
         )
 
@@ -543,8 +548,7 @@ def search_inputs(
     values = None
     if specs and prior_store is not None:
         with problems.collect(location=where("prior", prior_store.path)):
-            prior_store.to_prior(specs)
-            _warn_prior(prior_store, specs)
+            _warn_prior(prior_store, specs, prior_store.to_prior(specs))
     if specs:
         with problems.collect():
             values = _start(specs, prior=prior_store, start=start_store)

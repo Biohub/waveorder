@@ -1,7 +1,7 @@
 """The pieces of a model's ``calibrate_position``: its checks, its calibration, and the store of what it found.
 
-The volume is calibrated whole, or each field tile on its own; the ``tf.zarr`` store carries the values found and,
-for a whole-volume evidence calibration, their covariance (zeros for field tiles and a bead fit, which give none).
+The volume is calibrated whole, or each field tile on its own; the ``tf.zarr`` store carries the values found and
+their Laplace covariance where the calibration gives one (an evidence or GCV score, or a bead fit).
 """
 
 import logging
@@ -154,16 +154,20 @@ class _Estimates:
     scores: dict[str, Tensor]
     grid_columns: list[str] | None = None
     covariance: Tensor | None = None
-    """``(T, P, P)`` over :attr:`names`; ``None`` where the calibration gives none (field tiles, a bead fit)."""
+    """``(T, P, P)`` over :attr:`names`; ``None`` where the calibration gives none (a score without a covariance)."""
 
 
 def _embedded(names: Sequence[str], covariance: Tensor | None, covered: Sequence[str]) -> Tensor | None:
-    """Embed ``covariance`` over ``covered`` in a ``(1, P, P)`` one over ``names``, zero elsewhere; ``None`` stays."""
+    """Embed an ``(S, S)`` or ``(T, S, S)`` ``covariance`` over ``covered`` in a ``(T, P, P)`` one over ``names``.
+
+    Entries outside ``covered`` are zero; ``None`` stays ``None``.
+    """
     if covariance is None:
         return None
-    embedded = torch.zeros(1, len(names), len(names), dtype=torch.float64)
+    rows_covered = covariance.detach().cpu().double().reshape(-1, len(covered), len(covered))
+    embedded = torch.zeros(rows_covered.shape[0], len(names), len(names), dtype=torch.float64)
     rows = torch.tensor([names.index(name) for name in covered])
-    embedded[0, rows[:, None], rows] = covariance.detach().cpu().double()
+    embedded[:, rows[:, None], rows] = rows_covered
     return embedded
 
 
@@ -181,7 +185,6 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
     found = dict(result.parameters)
     scores: dict[str, Tensor] = {}
     columns = None
-    covariance: tuple[Tensor | None, tuple[str, ...]] = (None, ())  # a bead fit gives none
     if isinstance(result, BeadCalibration):  # an objective trace, and no bounds but the noise level's
         at_bound, objective = [], result.trace[-1]
         if "score_trace" in wanted:
@@ -206,7 +209,6 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
             scores["score_grid"], columns = result.grid.values, [*result.grid.names, "objective"]
         if auto is not None and result.sweep is not None:
             _write_sweep(result.sweep, auto, title=f"{plan.name}   t={plan.time}")
-        covariance = (result.covariance, result.covariance_names)
     names = tuple(name for name in plan.names if name in found)
     parameters = float64(torch.stack([torch.as_tensor(found[name]).reshape(()) for name in names]))
     return _Estimates(
@@ -216,7 +218,7 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
         objective=[shortest_decimal(float(objective.detach()), torch.float32)],
         scores=scores,
         grid_columns=columns,
-        covariance=_embedded(names, *covariance),
+        covariance=_embedded(names, result.covariance, result.covariance_names),
     )
 
 
@@ -245,12 +247,15 @@ def _calibrate_field_tiles(model: ReconstructionModel, volume: Tensor, plan: Pla
         data, pixel_size=plan.pixel_size, plan=plan.tile_plan, start=start, prior=search.prior, prepared=True
     )
     model.tile_parameters = dict(tiled.parameters)
+    covariances = [tile.covariance for tile in tiled.tiles if tile.covariance is not None]
+    covariance = torch.stack(covariances) if covariances else None
     return _Estimates(
         names=plan.names,
         parameters=torch.stack([float64(tiled.parameters[name]) for name in plan.names], dim=1),
         at_bound=[list(tile.at_bound) for tile in tiled.tiles],
         objective=float64(tiled.objective).tolist(),
         scores={},
+        covariance=_embedded(plan.names, covariance, tiled.tiles[0].covariance_names),
     )
 
 

@@ -13,9 +13,10 @@ from torch import Tensor
 from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn.model import ImagingModel, expect_on_system
 from waveorder.nn.noise import Gaussian, estimate_sigma
-from waveorder.nn.parameters import ParameterPrior, free_specs
+from waveorder.nn.parameters import ParameterPrior, evaluate, free_specs
 from waveorder.nn.priors import Beads
 from waveorder.nn.sampling import Data, Sampling
+from waveorder.nn.search.base import curvature_covariance, on_bounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,12 @@ class BeadCalibration:
         The model's noise is left as it was.
     trace : Tensor
         ``(iterations,)`` objective before each step.
+    covariance : Tensor
+        ``(S, S)`` Laplace covariance of the system's free quantities :attr:`covariance_names`: the inverse Hessian
+        of the objective over them at :attr:`parameters`, the beads, background and noise held at their fit, as in
+        wo-4.0. All NaN if a quantity is on a bound or the Hessian is not positive definite.
+    covariance_names : tuple[str, ...]
+        The rows and columns of :attr:`covariance`, by dotted name: :attr:`parameters`' names.
     """
 
     parameters: dict[str, Tensor]
@@ -45,6 +52,8 @@ class BeadCalibration:
     background: Tensor
     noise_sigma: Tensor
     trace: Tensor
+    covariance: Tensor
+    covariance_names: tuple[str, ...]
 
 
 def calibrate_beads(
@@ -58,7 +67,7 @@ def calibrate_beads(
     at :meth:`~waveorder.nn.priors.Beads.detect`'s peaks, the background at the median and an estimated ``sigma`` at
     ``1.4826 * MAD``. Adam runs the system's quantities and ``log sigma`` at ``learning_rate``, positions, log
     amplitudes and background at 10 times it, and clamps the system's quantities to their bounds after each step. The
-    last iterate is kept, as in 3.x.
+    last iterate is kept, as in 3.x, and the curvature there gives :attr:`BeadCalibration.covariance`.
 
     Parameters
     ----------
@@ -126,27 +135,37 @@ def calibrate_beads(
         groups.append({"params": [log_sigma], "lr": learning_rate})
     optimizer = torch.optim.Adam(groups)
 
-    def objective() -> Tensor:
+    def objective(values: dict[str, Tensor]) -> Tensor:
         obj = beads.render(positions, log_amplitudes.exp(), sampling).to(volume.dtype)
-        predicted = model.system(obj[None], sampling)[0].to(wide) + background
+        predicted = evaluate(lambda m: m.system(obj[None], sampling)[0], model, values).to(wide) + background
         variance = (2 * log_sigma).exp()
         misfit = (predicted - target).square().sum() / (2 * variance)
         normalization = 0.5 * volume.numel() * torch.log(2 * math.pi * variance)
-        return misfit + normalization + prior.nll({name: parameters[name] for name in specs})
+        return misfit + normalization + prior.nll(values)
 
+    names = tuple(specs)
     trace = []
     for _ in range(iterations):
         optimizer.zero_grad()
-        value = objective()
+        value = objective({name: parameters[name] for name in names})
         value.backward()
         optimizer.step()
         prior.clamp_(model)
         trace.append(value.detach())
+    point = {name: parameters[name].detach().clone() for name in names}
+    # Differentiated in the system's quantities alone: the beads, background and noise stay at their fit.
+    covariance = curvature_covariance(
+        lambda values: objective(dict(zip(names, values.unbind(-1), strict=True))),
+        torch.stack([point[name] for name in names], dim=-1),
+        on_bounds(specs, point).any(dim=0),
+    )
     return BeadCalibration(
-        parameters={name: parameters[name].detach().clone() for name in specs},
+        parameters=point,
         positions=positions.detach(),
         amplitudes=log_amplitudes.detach().exp(),
         background=background.detach(),
         noise_sigma=log_sigma.detach().exp(),
         trace=torch.stack(trace),
+        covariance=covariance,
+        covariance_names=names,
     )

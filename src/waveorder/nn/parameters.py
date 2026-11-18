@@ -303,10 +303,12 @@ def _clamped(specs: Mapping[str, Free], params: Mapping[str, Tensor]) -> dict[st
 
 @dataclass(frozen=True, slots=True)
 class ParameterPrior:
-    """The calibration term ``C(H) = -log p(H)`` over free quantities, independent per quantity.
+    """The calibration term ``C(H) = -log p(H)`` over free quantities.
 
-    A quantity with a ``tolerance`` contributes a Gaussian term; one without contributes nothing (a flat prior).
-    Bounds are hard limits applied by :meth:`clamp`, not a term in :meth:`nll`.
+    A quantity with a ``tolerance`` contributes an independent Gaussian term; one without contributes nothing (a
+    flat prior). The quantities :attr:`precision_names` instead share one correlated Gaussian term
+    ``0.5 * r^T P r``, ``r`` their offsets from their centres, which replaces their tolerances. Bounds are hard limits
+    applied by :meth:`clamp`, not a term in :meth:`nll`.
 
     Parameters
     ----------
@@ -315,13 +317,42 @@ class ParameterPrior:
     centers : Mapping[str, Tensor], optional
         Centres that replace the ``nominal`` of the quantities named, as CPU tensors of shape ``(1,)`` (shared by
         every tile) or ``(T,)`` (one per tile), in the quantity's units, e.g. from an earlier calibration.
+    precision : Tensor, optional
+        ``(1, S, S)`` (shared by every tile) or ``(T, S, S)`` (one per tile) CPU precision matrix, the inverse
+        covariance, over :attr:`precision_names`, in their units, e.g. an earlier calibration's covariance inverted.
+    precision_names : tuple[str, ...]
+        The ``S`` quantities of :attr:`precision`, in its row order; names of :attr:`specs`.
+
+    Raises
+    ------
+    ParameterError
+        If ``precision`` is not ``(rows, S, S)`` over ``S`` distinct names of ``specs``.
     """
 
     specs: Mapping[str, Free]
     centers: Mapping[str, Tensor] = field(default_factory=dict)
+    precision: Tensor | None = None
+    precision_names: tuple[str, ...] = ()
     _placed: dict[tuple[str, torch.dtype, torch.device], Tensor] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
+
+    def __post_init__(self) -> None:
+        names = self.precision_names
+        if self.precision is None:
+            if names:
+                raise ParameterError(f"precision_names {list(names)} are given without a precision", path="precision")
+            return
+        size = len(names)
+        shape = tuple(self.precision.shape)
+        if len(shape) != 3 or shape[1:] != (size, size) or len(set(names)) != size or size == 0:
+            raise ParameterError(
+                f"precision must be (rows, S, S) over S distinct precision_names, got {shape} over {list(names)}",
+                path="precision",
+            )
+        unknown = [name for name in names if name not in self.specs]
+        if unknown:
+            raise ParameterError(f"precision_names {unknown} are no quantities of the prior", path="precision_names")
 
     @classmethod
     def from_module(cls, module: nn.Module) -> Self:
@@ -330,13 +361,17 @@ class ParameterPrior:
 
     @property
     def covered(self) -> tuple[str, ...]:
-        """The quantities with a ``tolerance``."""
-        return tuple(name for name, spec in self.specs.items() if spec.tolerance is not None)
+        """The quantities with a Gaussian term: a ``tolerance``, or a row of :attr:`precision`."""
+        joint = set(self.precision_names)
+        return tuple(name for name, spec in self.specs.items() if spec.tolerance is not None or name in joint)
 
     @property
     def tiles(self) -> int:
-        """Rows of the prior: the most rows of :attr:`centers`, 1 without them."""
-        return max((int(center.shape[0]) for center in self.centers.values()), default=1)
+        """Rows of the prior: the most rows of :attr:`centers` and :attr:`precision`, 1 without them."""
+        rows = [int(center.shape[0]) for center in self.centers.values()]
+        if self.precision is not None:
+            rows.append(int(self.precision.shape[0]))
+        return max(rows, default=1)
 
     def _center(self, name: str, like: Tensor) -> float | Tensor:
         """Return the centre of ``name``: a number, or its ``(T,)`` rows in ``like``'s dtype and device, cast once."""
@@ -350,17 +385,32 @@ class ParameterPrior:
             self._placed[key] = center.to(dtype=like.dtype, device=like.device)
         return self._placed[key]
 
+    def _precision(self, like: Tensor) -> Tensor:
+        """Return :attr:`precision`, ``(S, S)`` for one row else ``(T, S, S)``, in ``like``'s dtype and device."""
+        assert self.precision is not None
+        key = (" precision", like.dtype, like.device)
+        if key not in self._placed:
+            rows = self.precision[0] if self.precision.shape[0] == 1 else self.precision
+            self._placed[key] = rows.to(dtype=like.dtype, device=like.device)
+        return self._placed[key]
+
     def nll(self, params: Mapping[str, Tensor]) -> Tensor:
         """Return ``C(H)`` for parameter values keyed by the same dotted names as :attr:`specs`.
 
-        The result has the dtype, device and batch shape of ``params``; with no toleranced quantity it is zero.
+        The result has the dtype, device and batch shape of ``params``; with no Gaussian term it is zero.
         """
         _missing(self.specs, params)
         reference = next(iter(params.values()), None)
         total = torch.zeros(()) if reference is None else reference.new_zeros(())
+        joint = set(self.precision_names)
         for name, spec in self.specs.items():
-            if spec.tolerance is not None:
+            if spec.tolerance is not None and name not in joint:
                 total = total + 0.5 * ((params[name] - self._center(name, params[name])) / spec.tolerance) ** 2
+        if self.precision is not None:
+            offsets = [params[name] - self._center(name, params[name]) for name in self.precision_names]
+            residual = torch.stack(torch.broadcast_tensors(*offsets), dim=-1)
+            form = residual[..., None, :] @ self._precision(residual) @ residual[..., :, None]
+            total = total + 0.5 * form[..., 0, 0]
         return total
 
     def clamp(self, params: Mapping[str, Tensor]) -> dict[str, Tensor]:
@@ -380,9 +430,13 @@ class ParameterPrior:
         if self.tiles == 1:
             return self
         rows = list(tiles)
-        return type(self)(
-            self.specs,
-            {name: center if center.shape[0] == 1 else center[rows] for name, center in self.centers.items()},
+        precision = self.precision
+        if precision is not None and precision.shape[0] != 1:
+            precision = precision[rows]
+        return dataclasses.replace(
+            self,
+            centers={name: center if center.shape[0] == 1 else center[rows] for name, center in self.centers.items()},
+            precision=precision,
         )
 
 

@@ -19,6 +19,7 @@ from waveorder.nn import (
     ZernikeAberration,
 )
 from waveorder.nn.noise import estimate_sigma
+from waveorder.nn.parameters import load_parameters
 from waveorder.nn.priors import Beads
 from waveorder.nn.search import calibrate_beads
 
@@ -173,3 +174,43 @@ def test_beads_refuse_a_thin_system_before_fitting() -> None:
     thin = ImagingModel(ThinFluorescence2D(detection, index_of_refraction_media=1.3), Beads(DIAMETER), Gaussian(1.0))
     with pytest.raises(IncompatibleModelError, match="ThinFluorescence2D takes an object of shape \\(1, 1, 32, 32\\)"):
         calibrate_beads(_bead_volume().float(), thin, SAMPLING, iterations=1)
+
+
+def test_the_covariance_is_the_inverse_curvature_with_the_beads_held() -> None:
+    """wo-4.0's bead covariance: the inverse Hessian of the objective over the system's quantities at the fit, the
+    beads, background and noise held there; here against a central-difference Hessian of that objective."""
+    aberration = ZernikeAberration({"astigmatism_0": Free(0.0), "astigmatism_45": Free(0.0, tolerance=0.1)})
+    detection = Detection(wavelength=0.532, numerical_aperture=1.2, edge="sigmoid", pupil_aberrations=aberration)
+    system = WidefieldFluorescence3D(detection, index_of_refraction_media=1.3)
+    model = ImagingModel(system, Beads(DIAMETER), Gaussian(1.0)).double()
+    data = _bead_volume()
+    result = calibrate_beads(data, model, SAMPLING, iterations=60)
+    names = result.covariance_names
+    assert names == tuple(result.parameters)
+    assert result.covariance.shape == (2, 2)
+    obj = Beads(DIAMETER).render(result.positions, result.amplitudes, SAMPLING)
+
+    @torch.no_grad()
+    def objective(shift: tuple[float, ...]) -> float:
+        values = {name: result.parameters[name] + delta for name, delta in zip(names, shift, strict=True)}
+        load_parameters(model, values)
+        predicted = model.system(obj[None], SAMPLING)[0] + result.background
+        prior = 0.5 * (float(values[names[1]]) / 0.1) ** 2
+        return float((predicted - data[0]).square().sum() / 2) + prior
+
+    step = 1e-4
+    hessian = torch.zeros(2, 2, dtype=torch.float64)
+    for i in range(2):
+        for j in range(2):
+            corners = [
+                objective(tuple(step * (si * (k == i) + sj * (k == j)) for k in range(2)))
+                for si, sj in ((1, 1), (1, -1), (-1, 1), (-1, -1))
+            ]
+            hessian[i, j] = (corners[0] - corners[1] - corners[2] + corners[3]) / (4 * step**2)
+    assert torch.allclose(result.covariance, torch.linalg.inv(hessian), rtol=1e-3)
+
+
+def test_the_covariance_is_nan_on_a_bound() -> None:
+    model = ImagingModel(_system(Free(0.3, bounds=(0.29, 0.31))), Beads(DIAMETER), Gaussian(1.0)).double()
+    result = calibrate_beads(_bead_volume(), model, SAMPLING, iterations=20)
+    assert result.covariance.isnan().all()

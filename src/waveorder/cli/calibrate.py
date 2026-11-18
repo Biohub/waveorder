@@ -23,7 +23,8 @@ _Prior = Annotated[
         "--transfer-function-dirpath",
         metavar="STORE",
         rich_help_panel="Inputs",
-        help="A transfer-function store whose parameters centre the prior.",
+        help="A transfer-function store whose parameters centre the prior; its covariance, where non-zero, replaces "
+        "the configuration's tolerances with a correlated Gaussian prior.",
     ),
 ]
 _Start = Annotated[
@@ -52,9 +53,9 @@ def calibrate_transfer_function(  # noqa: PLR0913 (one keyword per flag)
 
     Every imaging-system number written as {nominal, tolerance} (and object.weight: auto) is estimated on the first
     position at its first selected time. solver.calibration chooses the score and the search; without it, the
-    evidence and the default search. -i takes positions, plates or globs as wo rec does. The store holds the values
-    and their provenance. An existing -o is refused without --overwrite, which replaces a transfer-function store
-    and never anything else.
+    evidence and the default search. -i takes positions, plates or globs as wo rec does. The store holds the values,
+    their covariance (an evidence, GCV or bead calibration's Laplace covariance) and their provenance. An existing -o
+    is refused without --overwrite, which replaces a transfer-function store and never anything else.
 
     Example: wo calibrate-tf -i in.zarr -c phase.yml -o tf.zarr
     """

@@ -9,7 +9,7 @@ import math
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar, Literal, NamedTuple, Protocol, Self, runtime_checkable
 
 import torch
@@ -484,27 +484,52 @@ def laplace_covariance(
     """Return the system's searched quantities and their Laplace covariance at ``point``.
 
     The covariance is the inverse Hessian of ``objective`` over the quantities named ``system.*``, the others held
-    at ``point`` (wo-4.0 held the noise level and the object weight). It is all NaN if a quantity is on a bound or
-    the Hessian is not positive definite, and ``None`` without a system quantity. Nothing reads back.
+    at ``point`` (wo-4.0 held the noise level and the object weight). Values of shape ``()`` give one ``(S, S)``
+    covariance; values of shape ``(B,)`` for an objective that returns ``(B,)`` independent objectives (tiles) give
+    ``(B, S, S)``, one per row. See :func:`curvature_covariance` for when it is NaN; ``None`` without a system
+    quantity. Nothing reads back.
     """
     names = tuple(name for name in objective.specs if name.startswith("system."))
     if not names:
         return names, None
     fixed = {name: value.detach() for name, value in point.items() if name not in names}
-    at = torch.stack([point[name].detach() for name in names])
+    at = torch.stack([point[name].detach() for name in names], dim=-1)
 
     def total(values: Tensor) -> Tensor:
-        return objective({**fixed, **dict(zip(names, values.unbind(), strict=True))})
+        return objective({**fixed, **dict(zip(names, values.unbind(-1), strict=True))})
 
+    bounded = on_bounds({name: objective.specs[name] for name in names}, {name: point[name] for name in names})
+    return names, curvature_covariance(total, at, bounded.any(dim=0))
+
+
+def curvature_covariance(total: Callable[[Tensor], Tensor], at: Tensor, bounded: Tensor) -> Tensor:
+    """Return the inverse Hessian of ``total`` at the points ``at``, each all NaN where it serves as no covariance.
+
+    ``at`` is ``(*B, S)``: independent points whose objectives ``total`` returns as ``(*B,)``. The Hessian of their
+    sum is block diagonal, so ``S`` Hessian-vector products give every point's ``(S, S)`` block at once. The result
+    ``(*B, S, S)``, in ``at``'s dtype and on its device, is all NaN at a point marked in the ``(*B,)`` ``bounded``
+    (a quantity on a bound) or whose Hessian is not positive definite. Nothing reads back.
+    """
+    size = at.shape[-1]
     with torch.enable_grad():
-        hessian = torch.autograd.functional.hessian(total, at)
+        variable = at.detach().requires_grad_()
+        (gradient,) = torch.autograd.grad(total(variable).sum(), variable, create_graph=True)
+        columns = [
+            torch.autograd.grad(
+                gradient[..., k].sum(), variable, retain_graph=True, allow_unused=True, materialize_grads=True
+            )[0]
+            if gradient.requires_grad
+            else torch.zeros_like(variable)
+            for k in range(size)
+        ]
+    hessian = torch.stack(columns, dim=-1).detach()
     factor, info = torch.linalg.cholesky_ex((hessian + hessian.mT) / 2)
     # A failed factor may hold a zero pivot, which cholesky_inverse refuses: invert the identity there instead.
-    identity = torch.eye(len(names), dtype=factor.dtype, device=factor.device)
-    covariance = torch.cholesky_inverse(torch.where(info == 0, factor, identity))
-    bounded = on_bounds({name: objective.specs[name] for name in names}, {name: point[name] for name in names})
-    usable = (info == 0) & torch.isfinite(covariance).all() & ~bounded.any()
-    return names, torch.where(usable, covariance, torch.nan)
+    identity = torch.eye(size, dtype=factor.dtype, device=factor.device).expand_as(factor)
+    factored = (info == 0)[..., None, None]
+    covariance = torch.cholesky_inverse(torch.where(factored, factor, identity))
+    usable = (info == 0) & torch.isfinite(covariance).flatten(-2).all(dim=-1) & ~bounded
+    return torch.where(usable[..., None, None], covariance, torch.nan)
 
 
 def start_from_data(model: ImagingModel, data: Data, prior: ParameterPrior | None = None) -> ParameterPrior:
@@ -536,9 +561,7 @@ def start_from_data(model: ImagingModel, data: Data, prior: ParameterPrior | Non
         return ParameterPrior(specs)
     if not any(name in prior.specs for name in started):
         return prior
-    return ParameterPrior(
-        {name: specs[name] if name in started else spec for name, spec in prior.specs.items()}, prior.centers
-    )
+    return replace(prior, specs={name: specs[name] if name in started else spec for name, spec in prior.specs.items()})
 
 
 def _seen(kept: Sequence[Sequence[object]], names: Sequence[str]) -> tuple[ScoreGrid | None, SweepResult | None]:

@@ -6,9 +6,8 @@ Layout ``waveorder.tf/3``, a zarr v3 group read and written with zarr-python; it
       attrs: format, parameter_names (dotted, column order), tile_grid, provenance
       parameters             (T, P) float64: every free quantity of the model, one row per tile
       parameters_covariance  (T, P, P) float64: each tile's Laplace covariance of the calibrated system quantities;
-                             zero outside them and where there is none (a sharpness score, a bead fit, field
-                             tiles), NaN where the calibration found none (a quantity on a bound, a Hessian not
-                             positive definite)
+                             zero outside them and where there is none (a sharpness score), NaN where the
+                             calibration found none (a quantity on a bound, a Hessian not positive definite)
       transfer_function/<Z>x<Y>x<X>/transfer   optional: the transfer on that grid, reused by later runs, with its
                              metadata as the group's attributes (a thin system's plane transfers are for wo view;
                              reconstructions recompute them)
@@ -25,6 +24,7 @@ import json
 import re
 import shutil
 import uuid
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +35,7 @@ import zarr
 from torch import Tensor
 from zarr.core.common import JSON
 
-from waveorder.errors import Rejected, named
+from waveorder.errors import CalibrationWarning, Rejected, named
 from waveorder.nn import Free, ParameterPrior
 
 FORMAT = "waveorder.tf/3"
@@ -207,9 +207,13 @@ class TfStore:
     def to_prior(self, specs: Mapping[str, Free]) -> ParameterPrior:
         """Return the prior this store sets over the free quantities ``specs``, for a calibration that starts from it.
 
-        The store's values become the prior centres of the quantities it names, with each spec's tolerance (flat
-        without one); other quantities keep their own prior. One row is shared by every tile; ``T`` rows give one
-        prior per tile.
+        The store's values become the prior centres of the quantities it names. As in wo-4.0, where the store's
+        :attr:`parameters_covariance` over those quantities is usable, its inverse becomes their Gaussian prior, a
+        full precision matrix that replaces their tolerances; the quantities outside it keep each spec's tolerance
+        (flat without one), and those the store does not name keep their own prior. Rows and columns that are zero
+        on every tile (quantities with no covariance, such as the noise level or the weight) are left out of the
+        block, and an all-zero block leaves the tolerances in force. One row is shared by every tile; ``T`` rows
+        give one prior per tile, their centres and precision both.
 
         Parameters
         ----------
@@ -219,9 +223,47 @@ class TfStore:
         Returns
         -------
         ParameterPrior
+
+        Raises
+        ------
+        Rejected
+            If the block on some tile is singular, so it cannot serve as a Gaussian prior.
+
+        Warns
+        -----
+        CalibrationWarning
+            If the block holds NaN (the calibration that made it found no covariance, e.g. on a bound): the
+            tolerances stay in force for the quantities it covers.
         """
-        columns = {name: self.parameter_names.index(name) for name in specs if name in self.parameter_names}
-        return ParameterPrior(dict(specs), {name: self.parameters[:, column] for name, column in columns.items()})
+        names = [name for name in specs if name in self.parameter_names]
+        columns = [self.parameter_names.index(name) for name in names]
+        centers = {name: self.parameters[:, column] for name, column in zip(names, columns, strict=True)}
+        covariance = self.parameters_covariance
+        if covariance is None or not columns:
+            return ParameterPrior(dict(specs), centers)
+        block = covariance[:, columns][:, :, columns]
+        known = ((block != 0).any(dim=2) | (block != 0).any(dim=1)).any(dim=0)
+        kept = [name for name, flag in zip(names, known.tolist(), strict=True) if flag]
+        if not kept:
+            return ParameterPrior(dict(specs), centers)
+        block = block[:, known][:, :, known]
+        if block.isnan().any():
+            shown = ", ".join(kept)
+            warnings.warn(
+                f"the {named('prior')} store's parameters_covariance over {shown} holds NaN (the calibration that made "
+                "it found no covariance there); their prior takes the model's tolerances instead",
+                CalibrationWarning,
+                stacklevel=2,
+            )
+            return ParameterPrior(dict(specs), centers)
+        precision, info = torch.linalg.inv_ex(block)
+        if (info != 0).any():
+            message = (
+                f"the {named('prior')} parameters_covariance block over {len(kept)} covered parameters is singular "
+                "and cannot serve as a Gaussian prior; re-estimate it, or drop the singular parameters from the store"
+            )
+            raise Rejected.one(message) if self.path is None else _rejected(self.path, message)
+        return ParameterPrior(dict(specs), centers, precision, tuple(kept))
 
     @classmethod
     def load(cls, path: str | Path) -> Self:

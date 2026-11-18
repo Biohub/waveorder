@@ -33,6 +33,7 @@ from waveorder.nn.search.base import (
     _expect_count,
     expect_known_names,
     expect_searchable,
+    laplace_covariance,
     on_bounds,
     score_candidates,
     start_from_data,
@@ -56,7 +57,8 @@ class TileCalibration:
     objective : Tensor
         ``(T,)`` score plus parameter prior at each tile's estimate.
     tiles : tuple[CalibrationResult, ...]
-        One :func:`~waveorder.nn.calibrate` result per tile.
+        One :func:`~waveorder.nn.calibrate` result per tile, with its :attr:`~CalibrationResult.covariance` for a
+        score that has one.
     trace : tuple[tuple[str, Tensor], ...]
         The best ``(T,)`` objective after each stage, by stage type.
     """
@@ -135,7 +137,9 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
 ) -> TileCalibration:
     """Calibrate the free quantities of ``model`` on every tile independently, stage by stage.
 
-    Each tile is calibrated as :func:`~waveorder.nn.calibrate` would calibrate it alone. A stage with
+    Each tile is calibrated as :func:`~waveorder.nn.calibrate` would calibrate it alone, and for a score with
+    :attr:`~waveorder.nn.scores.Score.has_covariance` each tile's result carries its own Laplace covariance, all
+    tiles of a chunk at once (``S`` Hessian-vector products of the chunk's objective). A stage with
     ``reads_back = False`` (grid, random, gradient search) runs on a chunk of tiles at once; one that reads back
     (L-BFGS, Nelder-Mead) runs tile by tile. A ``Gaussian("estimate")`` noise starts from each tile's own data, its
     start and bounds set by :meth:`~waveorder.nn.Gaussian.start_from` as ``calibrate`` sets them; since the bounds
@@ -150,7 +154,7 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
         A stage with ``reads_back = False`` must accept values with a leading tile axis, as the built-in ones do.
     prior : ParameterPrior, optional
         Prior over the free quantities; by default the one their specs declare. One row is shared by every tile; a
-        prior of ``T`` rows gives each tile its own.
+        prior of ``T`` rows (centres or precision) gives each tile its own.
     start : Mapping[str, Tensor], optional
         A finite ``(T,)`` start per dotted name, such as a previous :attr:`TileCalibration.parameters`; names not
         listed start at the model's value, or a ``Gaussian("estimate")`` sigma at its tile's estimate.
@@ -202,6 +206,8 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
     size = 1 if estimated else count if chunk_size is None else chunk_size
     names = list(specs)
     estimates: list[Estimate] = []
+    covariances: list[Tensor] = []
+    covered: tuple[str, ...] = ()
     levels: list[list[Tensor]] = []
     flags: list[Tensor] = []
     for first in range(0, count, size):
@@ -223,6 +229,11 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
         estimates.append(best)
         levels.append(reached)
         flags.append(on_bounds(free_specs(work), best.point))
+        if score.has_covariance:
+            covered, covariance = laplace_covariance(objective, best.point)
+            if covariance is not None:
+                covariances.append(covariance)
+    covariance = torch.cat(covariances) if covariances else None
     point = {name: torch.cat([estimate.point[name] for estimate in estimates]) for name in names}
     trace = tuple((type(stage).__name__, torch.cat([chunk[k] for chunk in levels])) for k, stage in enumerate(search))
     # One read-back: the trace and which quantities ended on a bound, per tile.
@@ -235,6 +246,8 @@ def calibrate_tiles(  # noqa: PLR0913 (tiles, model and grid; score and prior; s
             objective[index],
             tuple(name for name, row in zip(names, bounded, strict=True) if row[index]),
             tuple((name, step[index]) for (name, _), step in zip(trace, steps, strict=True)),
+            covariance=None if covariance is None else covariance[index],
+            covariance_names=covered,
         )
         for index in range(count)
     )

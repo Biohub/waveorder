@@ -10,7 +10,7 @@ import zarr
 from zarr.core.common import JSON
 
 from tests.io.stores import PROVENANCE_592, TILE_GRID_592, write_592
-from waveorder.errors import Rejected
+from waveorder.errors import CalibrationWarning, Rejected
 from waveorder.io import TfStore
 from waveorder.io.tf_store import (
     FORMAT,
@@ -144,6 +144,75 @@ def test_a_store_gives_the_prior_of_the_free_quantities_it_names():
     one = {NAMES[0]: torch.tensor(0.6, dtype=torch.float64), "system.other": torch.tensor(1.0, dtype=torch.float64)}
     torch.testing.assert_close(prior.select([1]).nll(one), torch.tensor(0.5, dtype=torch.float64))
     assert _store().to_prior({"system.other": other}).tiles == 1  # it names none of them
+
+
+_COVARIANCE = torch.tensor([[4e-4, 3e-4], [3e-4, 9e-4]], dtype=torch.float64)  # correlation 0.5
+_SPECS = {
+    NAMES[0]: Free(0.5, tolerance=0.05, bounds=(0.3, 0.7)),
+    NAMES[1]: Free(0.0, bounds=(-0.5, 0.5)),  # flat in the model: the stored covariance gives it its width
+    NAMES[2]: Free(1e-3, tolerance=1e-3, bounds=(1e-6, 1.0)),
+}
+
+
+def _one_row(covariance: torch.Tensor) -> TfStore:
+    """One row; the system's block ``covariance``, the weight's row and column zero (no covariance)."""
+    full = torch.zeros(1, 3, 3, dtype=torch.float64)
+    full[0, :2, :2] = covariance
+    return _store(parameters=torch.tensor([[0.52, 0.01, 1e-3]], dtype=torch.float64), parameters_covariance=full)
+
+
+def test_a_stored_covariance_is_the_prior_over_the_quantities_it_covers_as_a_quadratic_form():
+    prior = _one_row(_COVARIANCE).to_prior(_SPECS)
+    assert prior.precision_names == NAMES[:2]  # the weight's zero row and column are left out
+    assert prior.covered == NAMES
+    offset = torch.tensor([0.02, -0.03], dtype=torch.float64)
+    values = {NAMES[0]: 0.52 + offset[0], NAMES[1]: 0.01 + offset[1], NAMES[2]: torch.tensor(3e-3).double()}
+    form = 0.5 * offset @ torch.linalg.inv(_COVARIANCE) @ offset  # the correlation counts, not the diagonal alone
+    weight = 0.5 * ((3e-3 - 1e-3) / 1e-3) ** 2  # outside the block: its own tolerance
+    torch.testing.assert_close(prior.nll(values), form + weight)
+    diagonal = 0.5 * float((offset.square() / _COVARIANCE.diagonal()).sum())
+    assert abs(float(form) - diagonal) > 0.1 * diagonal
+    batched = {name: value.expand(4) for name, value in values.items()}  # batch shape and dtype as the values'
+    torch.testing.assert_close(prior.nll(batched), (form + weight).expand(4))
+    single = {name: value.float() for name, value in values.items()}
+    assert prior.nll(single).dtype == torch.float32
+
+
+def test_an_all_zero_or_absent_covariance_leaves_the_tolerances():
+    for store in (_one_row(torch.zeros(2, 2, dtype=torch.float64)), _store(parameters_covariance=None)):
+        prior = store.to_prior(_SPECS)
+        assert prior.precision is None
+        assert prior.covered == (NAMES[0], NAMES[2])
+
+
+def test_a_nan_covariance_falls_back_to_the_tolerances_with_a_warning():
+    with pytest.warns(CalibrationWarning, match=rf"over {NAMES[0]}, {NAMES[1]} holds NaN") as record:
+        prior = _one_row(torch.full((2, 2), math.nan, dtype=torch.float64)).to_prior(_SPECS)
+    assert len(record) == 1
+    assert prior.precision is None
+    assert prior.covered == (NAMES[0], NAMES[2])
+
+
+def test_a_singular_covariance_is_refused():
+    singular = torch.tensor([[1e-4, 1e-4], [1e-4, 1e-4]], dtype=torch.float64)
+    with pytest.raises(Rejected, match="block over 2 covered parameters is singular and cannot serve as a Gaussian"):
+        _one_row(singular).to_prior(_SPECS)
+
+
+def test_a_tiled_store_gives_each_tile_its_own_precision():
+    covariance = torch.zeros(2, 3, 3, dtype=torch.float64)
+    covariance[0, :2, :2] = _COVARIANCE
+    covariance[1, :2, :2] = 4 * _COVARIANCE
+    prior = _store(parameters_covariance=covariance).to_prior(_SPECS)
+    assert prior.tiles == 2
+    offset = torch.tensor([0.02, -0.03], dtype=torch.float64)
+    centres = _store().parameters[:, :2]
+    values = {NAMES[0]: centres[:, 0] + offset[0], NAMES[1]: centres[:, 1] + offset[1]}
+    values[NAMES[2]] = torch.tensor([1e-3, 2e-3], dtype=torch.float64)
+    form = 0.5 * offset @ torch.linalg.inv(_COVARIANCE) @ offset
+    torch.testing.assert_close(prior.nll(values), torch.stack([form, form / 4]))
+    one = {name: value[1] for name, value in values.items()}
+    torch.testing.assert_close(prior.select([1]).nll(one), form / 4)
 
 
 PREFIX_592 = "system.detection.pupil_aberrations."

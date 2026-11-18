@@ -320,6 +320,13 @@ def test_a_bead_calibration_of_a_position_records_and_takes_an_estimated_noise_l
     assert store.parameter_names == ("system.detection.numerical_aperture", "noise.sigma")
     sigma = store.row()["noise.sigma"]
     assert sigma == pytest.approx(2, rel=0.2)  # the bead fit's, not the start's
+    covariance = store.parameters_covariance  # the bead fit's Laplace variance of the aperture; none for sigma
+    assert covariance is not None
+    assert covariance.shape == (1, 2, 2)
+    aperture = covariance[0, 0, 0]  # NaN here: the sigmoid-edged pupil leaves the objective flat in the aperture
+    assert bool(aperture > 0) or bool(aperture.isnan())
+    assert covariance[0, 1].eq(0).all()
+    assert covariance[0, :, 1].eq(0).all()
     assert float(bead.imaging_model.get_parameter("noise.sigma").detach()) == pytest.approx(sigma, rel=1e-6)
 
 
@@ -367,6 +374,21 @@ def test_a_stores_prior_calibrates_in_memory_as_the_store_does_on_a_position(pos
     prior = store.to_prior(free_specs(model.imaging_model))
     result = model.calibrate(intensities(phase_volume)[None], pixel_size=PIXEL_SIZE, prior=prior)
     assert float(result.parameters[NA]) == pytest.approx(on_position.row()[NA], rel=1e-5)
+
+
+def test_a_stores_covariance_is_the_width_of_the_prior_it_sets(phase_volume):
+    """The aperture is flat in the model: the stored covariance alone sets its width, as wo-4.0's ``-t`` did. Tight,
+    the estimate stays at the stored value; loose, it follows the data."""
+    data = intensities(phase_volume)[None]
+    alone = float(model_of().calibrate(data, pixel_size=PIXEL_SIZE).parameters[NA])
+    assert alone == pytest.approx(TRUE_NA, abs=0.04)
+    stored = 0.62
+    for variance, expected in ((1e-10, stored), (1.0, alone)):
+        store = store_of(values=(stored,), parameters_covariance=torch.tensor([[[variance]]], dtype=torch.float64))
+        model = model_of()
+        load_parameters(model.imaging_model, {NA: stored})  # the start a prior store also gives
+        result = model.calibrate(data, pixel_size=PIXEL_SIZE, prior=store)
+        assert float(result.parameters[NA]) == pytest.approx(expected, abs=2e-3)
 
 
 def _corrupt(position: Path) -> None:
@@ -528,6 +550,10 @@ def test_field_tiles_write_one_row_per_tile_and_set_tile_parameters(tiled):
     assert model.tile_parameters is not None
     per_tile = model.tile_parameters[TILED_NA].double().cpu()
     torch.testing.assert_close(per_tile, store.parameters[:, 0], rtol=1e-6, atol=0)
+    covariance = store.parameters_covariance
+    assert covariance is not None
+    assert covariance.shape == (2, 1, 1)  # each tile's Laplace variance, NaN where its estimate is on a bound
+    assert ((covariance > 0) | covariance.isnan()).all()
     assert _value(model, TILED_NA) == pytest.approx(1.15)  # the model's own values are not modified
 
 
