@@ -346,7 +346,7 @@ def apply_inverse_transfer_function(
     if reconstruction_algorithm == "Tikhonov":
         U, S, Vh = singular_system
         S_reg = tikhonov_regularized_inverse_filter(S, regularization_strength, apodization_rolloff=apodization_rolloff)
-        sfyx_inverse_filter = torch.einsum("sj...,j...,jf...->fs...", U, S_reg, Vh)
+        sfyx_inverse_filter = torch.einsum("sj...,j...,jf...->fs...", torch.conj(U), S_reg, torch.conj(Vh))
 
         results = []
         for b in range(zyx_data.shape[0]):
