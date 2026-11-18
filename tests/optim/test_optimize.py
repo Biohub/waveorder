@@ -1,7 +1,9 @@
 """Integration tests for the optimization loop."""
 
+import pytest
 import torch
 
+from tests.conftest import _DEVICE
 from waveorder.focus import compute_midband_power
 from waveorder.optim import optimize_reconstruction
 
@@ -188,3 +190,62 @@ def test_wall_times_recorded():
 
     assert len(result.wall_times) == 3
     assert all(t >= 0 for t in result.wall_times)
+
+
+@pytest.mark.parametrize(*_DEVICE)
+@pytest.mark.parametrize("method", ["adam", "lbfgs", "nelder_mead", "grid_search"])
+def test_parameters_are_created_on_the_data_device(device, method):
+    """Every method hands ``reconstruct_fn`` parameter tensors on the data's device.
+
+    A CPU parameter next to CUDA data breaks a reconstruction that builds a
+    transfer function from it (``phase_thick_3d`` takes its device from the
+    tilt tensor). The check is on the device itself: adding a 0-d CPU tensor
+    to a CUDA tensor does not raise, so a toy reconstruction would not show it.
+    """
+    target = torch.full((8, 8), 3.0, device=device)
+    data = torch.zeros(2, 8, 8, device=device)
+    seen = set()
+
+    def reconstruct_fn(data, **params):
+        seen.update(value.device.type for value in params.values())
+        return data[0] + params["offset"]
+
+    def loss_fn(recon):
+        return ((recon - target) ** 2).sum()
+
+    result = optimize_reconstruction(
+        data=data,
+        reconstruct_fn=reconstruct_fn,
+        loss_fn=loss_fn,
+        optimizable_params={"offset": (2.0, 0.5)},
+        method=method,
+        max_iterations=3,
+    )
+
+    assert seen == {torch.device(device).type}
+    assert result.final_reconstruction.device.type == torch.device(device).type
+
+
+@pytest.mark.parametrize(*_DEVICE)
+def test_batched_parameters_are_created_on_the_data_device(device):
+    """The batched (per-tile) Adam path creates its ``(B,)`` parameters on the data's device too."""
+    data = torch.zeros(3, 2, 8, 8, device=device)  # (B, Z, Y, X)
+    seen = set()
+
+    def reconstruct_fn(data, **params):
+        seen.update(value.device.type for value in params.values())
+        return data[:, 0] + params["offset"][:, None, None]
+
+    def loss_fn(recon):
+        return ((recon - 3.0) ** 2).sum()
+
+    optimize_reconstruction(
+        data=data,
+        reconstruct_fn=reconstruct_fn,
+        loss_fn=loss_fn,
+        optimizable_params={"offset": (2.0, 0.5)},
+        method="adam",
+        max_iterations=2,
+    )
+
+    assert seen == {torch.device(device).type}
