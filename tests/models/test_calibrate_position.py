@@ -92,6 +92,9 @@ def test_calibration_recovers_the_aperture_and_updates_the_model(calibrated):
     value = store.row()[NA]
     assert value == pytest.approx(TRUE_NA, abs=0.04)
     assert _value(model) == pytest.approx(value, rel=1e-6)
+    assert store.parameters_covariance is not None
+    assert store.parameters_covariance.shape == (1, 1, 1)
+    assert store.parameters_covariance[0, 0, 0] > 0  # the evidence's Laplace variance of the aperture
     assert store.tile_grid["shape_zyx"] == list(SHAPE)
     assert store.tile_grid["size_yx"] is None
     assert store.transfers == ()  # a calibration store holds parameters only
@@ -131,6 +134,26 @@ def test_a_saved_store_gives_a_second_model_the_same_values(calibrated, tmp_path
     third.load_calibration(store)  # the store in memory, without a file
     assert _value(third) == pytest.approx(_value(model), rel=1e-6)
     assert third.tile_parameters is None
+
+
+def test_the_covariance_fills_the_rows_and_columns_of_the_system_quantities_only(position, tmp_path):
+    model = Phase3D(
+        Illumination(wavelength=0.532, numerical_aperture=Free(0.45, bounds=(0.3, 0.7))),
+        Detection(wavelength=0.532, numerical_aperture=0.9),
+        index_of_refraction_media=1.33,
+        object_prior=Tikhonov(weight=Free(4e-4, bounds=(1e-5, 1e-2))),  # searched, but outside the covariance
+        noise=Gaussian(sigma=1e-3),
+        search=[GridSearch(points=9), GradientSearch()],
+    )
+    store = model.calibrate_position(position, channels=["BF"])
+    assert store is not None
+    saved = TfStore.load(store.save(tmp_path / "tf.zarr"))
+    assert saved.parameters_covariance is not None
+    assert saved.parameters_covariance.shape == (1, 2, 2)
+    aperture, weight = saved.parameter_names.index(NA), saved.parameter_names.index(WEIGHT)
+    assert saved.parameters_covariance[0, aperture, aperture] > 0
+    assert saved.parameters_covariance[0, weight].eq(0).all()
+    assert saved.parameters_covariance[0, :, weight].eq(0).all()
 
 
 def test_a_quantity_that_ends_on_a_bound_warns(position):

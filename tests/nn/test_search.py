@@ -34,7 +34,7 @@ from waveorder.nn import (
     score_candidates,
 )
 from waveorder.nn.optics import Detection
-from waveorder.nn.parameters import free_specs
+from waveorder.nn.parameters import ParameterPrior, free_specs
 from waveorder.nn.search import LBFGSSearch, expect_known_names, keep_best, on_bounds, search_spans
 from waveorder.nn.search.base import CalibrationObjective, Estimate
 from waveorder.nn.systems.fluorescence import WidefieldFluorescence3D
@@ -103,6 +103,28 @@ def test_a_quantity_on_its_bound_is_reported():
     )
     assert result.parameters[NA].item() == pytest.approx(1.2)
     assert result.at_bound == (NA,)
+    assert result.covariance is not None
+    assert result.covariance.isnan().all()  # on a bound the objective still slopes: its curvature is no width
+
+
+def test_the_covariance_is_the_inverse_curvature_of_the_objective_with_the_weight_held():
+    data = _data().double()
+    model = _model(FREE_NA, weight=Free(WEIGHT, bounds=(WEIGHT / 1000, WEIGHT * 1000))).double()
+    result = calibrate(data, model, SAMPLING, score=Evidence())
+    assert result.covariance_names == (NA,)  # the system's quantity only: the free weight is held, as in wo-4.0
+    assert result.covariance is not None
+    assert tuple(result.covariance.shape) == (1, 1)
+
+    prior = ParameterPrior(free_specs(model))
+    objective = CalibrationObjective.of(data, model, SAMPLING, score=Evidence(), prior=prior)
+    point = {name: value.detach() for name, value in result.parameters.items()}
+    step = 1e-4
+    with torch.no_grad():
+        below, at, above = (objective(point | {NA: point[NA] + shift}) for shift in (-step, 0.0, step))
+    curvature = ((above - 2 * at + below) / step**2).item()
+    assert result.covariance.item() == pytest.approx(1 / curvature, rel=1e-3)
+    # The estimate lies within a few of its own standard deviations of the truth, 1.0.
+    assert abs(point[NA].item() - 1.0) < 3 * result.covariance.item() ** 0.5
 
 
 def test_lbfgs_refines_the_grid_estimate():

@@ -39,9 +39,13 @@ class Score(Verb[Tensor]):
     is_likelihood : ClassVar[bool]
         Whether the score is a negative log-likelihood of the free quantities (up to a constant); calibration then
         warns about quantities a likelihood cannot determine. False by default.
+    has_covariance : ClassVar[bool]
+        Whether calibration reports the inverse Hessian of the objective at its estimate as the covariance of the
+        system's quantities (:attr:`~waveorder.nn.search.CalibrationResult.covariance`). False by default.
     """
 
     is_likelihood: ClassVar[bool] = False
+    has_covariance: ClassVar[bool] = False
 
 
 @register("evidence", kind="score")
@@ -58,6 +62,7 @@ class Evidence(Score):
     """
 
     is_likelihood: ClassVar[bool] = True
+    has_covariance: ClassVar[bool] = True
 
     @override
     def check(self, model: ImagingModel) -> None:
@@ -101,6 +106,8 @@ class GCV(Score):
     estimates the prediction error without knowing the noise variance, so minimizing it over a free Tikhonov weight
     picks the regularization from the data. Data units squared; not a likelihood.
     """
+
+    has_covariance: ClassVar[bool] = True  # as wo-4.0, though only the evidence's curvature is a posterior width
 
     @override
     def check(self, model: ImagingModel) -> None:

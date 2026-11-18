@@ -1,6 +1,7 @@
 """The pieces of a model's ``calibrate_position``: its checks, its calibration, and the store of what it found.
 
-The volume is calibrated whole, or each field tile on its own; the ``tf.zarr`` store carries the values found.
+The volume is calibrated whole, or each field tile on its own; the ``tf.zarr`` store carries the values found and,
+for a whole-volume evidence calibration, their covariance (zeros for field tiles and a bead fit, which give none).
 """
 
 import logging
@@ -152,6 +153,18 @@ class _Estimates:
     objective: list[float]
     scores: dict[str, Tensor]
     grid_columns: list[str] | None = None
+    covariance: Tensor | None = None
+    """``(T, P, P)`` over :attr:`names`; ``None`` where the calibration gives none (field tiles, a bead fit)."""
+
+
+def _embedded(names: Sequence[str], covariance: Tensor | None, covered: Sequence[str]) -> Tensor | None:
+    """Embed ``covariance`` over ``covered`` in a ``(1, P, P)`` one over ``names``, zero elsewhere; ``None`` stays."""
+    if covariance is None:
+        return None
+    embedded = torch.zeros(1, len(names), len(names), dtype=torch.float64)
+    rows = torch.tensor([names.index(name) for name in covered])
+    embedded[0, rows[:, None], rows] = covariance.detach().cpu().double()
+    return embedded
 
 
 def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> _Estimates:
@@ -168,6 +181,7 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
     found = dict(result.parameters)
     scores: dict[str, Tensor] = {}
     columns = None
+    covariance: tuple[Tensor | None, tuple[str, ...]] = (None, ())  # a bead fit gives none
     if isinstance(result, BeadCalibration):  # an objective trace, and no bounds but the noise level's
         at_bound, objective = [], result.trace[-1]
         if "score_trace" in wanted:
@@ -192,6 +206,7 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
             scores["score_grid"], columns = result.grid.values, [*result.grid.names, "objective"]
         if auto is not None and result.sweep is not None:
             _write_sweep(result.sweep, auto, title=f"{plan.name}   t={plan.time}")
+        covariance = (result.covariance, result.covariance_names)
     names = tuple(name for name in plan.names if name in found)
     parameters = float64(torch.stack([torch.as_tensor(found[name]).reshape(()) for name in names]))
     return _Estimates(
@@ -201,6 +216,7 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
         objective=[shortest_decimal(float(objective.detach()), torch.float32)],
         scores=scores,
         grid_columns=columns,
+        covariance=_embedded(names, *covariance),
     )
 
 
@@ -272,6 +288,7 @@ def calibrated_store(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
     store = TfStore(
         parameter_names=found.names,
         parameters=found.parameters,
+        parameters_covariance=found.covariance,
         tile_grid=tile_grid(plan.shape, plan.pixel_size, plan=plan.tile_plan, field_tiles=model.field_tiles),
         provenance=_provenance(model, plan, found),
         scores=found.scores,

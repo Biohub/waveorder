@@ -774,20 +774,20 @@ _OUTPUTS = (
     "score_trace",
     "score_grid",
     "parameters",
-    "psf",
     "parameters_covariance",
+    "psf",
     "weight_trace",
     "residual",
     "tile_map",
 )
 _SCORES = _OUTPUTS[2:4]
 """The score arrays a calibration store may hold."""
-_UNWRITTEN = frozenset(_OUTPUTS[5:])
+_UNWRITTEN = frozenset(_OUTPUTS[6:])
 """The outputs wo-4.0 accepted and wrote none of: accepted here, with no effect."""
 
 type OutputName = Annotated[str, _available(*_OUTPUTS)]
 """An output of ``outputs``. The reconstruction is always written; the score arrays go into the calibration store,
-which always holds the parameters."""
+which always holds the parameters and their covariance."""
 
 
 def _default_outputs() -> list[OutputName]:

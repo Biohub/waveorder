@@ -1,20 +1,25 @@
 """The ``tf.zarr`` transfer-function store: parameters, their provenance and the transfer functions they give.
 
-Layout ``waveorder.tf/2`` (zarr v3 through ``tensordict.PersistentTensorDict``; a read never unpickles)::
+Layout ``waveorder.tf/3``, a zarr v3 group read and written with zarr-python; its metadata is plain JSON::
 
     <name>.zarr/
-      format, parameter_names (dotted, column order), tile_grid, provenance
+      attrs: format, parameter_names (dotted, column order), tile_grid, provenance
       parameters             (T, P) float64: every free quantity of the model, one row per tile
-      transfer_function/<Z>x<Y>x<X>/{transfer, metadata}   optional: the transfer on that grid, reused by later runs
-                             (a thin system's plane transfers are for wo view; reconstructions recompute them)
+      parameters_covariance  (T, P, P) float64: each tile's Laplace covariance of the calibrated system quantities;
+                             zero outside them and where there is none (a sharpness score, a bead fit, field
+                             tiles), NaN where the calibration found none (a quantity on a bound, a Hessian not
+                             positive definite)
+      transfer_function/<Z>x<Y>x<X>/transfer   optional: the transfer on that grid, reused by later runs, with its
+                             metadata as the group's attributes (a thin system's plane transfers are for wo view;
+                             reconstructions recompute them)
       score_trace            optional (N,) float64: the objective at each gradient step of the calibration
       score_grid             optional (N, G + 1) float64: each grid point's G values, then its objective
 
-Stores from #592 are read too; 3.x ``compute-tf`` stores (no parameters) are refused. :meth:`TfStore.save` writes
-``<name>.tmp-<id>`` and renames it onto ``<name>``, so a killed process leaves a ``.tmp-`` or ``.old-`` directory.
+Stores from #592 and wo-4.0 are read too. Earlier 4.x stores (format ``waveorder.tf/2``) and 3.x
+``compute-tf`` stores (no parameters) are refused. :meth:`TfStore.save` writes ``<name>.tmp-<id>`` and renames it
+onto ``<name>``, so a killed process leaves a ``.tmp-`` or ``.old-`` directory.
 """
 
-import contextlib
 import hashlib
 import json
 import re
@@ -26,16 +31,21 @@ from pathlib import Path
 from typing import Literal, Self
 
 import torch
+import zarr
 from torch import Tensor
+from zarr.core.common import JSON
 
 from waveorder.errors import Rejected, named
 from waveorder.nn import Free, ParameterPrior
 
-FORMAT = "waveorder.tf/2"
-"""The ``format`` entry of the stores this module writes."""
+FORMAT = "waveorder.tf/3"
+"""The ``format`` attribute of the stores this module writes."""
 
 _MALFORMED = (ValueError, TypeError, KeyError, OSError, RuntimeError)
 """What reading a damaged store raises."""
+
+_V2_MARK = "__tensordict__"
+"""The root attribute of the earlier 4.x ``waveorder.tf/2`` stores, which this version refuses."""
 
 _SHAPE_NAME = re.compile(r"[0-9]+x[0-9]+x[0-9]+")
 """Name of a ``transfer_function/<Z>x<Y>x<X>`` group."""
@@ -137,6 +147,9 @@ class TfStore:
         ``P`` dotted names of the model's free quantities, in column order.
     parameters : Tensor
         ``(T, P)`` float64 on the CPU, one row per tile (one row for a shift-invariant store).
+    parameters_covariance : Tensor, optional
+        ``(T, P, P)`` float64 on the CPU: each tile's covariance of the parameters, zero where unknown, NaN where the
+        calibration found none. ``None`` writes zeros; a loaded store always has it.
     tile_grid : dict
         ``size_yx``, ``overlap_yx``, ``centers_yx`` (one ``[y, x]`` per tile, um), ``shape_zyx``, ``blend``, ``units``.
     provenance : dict
@@ -148,18 +161,19 @@ class TfStore:
         ``provenance["score_grid_columns"]`` names.
     path : Path, optional
         Where the store was read from.
-    origin : {"waveorder.tf/2", "#592"}
-        The layout it was read from.
+    origin : {"waveorder.tf/3", "#592"}
+        The layout it was read from (``#592`` covers the stores of #592 and wo-4.0).
     """
 
     parameter_names: tuple[str, ...]
     parameters: Tensor
+    parameters_covariance: Tensor | None = None
     tile_grid: dict[str, object] = field(default_factory=dict)
     provenance: dict[str, object] = field(default_factory=dict)
     transfers: tuple[TransferArray, ...] = ()
     scores: dict[str, Tensor] = field(default_factory=dict)
     path: Path | None = None
-    origin: Literal["waveorder.tf/2", "#592"] = FORMAT
+    origin: Literal["waveorder.tf/3", "#592"] = FORMAT
 
     @property
     def tiles(self) -> int:
@@ -213,8 +227,9 @@ class TfStore:
     def load(cls, path: str | Path) -> Self:
         """Read and validate a ``tf.zarr``.
 
-        Validation: names are distinct, ``parameters`` is ``(T, P)`` and finite, and ``tile_grid`` lists one centre
-        per tile if any. Whether the names cover a model's free quantities is the caller's check.
+        Validation: names are distinct, ``parameters`` is ``(T, P)`` and finite, ``parameters_covariance`` is
+        ``(T, P, P)`` with no infinity, and ``tile_grid`` lists one centre per tile if any. Whether the names cover a
+        model's free quantities is the caller's check.
 
         Parameters
         ----------
@@ -230,7 +245,8 @@ class TfStore:
         ------
         Rejected
             If ``path`` is missing, not a zarr group, a 3.x ``compute-tf`` store (recompute it with ``wo compute-tf``),
-            not a transfer-function store, another format, malformed, or fails validation.
+            an earlier 4.x ``waveorder.tf/2`` store (recompute it with this version), not a transfer-function store,
+            another format, malformed, or fails validation.
         """
         return _reading(Path(path), lambda at: _read(cls, at))
 
@@ -280,34 +296,32 @@ def _rejected(path: Path, message: str) -> Rejected:
 def store_layout(path: str | Path) -> Layout | None:
     """Return which transfer-function store ``path`` holds (what ``overwrite`` may replace), or ``None``.
 
-    ``waveorder.tf`` (a ``format`` entry), ``#592`` (``parameters`` and ``parameter_names``, no format), ``3.x``
-    (a ``settings`` attribute or 3.x transfer arrays).
+    ``waveorder.tf`` (a ``format`` attribute, or an earlier ``waveorder.tf/2`` store), ``#592``
+    (``parameters`` and ``parameter_names``, no format), ``3.x`` (a ``settings`` attribute or 3.x transfer arrays).
     """
-    import zarr
-
     path = Path(path)
     if not path.is_dir():
         return None
     try:
         group = zarr.open_group(str(path), mode="r")
-        return _layout(group.__contains__, dict(group.attrs))
+        return _layout(group, dict(group.attrs))
     except (ValueError, OSError, KeyError, TypeError):
         return None
 
 
-def _layout(has: Callable[[str], bool], attrs: Mapping[str, object]) -> Layout | None:
-    """Return the layout of an open zarr group from its attributes and ``has(name)``, whether it holds a member."""
-    if "__tensordict__" in attrs and has("format"):  # a format entry tensordict wrote
+def _layout(group: zarr.Group, attrs: Mapping[str, object]) -> Layout | None:
+    """Return the layout of an open zarr group from its attributes and members."""
+    if "format" in attrs or _V2_MARK in attrs:
         return "waveorder.tf"
-    if "format" not in attrs and has("parameters") and "parameter_names" in attrs:
+    if "parameters" in group and "parameter_names" in attrs:
         return "#592"
-    if isinstance(attrs.get("settings"), dict) or any(has(name) for name in _ARRAYS_3X):
+    if isinstance(attrs.get("settings"), dict) or any(name in group for name in _ARRAYS_3X):
         return "3.x"
     return None
 
 
 def _reading[T](path: Path, read: Callable[[Path], T]) -> T:
-    """Return ``read(path)``; a damaged store, on which zarr or tensordict fail, is refused at ``path``."""
+    """Return ``read(path)``; a damaged store, on which zarr fails, is refused at ``path``."""
     try:
         return read(path)
     except Rejected:
@@ -316,36 +330,31 @@ def _reading[T](path: Path, read: Callable[[Path], T]) -> T:
         raise _rejected(path, f"is a malformed transfer-function store ({type(error).__name__}: {error})") from None
 
 
-def _read[S: TfStore](kind: type[S], path: Path) -> S:
-    """Read and validate the store at ``path`` as a ``kind``, by its layout."""
-    import zarr
-
+def _open(path: Path) -> tuple[zarr.Group, dict[str, object]]:
+    """Return the zarr group at ``path`` and its attributes; refuse a missing path or one that is not a group."""
     if not path.exists():
         raise _rejected(path, "does not exist")
     try:
         group = zarr.open_group(str(path), mode="r")
-        attrs = dict(group.attrs)
+        return group, dict(group.attrs)
     except (ValueError, OSError, KeyError, TypeError) as error:
         raise _rejected(path, f"is not a zarr group ({error})") from None
-    layout = _layout(group.__contains__, attrs)
+
+
+def _read[S: TfStore](kind: type[S], path: Path) -> S:
+    """Read and validate the store at ``path`` as a ``kind``, by its layout."""
+    group, attrs = _open(path)
+    layout = _layout(group, attrs)
     if layout == "waveorder.tf":
-        store = _read_v2(kind, path)
+        store = _read_v3(kind, group, attrs, path=path)
     elif layout == "#592":
         store = _read_592(kind, group, attrs, path=path)
     elif layout == "3.x":
         raise _rejected(path, "was made by waveorder 3.x, which stored no parameters; recompute it with wo compute-tf")
     else:
-        raise _rejected(path, "is not a transfer-function store (no format entry and no parameters)")
+        raise _rejected(path, "is not a transfer-function store (no format attribute and no parameters)")
     validate(store)
     return store
-
-
-def _numbers(values: object, name: str, path: Path) -> Tensor:
-    if values is None:
-        raise _rejected(path, f"has no {name} array")
-    if not isinstance(values, Tensor) or values.is_complex() or values.dtype == torch.bool:
-        raise _rejected(path, f"{name} must be a numeric array")
-    return values.to(torch.float64)
 
 
 def _grid_name(key: str, path: Path) -> tuple[int, int, int]:
@@ -355,42 +364,49 @@ def _grid_name(key: str, path: Path) -> tuple[int, int, int]:
     return z, y, x
 
 
-def _metadata(value: object, key: str, path: Path) -> dict[str, object]:
-    """Return ``value``, the ``transfer_function/<key>/metadata`` entry, as a mapping."""
-    name = f"transfer_function/{key}/metadata"
-    return _mapping({name: value}, name, path)
+def _grids(group: zarr.Group, path: Path) -> dict[str, zarr.Group]:
+    """Return the ``transfer_function/<Z>x<Y>x<X>`` groups of a :data:`FORMAT` store by name."""
+    if "transfer_function" not in group:
+        return {}
+    grids = group["transfer_function"]
+    if not isinstance(grids, zarr.Group):
+        raise _rejected(path, "transfer_function must be a group of <Z>x<Y>x<X> groups")
+    found = {}
+    for key, node in sorted(grids.members()):
+        _grid_name(key, path)
+        if not isinstance(node, zarr.Group):
+            raise _rejected(path, f"transfer_function/{key} must be a group")
+        found[key] = node
+    return found
 
 
-def _read_v2[S: TfStore](kind: type[S], path: Path) -> S:
+def _read_v3[S: TfStore](kind: type[S], group: zarr.Group, attrs: Mapping[str, object], *, path: Path) -> S:
     """Read a :data:`FORMAT` store, its transfers listed without their arrays."""
-    from tensordict import PersistentTensorDict, TensorDictBase
-
-    with contextlib.closing(PersistentTensorDict.from_zarr(path, mode="r", allow_pickle=False)) as data:
-        if (tag := data.get_non_tensor("format", None)) != FORMAT:
-            raise _rejected(path, f"has format {tag!r}; this waveorder reads {FORMAT}, so a newer waveorder wrote it")
-        keys = set(data.keys())
-        meta = {key: data.get_non_tensor(key) for key in ("parameter_names", "tile_grid", "provenance") if key in keys}
-        grids = data.get("transfer_function", None)
-        if grids is not None and not isinstance(grids, TensorDictBase):
-            raise _rejected(path, "transfer_function must be a group of <Z>x<Y>x<X> groups")
-        listed = sorted(() if grids is None else grids.keys())
-        metadata = {key: data.get_non_tensor(("transfer_function", key, "metadata"), None) for key in listed}
-        return kind(
-            parameter_names=tuple(_names(meta, path)),
-            parameters=_numbers(data.get("parameters", None), "parameters", path),
-            tile_grid=_mapping(meta, "tile_grid", path),
-            provenance=_mapping(meta, "provenance", path),
-            transfers=tuple(
-                TransferArray(shape=_grid_name(key, path), attrs=_metadata(value, key, path))
-                for key, value in metadata.items()
-            ),
-            scores={name: _numbers(data.get(name), name, path) for name in SCORES if name in keys},
-            path=path,
+    if attrs.get("format") == "waveorder.tf/2" or _V2_MARK in attrs:
+        raise _rejected(
+            path,
+            "was written through tensordict by an earlier waveorder 4.x (format waveorder.tf/2), which this version "
+            "does not read; recompute it with this version (wo calibrate-tf, or a model's to_tf_store and save)",
         )
+    if (tag := attrs.get("format")) != FORMAT:
+        raise _rejected(path, f"has format {tag!r}; this waveorder reads {FORMAT}, so a newer waveorder wrote it")
+    return kind(
+        parameter_names=tuple(_names(attrs, path)),
+        parameters=_array(group, "parameters", path),
+        parameters_covariance=_array(group, "parameters_covariance", path),
+        tile_grid=_mapping(attrs, "tile_grid", path),
+        provenance=_mapping(attrs, "provenance", path),
+        transfers=tuple(
+            TransferArray(shape=_grid_name(key, path), attrs=dict(node.attrs))
+            for key, node in _grids(group, path).items()
+        ),
+        scores={name: _array(group, name, path) for name in SCORES if name in group},
+        path=path,
+    )
 
 
 def read_transfer(path: str | Path, shape: Sequence[int]) -> TransferArray | None:
-    """Read the transfer function a ``tf.zarr`` holds on ``shape``; ``None`` if absent or a #592 store.
+    """Read the transfer function a ``tf.zarr`` holds on ``shape``; ``None`` if absent or not a :data:`FORMAT` store.
 
     Raises
     ------
@@ -400,28 +416,25 @@ def read_transfer(path: str | Path, shape: Sequence[int]) -> TransferArray | Non
     key = "x".join(map(str, shape))
 
     def read(at: Path) -> TransferArray | None:
-        from tensordict import PersistentTensorDict
-
-        if not at.exists():
-            raise _rejected(at, "does not exist")
-        with contextlib.closing(PersistentTensorDict.from_zarr(at, mode="r", allow_pickle=False)) as data:
-            v2 = data.get_non_tensor("format", None) == FORMAT
-            transfer = data.get(("transfer_function", key, "transfer"), None) if v2 else None
-            if transfer is None:
-                return None
-            if not isinstance(transfer, Tensor):
-                raise _rejected(at, f"transfer_function/{key}/transfer must be an array")
-            metadata = data.get_non_tensor(("transfer_function", key, "metadata"), None)
-            return TransferArray(shape=_grid_name(key, at), attrs=_metadata(metadata, key, at), transfer=transfer)
+        group, attrs = _open(at)
+        grid = _grids(group, at).get(key) if attrs.get("format") == FORMAT else None
+        if grid is None or "transfer" not in grid:
+            return None
+        transfer = grid["transfer"]
+        if not isinstance(transfer, zarr.Array):
+            raise _rejected(at, f"transfer_function/{key}/transfer must be an array")
+        values = torch.as_tensor(transfer[...])
+        return TransferArray(shape=_grid_name(key, at), attrs=dict(grid.attrs), transfer=values)
 
     return _reading(Path(path), read)
 
 
-def _array(group: object, name: str, path: Path) -> Tensor:
-    if name not in group:  # ty: ignore[unsupported-operator]
+def _array(group: zarr.Group, name: str, path: Path) -> Tensor:
+    """Return the real array ``name`` of ``group`` as float64."""
+    if name not in group:
         raise _rejected(path, f"has no {name} array")
-    node = group[name]  # ty: ignore[not-subscriptable]
-    if not hasattr(node, "dtype") or node.dtype.kind not in "fiu":
+    node = group[name]
+    if not isinstance(node, zarr.Array) or node.dtype.kind not in "fiu":
         raise _rejected(path, f"{name} must be a numeric array")
     return torch.as_tensor(node[...], dtype=torch.float64)
 
@@ -442,26 +455,32 @@ def _names(attrs: Mapping[str, object], path: Path) -> list[str]:
     return names
 
 
-def _read_592[S: TfStore](kind: type[S], group: object, attrs: Mapping[str, object], *, path: Path) -> S:
-    """Read #592's layout: short names mapped, its ``transfer_function`` array listed, its score arrays."""
+def _read_592[S: TfStore](kind: type[S], group: zarr.Group, attrs: Mapping[str, object], *, path: Path) -> S:
+    """Read a #592 or wo-4.0 store: names mapped, the covariance (zeros if absent), its transfer array listed."""
     try:
         names = tuple(dotted_592_name(name) for name in _names(attrs, path))
     except Rejected as error:
         raise _rejected(path, "; ".join(problem.message for problem in error.problems)) from None
     parameters = _array(group, "parameters", path)
+    covariance = None
+    if "parameters_covariance" in group:
+        covariance = _array(group, "parameters_covariance", path)
+    elif parameters.dim() == 2:
+        covariance = torch.zeros(*parameters.shape, parameters.shape[1], dtype=torch.float64)
     grid = _mapping(attrs, "tile_grid", path)
     grid = {"size_yx": None, "overlap_yx": [0, 0], "centers_yx": None, "shape_zyx": None, "blend": None} | grid
     transfers = []
-    if "transfer_function" in group:  # ty: ignore[unsupported-operator]
-        z, y, x = (int(n) for n in group["transfer_function"].shape[-3:])  # ty: ignore[not-subscriptable]
+    if isinstance(node := group.get("transfer_function"), zarr.Array):
+        z, y, x = (int(n) for n in node.shape[-3:])
         transfers.append(TransferArray(shape=(z, y, x), attrs={"layout": "#592 transfer_function array"}))
     return kind(
         parameter_names=names,
         parameters=parameters,
+        parameters_covariance=covariance,
         tile_grid=grid | {"units": "um"},
         provenance=_mapping(attrs, "provenance", path),
         transfers=tuple(transfers),
-        scores={name: _array(group, name, path) for name in SCORES if name in group},  # ty: ignore[unsupported-operator]
+        scores={name: _array(group, name, path) for name in SCORES if name in group},
         path=path,
         origin="#592",
     )
@@ -485,6 +504,13 @@ def validate(store: TfStore) -> None:
     tiles = store.tiles
     if not torch.isfinite(store.parameters).all():
         raise _rejected(path, "parameters must be finite")
+    covariance = store.parameters_covariance
+    if covariance is not None:
+        if covariance.shape != (tiles, size, size):
+            shown = list(covariance.shape)
+            raise _rejected(path, f"parameters_covariance must be [tiles, {size}, {size}], got {shown}")
+        if torch.isinf(covariance).any():
+            raise _rejected(path, "parameters_covariance must hold no infinity (NaN marks an unknown covariance)")
     _validate_grid(store.tile_grid, tiles=tiles, path=path)
 
 
@@ -520,27 +546,34 @@ def _expect_publishable(path: Path, *, overwrite: bool) -> None:
         raise _rejected(path, f"is not a transfer-function store; use another {named('output')}")
 
 
+def _attributes(values: Mapping[str, object]) -> dict[str, JSON]:
+    """Return ``values`` as plain JSON: NaN and infinities as strings (``"NaN"``), other objects by ``str``."""
+    return json.loads(json.dumps(values, default=str), parse_constant=str)
+
+
+def _put(group: zarr.Group, name: str, values: Tensor) -> None:
+    group.create_array(name, data=values.detach().cpu().numpy())
+
+
 def _write(work: Path, store: TfStore) -> None:
-    """Write ``store`` as the new store ``work`` through tensordict: tensors as arrays, the rest as JSON entries."""
-    from tensordict import NonTensorData, PersistentTensorDict, TensorDict
-
-    def plain(value: object) -> NonTensorData:
-        # JSON values only (a NaN as the string "NaN"): tensordict pickles an entry JSON does not give back equal
-        return NonTensorData(json.loads(json.dumps(value, default=str), parse_constant=str))
-
-    entries: dict[str, object] = {
-        "format": plain(FORMAT),
-        "parameter_names": plain(list(store.parameter_names)),
-        "tile_grid": plain(store.tile_grid),
-        "provenance": plain(store.provenance),
-        "parameters": store.parameters.to(torch.float64),
-        **{name: values.to(torch.float64) for name, values in store.scores.items()},
+    """Write ``store`` as the new zarr v3 group ``work``: tensors as arrays, the rest as JSON attributes."""
+    metadata = {
+        "format": FORMAT,
+        "parameter_names": list(store.parameter_names),
+        "tile_grid": store.tile_grid,
+        "provenance": store.provenance,
     }
-    grids = {
-        "x".join(map(str, item.shape)): {"transfer": item.transfer.detach().cpu(), "metadata": plain(item.attrs)}
-        for item in store.transfers
-        if item.transfer is not None
-    }
-    if grids:
-        entries["transfer_function"] = grids
-    PersistentTensorDict.from_dict(TensorDict(entries, batch_size=[]), work, backend="zarr").close()
+    group = zarr.open_group(str(work), mode="w-", zarr_format=3, attributes=_attributes(metadata))
+    size = len(store.parameter_names)
+    covariance = store.parameters_covariance
+    if covariance is None:
+        covariance = torch.zeros(store.tiles, size, size, dtype=torch.float64)
+    _put(group, "parameters", store.parameters.to(torch.float64))
+    _put(group, "parameters_covariance", covariance.to(torch.float64))
+    for name, values in store.scores.items():
+        _put(group, name, values.to(torch.float64))
+    for item in store.transfers:
+        if item.transfer is not None:
+            key = "x".join(map(str, item.shape))
+            grid = group.create_group(f"transfer_function/{key}", attributes=_attributes(item.attrs))
+            _put(grid, "transfer", item.transfer)

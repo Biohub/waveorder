@@ -73,9 +73,8 @@ and `wo config new` never import torch; commands import the layers below inside 
 
 - Python 3.12 or newer. Write generics and aliases with PEP 695 syntax (`def f[T](x: T)`, `type Spec = ...`) and mark
   overrides with `typing.override`.
-- No `numpy` inside `src/waveorder`: the package is torch only, so `vmap` and autograd work end to end. ruff bans the
-  import. `benchmarks/`, `tests/benchmarks/` and the napari plugin (`plugin/`, which hands napari numpy arrays) may
-  use numpy.
+- Computation in `waveorder.nn` stays in torch, so autograd, `vmap` and GPUs work end to end. numpy is fine at file
+  boundaries: the arrays zarr reads and writes (`io/`), napari's arrays (`plugin/`), the benchmarks' references.
 - No type hint written as a string: import the type, and move a type both sides of a cycle need to a lower module.
   Within one module, a forward reference is a PEP 695 alias (`type _Fourier = FourierDiagonal | None`), which is
   evaluated lazily. `tests/test_annotations.py` fails on a string annotation.

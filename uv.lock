@@ -2955,15 +2955,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pyvers"
-version = "0.2.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/62/21/9daf8da2793d112a04b46ac33ab9046c91b0af8292cd93b3cfdd07ff7169/pyvers-0.2.3.tar.gz", hash = "sha256:c4b81c3a033963245e124cdecb052783c9c4cea3bb08c051833af1c44faa6283", size = 12347, upload-time = "2026-07-09T13:58:07.046Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/8d/63787e8feda59d981ebc953b6581ccab3c97cf7bfe0a6a407c07b50fc86c/pyvers-0.2.3-py3-none-any.whl", hash = "sha256:6f5b5612f2f4bd08caa49baa70fc5f875fc7da701a5385c13e244eea6b8114dd", size = 11757, upload-time = "2026-07-09T13:58:06.078Z" },
-]
-
-[[package]]
 name = "pywin32"
 version = "312"
 source = { registry = "https://pypi.org/simple" }
@@ -3476,20 +3467,6 @@ wheels = [
 ]
 
 [[package]]
-name = "tensordict"
-version = "0.15.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cloudpickle" },
-    { name = "numpy" },
-    { name = "pyvers" },
-    { name = "torch" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/6a/afc9e529c87fc47d6b9d869d7d4906334b4153f75764338158da1f32a1cd/tensordict-0.15.6-py3-none-any.whl", hash = "sha256:fd4dc096ad5f98d9418a90ed572fdb1d1f1f3286c82b7dc138e9a4130a6ba5c3", size = 876045, upload-time = "2026-11-11T21:18:33.021Z" },
-]
-
-[[package]]
 name = "threadpoolctl"
 version = "3.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3776,7 +3753,6 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "rich" },
-    { name = "tensordict" },
     { name = "torch" },
     { name = "typer" },
     { name = "zarr" },
@@ -3863,7 +3839,6 @@ requires-dist = [
     { name = "qtpy", marker = "extra == 'all'", specifier = ">=2.4.3" },
     { name = "qtpy", marker = "extra == 'visual'", specifier = ">=2.4.3" },
     { name = "rich", specifier = ">=15" },
-    { name = "tensordict", specifier = ">=0.15.6" },
     { name = "torch", specifier = ">=2.15" },
     { name = "typer", specifier = ">=0.29.1,<0.30" },
     { name = "zarr", specifier = ">=3.4.2" },

@@ -364,6 +364,13 @@ class CalibrationResult:
         CPU; else ``None``.
     sweep : SweepResult, optional
         With ``history``: what the last :class:`~waveorder.nn.search.WeightSweep` stage swept and picked.
+    covariance : Tensor, optional
+        ``(S, S)`` Laplace covariance of the system's quantities :attr:`covariance_names`, on the model's device:
+        the inverse Hessian of the objective at :attr:`parameters`, the other quantities held there. NaN if a
+        quantity is on a bound or the Hessian is not positive definite; ``None`` if the score has none
+        (:attr:`~waveorder.nn.scores.Score.has_covariance`) or no system quantity was searched.
+    covariance_names : tuple[str, ...]
+        The rows and columns of :attr:`covariance`, by dotted name.
     """
 
     parameters: dict[str, Tensor]
@@ -373,6 +380,8 @@ class CalibrationResult:
     steps: tuple[float, ...] = ()
     grid: ScoreGrid | None = None
     sweep: SweepResult | None = None
+    covariance: Tensor | None = None
+    covariance_names: tuple[str, ...] = ()
 
 
 def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and the quantities held; what to report)
@@ -451,6 +460,7 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     values, value = best
     _assign_parameters(model, values)  # the stages' own point: finite and in bounds, so nothing is read back
     grid, sweep = _seen(kept, names)
+    covered, covariance = laplace_covariance(objective, values) if score.has_covariance else ((), None)
     # The one read-back of calibrate, in float64 so every value survives: stage objectives and bound flags; then
     # the step histories and the grid kept.
     report = [*reached, on_bounds(specs, values)]
@@ -465,7 +475,36 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     at_bound = tuple(name for name, flag in zip(names, flags, strict=True) if flag)
     if grid is not None:
         grid = ScoreGrid(grid.names, packed_tensor[cut:].reshape(grid.values.shape))
-    return CalibrationResult(values, value.detach(), at_bound, trace, tuple(steps), grid, sweep)
+    return CalibrationResult(values, value.detach(), at_bound, trace, tuple(steps), grid, sweep, covariance, covered)
+
+
+def laplace_covariance(
+    objective: CalibrationObjective, point: Mapping[str, Tensor]
+) -> tuple[tuple[str, ...], Tensor | None]:
+    """Return the system's searched quantities and their Laplace covariance at ``point``.
+
+    The covariance is the inverse Hessian of ``objective`` over the quantities named ``system.*``, the others held
+    at ``point`` (wo-4.0 held the noise level and the object weight). It is all NaN if a quantity is on a bound or
+    the Hessian is not positive definite, and ``None`` without a system quantity. Nothing reads back.
+    """
+    names = tuple(name for name in objective.specs if name.startswith("system."))
+    if not names:
+        return names, None
+    fixed = {name: value.detach() for name, value in point.items() if name not in names}
+    at = torch.stack([point[name].detach() for name in names])
+
+    def total(values: Tensor) -> Tensor:
+        return objective({**fixed, **dict(zip(names, values.unbind(), strict=True))})
+
+    with torch.enable_grad():
+        hessian = torch.autograd.functional.hessian(total, at)
+    factor, info = torch.linalg.cholesky_ex((hessian + hessian.mT) / 2)
+    # A failed factor may hold a zero pivot, which cholesky_inverse refuses: invert the identity there instead.
+    identity = torch.eye(len(names), dtype=factor.dtype, device=factor.device)
+    covariance = torch.cholesky_inverse(torch.where(info == 0, factor, identity))
+    bounded = on_bounds({name: objective.specs[name] for name in names}, {name: point[name] for name in names})
+    usable = (info == 0) & torch.isfinite(covariance).all() & ~bounded.any()
+    return names, torch.where(usable, covariance, torch.nan)
 
 
 def start_from_data(model: ImagingModel, data: Data, prior: ParameterPrior | None = None) -> ParameterPrior:

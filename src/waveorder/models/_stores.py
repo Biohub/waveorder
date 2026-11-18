@@ -235,7 +235,7 @@ class StoredTransfers:
 
 
 def stored_transfers(store: TfStore, model: ReconstructionModel) -> StoredTransfers | None:
-    """Return what of a saved ``waveorder.tf/2`` store a shift-invariant model's binds may use; else ``None``."""
+    """Return what of a saved ``waveorder.tf/3`` store a shift-invariant model's binds may use; else ``None``."""
     if store.path is None or store.origin != FORMAT or not store.transfers or model.field_tiles is not None:
         return None
     listed = {item.shape: item for item in store.transfers}

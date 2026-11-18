@@ -44,12 +44,11 @@ classifiers = [
 dependencies = [
     "iohub>=0.4.1,<0.5",
     "natsort>=8.4",  # position order (io/positions.py)
-    "numpy>=2.5.4",  # Tensor.numpy() when tensors are written to zarr; torch does not require numpy
+    "numpy>=2.5.4",  # the arrays zarr reads and writes (io/tf_store.py); torch does not require numpy
     "pillow>=13",  # the sweep report's images (io/sweep_report.py)
     "pydantic>=2.14.3",
     "pyyaml>=6.0.3",
     "rich>=15",  # the command line's tables and progress (cli/render.py)
-    "tensordict>=0.15.6",
     "torch>=2.15",
     "typer>=0.29.1,<0.30",
     "zarr>=3.4.2",
@@ -178,12 +177,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D", "ANN", "PLR2004", "PLR0913", "PLR0917"]  # parametrized tests take one argument per case field
 "tests/io/__init__.py" = ["A005"]  # the tests of waveorder.io, not a module named io
-"benchmarks/**" = ["TID251"]  # benchmarks compare against reference arrays in numpy; the numpy ban is for waveorder
-"tests/benchmarks/**" = ["TID251"]
-"src/waveorder/plugin/**" = ["TID251"]  # the napari plugin hands napari numpy arrays (the reader, the overlay)
-# The skills' scripts are byte-identical copies of what the Biohub MCP serves (.skills/ruff.toml): they print, use
-# numpy and follow that repository's style, so the package's own rules do not apply to them.
-".skills/**" = ["T201", "E501", "RUF001", "RUF002", "RUF005", "D", "ANN", "TID251", "TID253"]
+# The skills' scripts are byte-identical copies of what the Biohub MCP serves (.skills/ruff.toml): they print and
+# follow that repository's style, so the package's own rules do not apply to them.
+".skills/**" = ["T201", "E501", "RUF001", "RUF002", "RUF005", "D", "ANN", "TID253"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
@@ -207,7 +203,6 @@ banned-module-level-imports = [
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "__future__.annotations".msg = "annotations are evaluated eagerly in waveorder; pydantic and torch read them at runtime"
-"numpy".msg = "waveorder is torch-only: numpy breaks vmap, torch.compile and autograd"
 
 # --- ty --------------------------------------------------------------------
 

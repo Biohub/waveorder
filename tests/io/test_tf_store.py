@@ -1,4 +1,4 @@
-"""The ``tf.zarr`` store: v2 round trip through tensordict, #592 stores, atomic publication, validation."""
+"""The ``tf.zarr`` store: round trip as plain zarr, #592 and wo-4.0 stores, atomic publication, validation."""
 
 import json
 import math
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 import zarr
-from tensordict import NonTensorData, PersistentTensorDict
+from zarr.core.common import JSON
 
 from tests.io.stores import PROVENANCE_592, TILE_GRID_592, write_592
 from waveorder.errors import Rejected
@@ -50,18 +50,20 @@ def _beside(target: Path) -> list[str]:
     return sorted(path.name for path in target.parent.iterdir())
 
 
-def _edit(path: Path, **entries: object) -> None:
-    """Replace entries of a v2 store through tensordict: a tensor, or any other value as a JSON entry."""
-    data = PersistentTensorDict.from_zarr(path, mode="r+")
+def _edit(path: Path, **entries: torch.Tensor | JSON) -> None:
+    """Replace attributes of a store, or its arrays: a tensor, at a path whose parts ``__`` separates."""
+    group = zarr.open_group(str(path), mode="r+")
     for name, value in entries.items():
-        key = tuple(name.split("__"))
-        if key in data.keys(include_nested=True):
-            del data[key]
-        data[key] = value if isinstance(value, torch.Tensor) else NonTensorData(value)
-    data.close()
+        if isinstance(value, torch.Tensor):
+            key = name.replace("__", "/")
+            if key in group:
+                del group[key]
+            group.create_array(key, data=value.numpy())
+        else:
+            group.attrs[name] = value
 
 
-def test_a_store_round_trips_through_tensordict_as_zarr_3(tmp_path):
+def test_a_store_round_trips_as_plain_zarr_3(tmp_path):
     transfer = torch.randn(1, 1, 4, 8, 5, dtype=torch.complex64)
     attrs: dict[str, object] = {
         "real": False,
@@ -70,15 +72,20 @@ def test_a_store_round_trips_through_tensordict_as_zarr_3(tmp_path):
         "parameters_sha256": "p" * 64,
     }
     scores = {"score_trace": torch.tensor([3.0, 2.5]), "score_grid": torch.arange(6.0).reshape(3, 2).double()}
-    store = _store(transfers=(TransferArray(shape=(4, 8, 8), attrs=attrs, transfer=transfer),), scores=scores)
+    covariance = torch.zeros(2, 3, 3, dtype=torch.float64)
+    covariance[0, :2, :2] = torch.tensor([[1e-4, -2e-5], [-2e-5, 3e-4]])  # the system's quantities of tile 0
+    covariance[1, :2, :2] = math.nan  # tile 1: a quantity on a bound
+    transfers = (TransferArray(shape=(4, 8, 8), attrs=attrs, transfer=transfer),)
+    store = _store(parameters_covariance=covariance, transfers=transfers, scores=scores)
     path = store.save(tmp_path / "tf.zarr")
     assert path == tmp_path / "tf.zarr"
-    assert json.loads((path / "zarr.json").read_text())["zarr_format"] == 3
     read = TfStore.load(path)
     assert read.origin == FORMAT
     assert read.path == path
     assert read.parameter_names == NAMES
     assert torch.equal(read.parameters, store.parameters)
+    assert read.parameters_covariance is not None
+    torch.testing.assert_close(read.parameters_covariance, covariance, rtol=0, atol=0, equal_nan=True)
     assert read.tile_grid == store.tile_grid
     assert read.provenance == store.provenance
     assert read.parameters_sha256 == store.parameters_sha256
@@ -92,11 +99,27 @@ def test_a_store_round_trips_through_tensordict_as_zarr_3(tmp_path):
     assert stored.transfer.dtype == torch.complex64
     assert torch.equal(stored.transfer, transfer)  # exact, in its own dtype
     assert read_transfer(path, (4, 8, 16)) is None
-    data = PersistentTensorDict.from_zarr(path, mode="r")  # the entries, as any tensordict reader sees them
-    assert data.get_non_tensor("format") == FORMAT
-    assert data.get_non_tensor("parameter_names") == list(NAMES)
-    assert torch.equal(data["transfer_function", "4x8x8", "transfer"], transfer)
-    data.close()
+    group = zarr.open_group(str(path), mode="r")  # what any zarr reader sees
+    assert json.loads((path / "zarr.json").read_text())["zarr_format"] == 3
+    assert dict(group.attrs) == {
+        "format": FORMAT,
+        "parameter_names": list(NAMES),
+        "tile_grid": store.tile_grid,
+        "provenance": store.provenance,
+    }
+    written = group["parameters_covariance"]
+    assert isinstance(written, zarr.Array)
+    assert written.shape == (2, 3, 3)
+    assert dict(group["transfer_function/4x8x8"].attrs) == attrs
+
+
+def test_a_store_without_a_covariance_writes_zeros_and_its_metadata_as_strict_json(tmp_path):
+    path = _store(provenance={"kind": "calibrated", "objective": [math.nan]}).save(tmp_path / "tf.zarr")
+    read = TfStore.load(path)
+    assert read.parameters_covariance is not None
+    assert torch.equal(read.parameters_covariance, torch.zeros(2, 3, 3, dtype=torch.float64))
+    assert read.provenance["objective"] == ["NaN"]  # a NaN as its string: zarr.json stays strict JSON
+    json.loads((path / "zarr.json").read_text(), parse_constant=lambda name: pytest.fail(f"zarr.json holds {name}"))
 
 
 def test_the_repr_is_one_line_without_tensors(tmp_path):
@@ -144,7 +167,7 @@ def test_a_592_store_reads_through_the_name_map(tmp_path):
     assert store.provenance == PROVENANCE_592
 
 
-def test_a_592_evidence_store_keeps_its_scores_and_provenance_and_ignores_its_covariance(tmp_path):
+def test_a_wo_4_0_evidence_store_keeps_its_scores_provenance_and_covariance(tmp_path):
     covariance = torch.tensor([[[1e-4, 1e-5], [1e-5, 2e-4]]], dtype=torch.float64)
     provenance = PROVENANCE_592 | {"score": "evidence", "time_index": 0, "best_score": -1234.5, "noise_sigma": 0.01}
     path = write_592(
@@ -160,6 +183,8 @@ def test_a_592_evidence_store_keeps_its_scores_and_provenance_and_ignores_its_co
     assert store.scores["score_trace"].tolist() == [-1000.0, -1200.0, -1234.5]  # wo-4.0's name, read as it is
     assert store.provenance == provenance
     assert store.transfers == ()
+    assert store.parameters_covariance is not None
+    assert torch.equal(store.parameters_covariance, covariance)
 
 
 def test_a_tiled_592_store_reads_its_rows(tmp_path):
@@ -184,9 +209,11 @@ def test_a_592_store_saves_as_the_current_format(tmp_path):
     path = write_592(tmp_path / "tf_592.zarr", names=["defocus", "z12"], parameters=torch.zeros(1, 2).double())
     store = TfStore.load(path)
     saved = TfStore.load(store.save(tmp_path / "tf.zarr"))
-    assert saved.origin == "waveorder.tf/2"
+    assert saved.origin == FORMAT
     assert saved.parameter_names == store.parameter_names
     assert saved.parameters_sha256 == store.parameters_sha256
+    assert saved.parameters_covariance is not None
+    assert torch.equal(saved.parameters_covariance, torch.zeros(1, 2, 2, dtype=torch.float64))
 
 
 @pytest.mark.parametrize(
@@ -237,10 +264,29 @@ def test_a_3x_store_is_refused_with_the_recompute_command(tmp_path):
         TfStore.load(path)
 
 
+def _write_v2(path: Path) -> None:
+    """Write a store as earlier 4.x wrote ``waveorder.tf/2``: its root marker, and JSON entries as byte arrays."""
+    group = zarr.open_group(str(path), mode="w", attributes={"__tensordict__": {"batch_size": [], "version": 1}})
+    for name, text in (("format", '"waveorder.tf/2"'), ("parameter_names", json.dumps(list(NAMES)))):
+        group.create_array(name, data=torch.frombuffer(bytearray(text.encode()), dtype=torch.uint8).numpy())
+    group.create_array("parameters", data=torch.zeros(1, 3, dtype=torch.float64).numpy())
+
+
+def test_a_v2_store_is_refused_with_the_recompute_message_and_may_be_overwritten(tmp_path):
+    path = tmp_path / "tf.zarr"
+    _write_v2(path)
+    with pytest.raises(Rejected, match=r"earlier waveorder 4\.x \(format waveorder.tf/2\).*recompute it") as error:
+        TfStore.load(path)
+    assert error.value.problems[0].location == str(path)
+    assert store_layout(path) == "waveorder.tf"
+    _store().save(path, overwrite=True)
+    assert TfStore.load(path).origin == FORMAT
+
+
 def test_another_format_and_a_missing_store_are_refused(tmp_path):
     path = _store().save(tmp_path / "tf.zarr")
-    _edit(path, format="waveorder.tf/3")
-    with pytest.raises(Rejected, match=r"has format 'waveorder.tf/3'; .*newer waveorder"):
+    _edit(path, format="waveorder.tf/4")
+    with pytest.raises(Rejected, match=r"has format 'waveorder.tf/4'; .*newer waveorder"):
         TfStore.load(path)
     with pytest.raises(Rejected, match="does not exist"):
         TfStore.load(tmp_path / "absent.zarr")
@@ -264,12 +310,18 @@ def test_the_layout_names_each_kind_of_store(tmp_path):
 
 _REPEATED = [*NAMES[:2], NAMES[0]]
 _INFINITE = torch.tensor([[0.5, math.inf, 1.0], [0.5, 0.0, 1.0]]).double()
+_INFINITE_COVARIANCE = torch.full((2, 3, 3), math.inf, dtype=torch.float64)
 
 
 @pytest.mark.parametrize(
     ("change", "match"),
-    [({"parameter_names": _REPEATED}, "repeats a name"), ({"parameters": _INFINITE}, "parameters must be finite")],
-    ids=["names", "finite"],
+    [
+        ({"parameter_names": _REPEATED}, "repeats a name"),
+        ({"parameters": _INFINITE}, "parameters must be finite"),
+        ({"parameters_covariance": _INFINITE_COVARIANCE}, "parameters_covariance must hold no infinity"),
+        ({"parameters_covariance": torch.zeros(2, 3)}, r"parameters_covariance must be \[tiles, 3, 3\]"),
+    ],
+    ids=["names", "finite", "covariance_finite", "covariance_shape"],
 )
 def test_validation_on_read(tmp_path, change, match):
     path = _store().save(tmp_path / "tf.zarr")
@@ -319,8 +371,8 @@ def test_overwrite_replaces_only_a_transfer_function_store(tmp_path):
         (lambda p: _edit(p, parameter_names="abc"), "parameter_names must be a list of names"),
         (lambda p: _edit(p, tile_grid={"shape_zyx": [1, "a", 2]}), "tile_grid.shape_zyx must be"),
         (lambda p: _edit(p, tile_grid={"centers_yx": [[1]]}), "tile_grid.centers_yx must be"),
-        (lambda p: _edit(p, parameters="abc"), "parameters must be a numeric array"),
-        (lambda p: _edit(p, transfer_function="abc"), "transfer_function must be a group"),
+        (lambda p: _edit(p, parameters=torch.ones(2, 3, dtype=torch.bool)), "parameters must be a numeric array"),
+        (lambda p: _edit(p, transfer_function=torch.zeros(2)), "transfer_function must be a group"),
     ],
     ids=["group_name", "grid_type", "provenance_type", "names_type", "shape_type", "centres_type", "array_type", "tf"],
 )
