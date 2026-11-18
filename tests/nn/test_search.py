@@ -35,7 +35,14 @@ from waveorder.nn import (
 )
 from waveorder.nn.optics import Detection
 from waveorder.nn.parameters import ParameterPrior, free_specs
-from waveorder.nn.search import LBFGSSearch, expect_known_names, keep_best, on_bounds, search_spans
+from waveorder.nn.search import (
+    LBFGSSearch,
+    NelderMeadSearch,
+    expect_known_names,
+    keep_best,
+    on_bounds,
+    search_spans,
+)
 from waveorder.nn.search.base import CalibrationObjective, Estimate
 from waveorder.nn.systems.fluorescence import WidefieldFluorescence3D
 from waveorder.nn.verbs import InverseProblem
@@ -168,6 +175,20 @@ def test_calibrate_reads_back_once(history):
     syncs = [str(warning.message) for warning in caught if "synchronizing CUDA operation" in str(warning.message)]
     assert len(syncs) == 1, syncs
     assert [name for name, _ in result.trace] == ["GridSearch", "RandomSearch", "GradientSearch"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "stage",
+    [GradientSearch(iterations=2), LBFGSSearch(iterations=2), NelderMeadSearch(iterations=3), RandomSearch(samples=3)],
+    ids=lambda stage: type(stage).__name__,
+)
+def test_every_stage_searches_on_the_datas_device(stage):
+    """wo-4.0 created its optimizer's parameters on the CPU, so a calibration on a GPU failed (#602)."""
+    model = _model(FREE_NA).cuda()
+    result = calibrate(_data().cuda(), model, SAMPLING, score=Evidence(), search=(stage,))
+    assert result.parameters[NA].device.type == "cuda"
+    assert model.get_parameter(NA).device.type == "cuda"
 
 
 def test_the_history_holds_every_gradient_step_and_the_last_full_grid():
