@@ -1,5 +1,8 @@
 """Integration tests for phase and fluorescence optimization examples."""
 
+import pytest
+import torch
+
 from waveorder.api import fluorescence, phase
 from waveorder.optim import OptimizableFloat
 from waveorder.optim.losses import MidbandPowerLossSettings
@@ -156,6 +159,40 @@ def test_phase_3d_optimize_with_tilt():
     assert optimized.transfer_function.numerical_aperture_detection != 0.8
     # Tilt was passed through (fixed, not optimized) without error
     assert optimized.transfer_function.tilt_angle_zenith == 0.3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+@pytest.mark.parametrize("method", ["grid_search", "adam"])
+def test_phase_3d_optimize_tilt_on_cuda(method):
+    """Phase 3D: a tilt fit runs on a CUDA device.
+
+    The transfer function follows the device of the tilt tensors, so when the
+    optimizer created them on the CPU the inverse multiplied CUDA data by a CPU
+    filter and raised.
+    """
+    gt_settings = phase.Settings(transfer_function=phase.TransferFunctionSettings(tilt_angle_zenith=0.3))
+    _, data = phase.simulate(gt_settings, recon_dim=3, zyx_shape=(11, 64, 64))
+    opt_settings = phase.Settings(
+        transfer_function=phase.TransferFunctionSettings(
+            tilt_angle_zenith=OptimizableFloat(init=0.2, lr=0.05),
+            tilt_angle_azimuth=OptimizableFloat(init=0.0, lr=0.5),
+        )
+    )
+
+    optimized, recon = phase.optimize(
+        data,
+        recon_dim=3,
+        settings=opt_settings,
+        method=method,
+        max_iterations=3,
+        grid_points=3,
+        device="cuda",
+    )
+
+    assert recon is not None
+    assert isinstance(optimized.transfer_function.tilt_angle_zenith, float)
+    assert isinstance(optimized.transfer_function.tilt_angle_azimuth, float)
 
 
 def test_phase_2d_no_optimizable_params_runs_standard():

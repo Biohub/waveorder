@@ -214,12 +214,14 @@ def _optimize_gradient(
                 (B,),
                 init_val,
                 dtype=torch.float32,
+                device=data.device,
                 requires_grad=use_gradients,
             )
         else:
             t = torch.tensor(
                 init_val,
                 dtype=torch.float32,
+                device=data.device,
                 requires_grad=use_gradients,
             )
         param_tensors[name] = t
@@ -399,6 +401,7 @@ def _optimize_nelder_mead(
             param_tensors[name] = torch.tensor(
                 float(x[i]),
                 dtype=torch.float32,
+                device=data.device,
             )
 
         kwargs = dict(fixed_params)
@@ -500,6 +503,7 @@ def _optimize_grid_search(
             param_tensors[name] = torch.tensor(
                 float(combo[i]),
                 dtype=torch.float32,
+                device=data.device,
             )
 
         kwargs = dict(fixed_params)
