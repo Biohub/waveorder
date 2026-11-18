@@ -69,7 +69,7 @@ def test_a_thin_transfer_at_steepness_100_is_wo40s_at_pupil_steepness_100():
     illumination = Illumination(wavelength=0.45, numerical_aperture=0.1)
     detection = Detection(numerical_aperture=0.15, edge="sigmoid", edge_steepness=100.0)
     system = ThinPhase2D(illumination, detection, index_of_refraction_media=1.0).double()
-    transfer = torch.view_as_complex(system.plane_transfers(sampling)[:, :, 0].contiguous())  # (Z, F, Y, X // 2 + 1)
+    transfer = torch.view_as_complex(system.plane_transfers(sampling)[0, :, :, 0].contiguous())  # (Z, F, Y, X')
     for (field, plane, y, x), expected in OLD_SOFT_EDGE.items():
         index = 1 - field  # 3.x lists absorption first, the system phase first
         assert float(transfer[plane, index, y, x].real) == pytest.approx(expected, rel=1e-5)

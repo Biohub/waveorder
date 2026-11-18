@@ -178,6 +178,8 @@ def _spectrum_layers(read: _Transfer, name: str) -> list[LayerData]:
         values = values[..., 0] + 1j * values[..., 1]
     half = values.resolve_conj().numpy()
     layout = read.attrs.get("layout")
+    if isinstance(layout, list) and layout[0] == "part":  # [Hermitian, anti-Hermitian]: the forward model's first
+        half, layout = half[0], layout[1:]
     planes = isinstance(layout, list) and layout[0] == "plane"
     axes = (-2, -1) if planes else (-3, -2, -1)
     spectrum = np.fft.fftshift(full_spectrum(half, read.shape[-1], axes=axes), axes=axes)

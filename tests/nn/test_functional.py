@@ -20,6 +20,7 @@ from waveorder.nn.functional import (
     cholesky_solve,
     complex_multiply,
     crop_half_spectrum,
+    cropped_frequencies,
     from_half_spectrum,
     gram,
     half_spectrum_frequencies,
@@ -98,6 +99,21 @@ def test_crop_half_spectrum_does_not_copy_an_unchanged_grid_and_rejects_finer_gr
         crop_half_spectrum(spectrum, (4, 7, 8))
     with pytest.raises(ShapeError, match="half spectrum of 5 columns"):
         crop_half_spectrum(spectrum, (4, 6, 10))
+
+
+@pytest.mark.parametrize("full", range(1, 25))
+def test_the_crop_is_wo40s_central_cuboid_and_shifts_only_an_odd_size_from_an_even_one(full):
+    """wo-4.0's ``sampling.nd_fourier_central_cuboid``: ``fftshift``, the central slice, ``ifftshift``, applied to the
+    frequency indices themselves. Only an odd size from an even one leaves the lowest frequencies, by one bin."""
+    indices = torch.arange(full)
+    for size in range(1, full + 1):
+        start = (full - size) // 2
+        expected = torch.fft.ifftshift(torch.fft.fftshift(indices)[start : start + size])
+        assert torch.equal(cropped_frequencies(full, size, device=indices.device), expected), (full, size)
+        lowest = torch.tensor(_low(full, size))
+        assert torch.equal(expected, lowest) == (size % 2 == 0 or full % 2 == 1), (full, size)
+        if size % 2 == 1 and full % 2 == 0:  # every frequency one bin lower: the zero frequency lands at index 1
+            assert torch.equal(expected, (lowest - 1).remainder(full)), (full, size)
 
 
 @pytest.mark.parametrize("nx", [7, 8])

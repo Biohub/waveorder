@@ -1,8 +1,9 @@
 """The transfer-function builds in slabs of planes give what the whole-grid builds gave, and keep their gradients.
 
 Each ``_whole_*`` function is a private copy of a build without the slabs: every plane of the oversampled grid at
-once, cropped to the data's frequencies at the end, of which the half of the Hermitian part is kept (the transfer
-function of ``real(ifftn(crop))``). The slabbed builds must match them to rounding, for any slab size.
+once, cropped to the data's frequencies at the end as wo-4.0's ``nd_fourier_central_cuboid`` crops, of which the
+halves of the Hermitian and anti-Hermitian parts are kept (the forward model ``real(ifftn(crop))`` and what the
+closed-form inverse adds). The slabbed builds must match them to rounding, for any slab size.
 """
 
 import math
@@ -76,16 +77,16 @@ def _axial_fft(values: Tensor) -> Tensor:
     return _fft(values.movedim(-4, -2), dim=(-1,)).movedim(-2, -4)
 
 
-def _real_operator_half(full: Tensor, shape: tuple[int, ...]) -> Tensor:
-    """Crop complex full spectra over their last ``len(shape)`` axes to the lowest frequencies of ``shape``, then
-    keep the half of the crop's Hermitian part ``0.5 (H(k) + conj H(-k))``, stored real."""
+def _parts(full: Tensor, shape: tuple[int, ...]) -> Tensor:
+    """Crop complex full spectra over their last ``len(shape)`` axes as wo-4.0 does (``fftshift``, central slice,
+    ``ifftshift``), then keep the halves of the crop's parts ``0.5 (H(k) +- conj H(-k))``, stacked, stored real."""
     dims = tuple(range(-len(shape), 0))
     for dim, size in zip(dims, shape, strict=True):
-        n = full.shape[dim]
-        keep = torch.cat([torch.arange((size + 1) // 2), torch.arange(n - size // 2, n)])
-        full = full.index_select(dim, keep)
-    hermitian = 0.5 * (full + torch.roll(torch.flip(full, dims), (1,) * len(dims), dims).conj())
-    return torch.view_as_real(hermitian[..., : shape[-1] // 2 + 1].contiguous())
+        start = (full.shape[dim] - size) // 2
+        full = torch.fft.ifftshift(torch.fft.fftshift(full, dim=dim).narrow(dim, start, size), dim=dim)
+    mirrored = torch.roll(torch.flip(full, dims), (1,) * len(dims), dims).conj()
+    parts = torch.stack((0.5 * (full + mirrored), 0.5 * (full - mirrored)))
+    return torch.view_as_real(parts[..., : shape[-1] // 2 + 1].contiguous())
 
 
 def _whole_thick_phase(system: ThickPhase3D, sampling: Sampling) -> Tensor:
@@ -117,7 +118,7 @@ def _whole_thick_phase(system: ThickPhase3D, sampling: Sampling) -> Tensor:
     second = _axial_fft(_fft(complex_multiply(illuminated, _conjugate(scattered)), dim=lateral, inverse=True) * window)
     scale = dz / (source * abs2(pupil)).sum()
     stacked = torch.stack(((first + second) * scale, _times_i(first - second) * scale))
-    return _real_operator_half(torch.view_as_complex(stacked.contiguous()), sampling.shape)
+    return _parts(torch.view_as_complex(stacked.contiguous()), sampling.shape)
 
 
 def _whole_widefield_psf(system: WidefieldFluorescence3D, sampling: Sampling) -> Tensor:
@@ -136,7 +137,7 @@ def _whole_widefield_psf(system: WidefieldFluorescence3D, sampling: Sampling) ->
 
 
 def _whole_widefield(system: WidefieldFluorescence3D, sampling: Sampling) -> Tensor:
-    return _real_operator_half(torch.fft.fftn(_whole_widefield_psf(system, sampling)), sampling.shape)
+    return _parts(torch.fft.fftn(_whole_widefield_psf(system, sampling)), sampling.shape)[0]
 
 
 def _whole_confocal(system: ConfocalFluorescence3D, sampling: Sampling) -> Tensor:
@@ -145,7 +146,7 @@ def _whole_confocal(system: ConfocalFluorescence3D, sampling: Sampling) -> Tenso
     psf = irfftn(widefield, fine.shape)
     detected = irfftn(widefield * pinhole_otf(system.pinhole_diameter, fine), fine.shape)
     confocal = psf * detected
-    return _real_operator_half(torch.fft.fftn(confocal / confocal.sum()), sampling.shape)
+    return _parts(torch.fft.fftn(confocal / confocal.sum()), sampling.shape)[0]
 
 
 def _whole_thin_phase(system: ThinPhase2D, sampling: Sampling) -> Tensor:
@@ -179,7 +180,7 @@ def _whole_thin_phase(system: ThinPhase2D, sampling: Sampling) -> Tensor:
     second = _fft(complex_multiply(illuminated, _conjugate(transmitted)), dim=lateral, inverse=True)
     direct = (source * abs2(detected)).sum(dim=(-2, -1), keepdim=True)[..., None]
     stacked = torch.stack((_times_i(first - second) / direct, (first + second) / direct), dim=1)
-    return _real_operator_half(torch.view_as_complex(stacked.contiguous()), (ny, nx)).unsqueeze(2)
+    return _parts(torch.view_as_complex(stacked.contiguous()), (ny, nx)).unsqueeze(3)
 
 
 def _whole_thin_fluorescence(system: ThinFluorescence2D, sampling: Sampling) -> Tensor:
@@ -192,7 +193,7 @@ def _whole_thin_fluorescence(system: ThinFluorescence2D, sampling: Sampling) -> 
     field = complex_multiply(system.detection.pupil(grid), _defocus(kz, system.plane_positions(sampling)))
     intensity = abs2(torch.view_as_real(torch.fft.ifft2(torch.view_as_complex(field))))
     spectrum = torch.fft.fft2(intensity / intensity.sum(dim=(-2, -1), keepdim=True))
-    planes = _real_operator_half(spectrum, (ny, nx))[:, None, None]
+    planes = _parts(spectrum, (ny, nx))[:, :, None, None]
     return planes[..., 0] if system.real_transfer else planes
 
 

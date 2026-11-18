@@ -1,5 +1,6 @@
 """Brightfield phase systems: units, first-order oracles, inverses and the module contracts."""
 
+import dataclasses
 import math
 from typing import Any, Literal
 
@@ -25,6 +26,7 @@ from waveorder.nn import (
 from waveorder.nn.functional import lateral_frequencies
 from waveorder.nn.optics import Illumination, IlluminationTilt, PupilEdge, PupilGrid
 from waveorder.nn.preprocess import brightfield_contrast
+from waveorder.nn.solvers.wiener import LinearGaussian
 from waveorder.nn.systems import phase as phase_module
 from waveorder.nn.systems.phase import ThickPhase3D, ThinPhase2D
 from waveorder.testing import (
@@ -78,44 +80,124 @@ def _ball(shape: tuple[int, ...], pixel_size: tuple[float, ...], *, radius: floa
     return blurred / blurred.max()
 
 
-def _thin_scene(zenith: float, *, edge: PupilEdge = "ramp") -> tuple[ThinPhase2D, Sampling, Tensor, Tensor]:
-    sampling = Sampling(shape=(7, 32, 32), pixel_size=(0.6, 0.1, 0.1))
+def _thin_scene(
+    zenith: float, *, edge: PupilEdge = "ramp", shape: tuple[int, int, int] = (7, 32, 32), pixel: float = 0.1
+) -> tuple[ThinPhase2D, Sampling, Tensor, Tensor]:
+    sampling = Sampling(shape=shape, pixel_size=(0.6, pixel, pixel))
     optics = _optics(na_ill=0.4, zenith=zenith, azimuth=0.6, edge=edge)
     system = ThinPhase2D(*optics, index_of_refraction_media=INDEX).double()
-    ball = _ball((32, 32), (0.1, 0.1), radius=0.8)
+    ball = _ball(shape[1:], (pixel, pixel), radius=0.8)
     obj = torch.stack((0.3 * ball, 0.05 * torch.roll(ball, 3, -1)))[:, None]
     intensity = 10 * (1 + system.forward(obj, sampling))
     return system, sampling, obj, intensity
 
 
-def test_thin_tilted_inverse_solves_the_normal_equations_per_frequency() -> None:
-    """Tilt makes the thin transfer complex: Wiener solves the Tikhonov normal equations per frequency (3.x built
-    its inverse from ``U S_reg Vh`` without conjugates, which is right only for a real, on-axis transfer)."""
-    system, sampling, obj, intensity = _thin_scene(0.3, edge="sigmoid")
-    operator = system.bind(sampling)
-    impulse = torch.zeros(2, 2, 1, 32, 32, dtype=torch.float64)
-    impulse[0, 0, 0, 0, 0] = impulse[1, 1, 0, 0, 0] = 1
-    phase_tf, absorption_tf = (torch.fft.fft2(operator.apply(delta)[0]) for delta in impulse)  # (Z, Y, X) each
+UNDERSAMPLED = {"even": (7, 32, 32), "odd": (7, 33, 31)}
+"""Thin-scene grids at 0.3 um pixels, cropped from twice as fine: Nyquist rows, and odd axes from even ones."""
+
+
+def _full_spectrum(parts: Tensor, nx: int, *, axes: int) -> Tensor:
+    """Return wo-4.0's cropped transfer ``H_c`` on the full spectrum from the halves of its two parts.
+
+    ``parts`` is complex ``(2, ..., X // 2 + 1)``: on the half columns their sum is ``H_c(k)`` and their difference
+    ``conj H_c(-k)``, which gives the other columns.
+    """
+    at_k, mirrored = parts[0] + parts[1], parts[0] - parts[1]
+    others = tuple(range(-axes, -1))
+    mirrored = torch.roll(torch.flip(mirrored, others), (1,) * len(others), others)  # at -k along the other axes
+    columns = nx - torch.arange(nx // 2 + 1, nx)
+    return torch.cat((at_k, mirrored[..., columns].conj()), dim=-1)
+
+
+def _cropped_planes(system: ThinPhase2D, sampling: Sampling) -> Tensor:
+    """Return wo-4.0's cropped transfer of each field and plane, ``(2, Z, Y, X)``: ``[H_phase, H_absorption]``."""
+    parts = torch.view_as_complex(system.plane_transfers(sampling)[:, :, :, 0].contiguous())  # (2, Z, F, Y, X')
+    return _full_spectrum(parts, sampling.shape[-1], axes=2).movedim(1, 0)
+
+
+def _wo40_thin(contrast: Tensor, transfers: Tensor, weight: float, decomposition: str) -> Tensor:
+    """3.x ``isotropic_thin_3d``'s Tikhonov inverse with #600's conjugates, in the system's field order.
+
+    ``calculate_singular_system`` (``use_svd`` for ``"svd"``, else the per-channel norms, without its 1e-12 guards),
+    the filter ``conj(U) S / (S^2 + weight) conj(Vh)`` and ``apply_filter_bank``'s ``real(ifft2(...))``.
+    """
+    if decomposition == "svd":
+        U, S, Vh = torch.linalg.svd(transfers.permute(2, 3, 0, 1), full_matrices=False)
+        U, S, Vh = U.permute(2, 3, 0, 1), S.permute(2, 0, 1), Vh.permute(2, 3, 0, 1)
+    else:
+        S = transfers.abs().square().sum(dim=1).sqrt()
+        U, Vh = torch.eye(2, dtype=transfers.dtype)[:, :, None, None], transfers / S[:, None]
+    regularized = (S / (S * S + weight)).to(transfers.dtype)
+    inverse = torch.einsum("sj...,j...,jf...->fs...", U.conj(), regularized, Vh.conj())  # (Z, F, Y, X)
+    return torch.fft.ifft2(torch.einsum("zs...,z...->s...", inverse, torch.fft.fft2(contrast[0]))).real
+
+
+@pytest.mark.parametrize("grid", list(UNDERSAMPLED))
+@pytest.mark.parametrize(("coupling", "decomposition"), [("joint", "svd"), ("per_field", "per_channel")])
+def test_thin_inverse_is_wo40s_on_a_cropped_tilted_grid(coupling, decomposition, grid) -> None:
+    """Wiener inverts wo-4.0's cropped, non-Hermitian transfer as 3.x + #600 does, not the Hermitian part the forward
+    model applies: on Nyquist rows of even axes, and everywhere along odd axes cropped from even ones."""
+    system, sampling, _, intensity = _thin_scene(0.3, edge="sigmoid", shape=UNDERSAMPLED[grid], pixel=0.3)
+    assert system.upsampling(sampling) == (1, 2, 2)
+    transfers = _cropped_planes(system, sampling)
     weight = 1e-3
     model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
+    noise = torch.randn(intensity.shape, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
+    contrast = brightfield_contrast(intensity, per_plane=True) + 1e-2 * noise  # noise reaches the Nyquist rows
+    estimate = Wiener(coupling=coupling)(contrast, model, sampling).estimate[:, 0]
+    assert _relative(estimate, _wo40_thin(contrast, transfers, weight, decomposition)) <= 1e-10
+    hermitian = dataclasses.replace(LinearGaussian.of(model, system.bind(sampling)), skew=None)
+    previous = hermitian.mean(contrast) if coupling == "joint" else hermitian.per_field_mean(contrast)
+    assert _relative(estimate, previous[:, 0]) > 1e-2  # the forward model's Hermitian part inverts otherwise
+
+
+def test_on_a_grid_that_is_not_cropped_the_inverse_is_the_posterior_mean() -> None:
+    """Without a crop the transfer is Hermitian: both estimators are what they were, the forward model's."""
+    system, sampling, _, intensity = _thin_scene(0.3, edge="sigmoid")
+    assert system.upsampling(sampling) == (1, 1, 1)
+    model = ImagingModel(system, Tikhonov(1e-3), Gaussian(1.0)).double()
     contrast = brightfield_contrast(intensity, per_plane=True)
-    estimate = Wiener()(contrast, model, sampling).estimate[:, 0]
-    # Oracle: (A^H A + weight I)^-1 A^H d per frequency on the full spectrum, A[z, f].
-    matrix = torch.stack((phase_tf, absorption_tf), dim=-1).permute(1, 2, 0, 3)
-    spectrum = torch.fft.fft2(contrast[0]).permute(1, 2, 0)[..., None]
-    adjoint = matrix.conj().transpose(-1, -2)
-    solved = torch.linalg.solve(adjoint @ matrix + weight * torch.eye(2, dtype=matrix.dtype), adjoint @ spectrum)
-    oracle = torch.fft.ifft2(solved[..., 0].permute(2, 0, 1)).real
-    assert _relative(estimate, oracle) <= 1e-9
-    assert _relative(estimate[0], obj[0, 0]) < 0.6
+    hermitian = dataclasses.replace(LinearGaussian.of(model, system.bind(sampling)), skew=None)
+    joint = Wiener()(contrast, model, sampling).estimate
+    torch.testing.assert_close(joint, hermitian.posterior(contrast).mean(), rtol=1e-12, atol=1e-14)
+    per_field = Wiener(coupling="per_field")(contrast, model, sampling).estimate
+    torch.testing.assert_close(per_field, hermitian.per_field_mean(contrast), rtol=1e-12, atol=1e-14)
 
 
-def _thin_transfers(system: ThinPhase2D, sampling: Sampling) -> Tensor:
-    """Return the full-spectrum transfer of each field, ``(2, Z, Y, X)``: ``[H_phase, H_absorption]``."""
-    impulse = torch.zeros(2, 2, 1, *sampling.shape[1:], dtype=torch.float64)
-    impulse[0, 0, 0, 0, 0] = impulse[1, 1, 0, 0, 0] = 1
-    operator = system.bind(sampling)
-    return torch.stack([torch.fft.fft2(operator.apply(delta)[0]) for delta in impulse])
+def test_thick_inverse_is_wo40s_on_a_cropped_tilted_grid() -> None:
+    """3.x ``phase_thick_3d``'s ``real(ifftn(fftn(d) conj(H_c) / (|H_c|^2 + weight)))`` of the cropped transfer."""
+    sampling = Sampling(shape=(9, 16, 15), pixel_size=(1.0, 0.3, 0.3))
+    system = ThickPhase3D(*_optics(zenith=0.2, azimuth=0.6, edge="sigmoid"), index_of_refraction_media=INDEX).double()
+    assert system.upsampling(sampling) == (2, 2, 2)
+    parts = torch.view_as_complex(system.transfer(sampling)[:, 0, 0].contiguous())  # (2, Z, Y, X')
+    transfer = _full_spectrum(parts, sampling.shape[-1], axes=3)
+    weight = 1e-2 * float(transfer.abs().max()) ** 2
+    data = torch.randn(system.data_shape(sampling), generator=torch.Generator().manual_seed(4), dtype=torch.float64)
+    model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
+    estimate = Wiener()(data, model, sampling).estimate[0]
+    oracle = torch.fft.ifftn(torch.fft.fftn(data[0]) * transfer.conj() / (transfer.abs().square() + weight)).real
+    assert _relative(estimate, oracle) <= 1e-10
+    hermitian = dataclasses.replace(LinearGaussian.of(model, system.bind(sampling)), skew=None)
+    assert _relative(estimate, hermitian.mean(data)[0]) > 1e-2
+
+
+@pytest.mark.parametrize(("kind", "coupling"), [("thin", "joint"), ("thin", "per_field"), ("thick", "joint")])
+def test_the_wo40_inverse_is_differentiable_and_vmaps_on_a_cropped_grid(kind, coupling) -> None:
+    sampling = Sampling(shape=(4, 12, 11), pixel_size=(1.0, 0.3, 0.3))
+    system_type = ThinPhase2D if kind == "thin" else ThickPhase3D
+    system = system_type(*_free_optics(), index_of_refraction_media=INDEX).double()
+    assert system.upsampling(sampling)[1:] == (2, 2)
+    model = ImagingModel(system, Tikhonov(1e-2), Gaussian(1.0)).double()
+    generator = torch.Generator().manual_seed(9)
+    data = torch.randn(model.system.data_shape(sampling), generator=generator, dtype=torch.float64)
+    weights = torch.randn(model.system.object_shape(sampling), generator=generator, dtype=torch.float64)
+
+    def estimate(module: ImagingModel) -> Tensor:
+        return Wiener(coupling=coupling)(data, module, sampling).estimate
+
+    assert_gradients_match_finite_differences(lambda module: (estimate(module) * weights).sum(), model, atol=1e-6)
+    candidates = torch.tensor([-0.3, 0.0, 0.35], dtype=torch.float64)
+    assert_vmap_matches_loop(estimate, model, name="system.illumination.tilt.zenith", values=candidates, atol=1e-10)
 
 
 @pytest.mark.parametrize("zenith", [0.0, 0.3], ids=["on-axis", "tilted"])
@@ -123,7 +205,7 @@ def test_per_field_wiener_is_each_fields_tikhonov_inverse(zenith) -> None:
     """``coupling="per_field"`` is 3.x's ``decomposition="per_channel"``: ``conj(H_f) . d / (||H_f||^2 + weight)`` over
     the planes for each field; with the fields' transfers orthogonal over z (on axis) it is the joint solve."""
     system, sampling, _, intensity = _thin_scene(zenith, edge="sigmoid")
-    transfers = _thin_transfers(system, sampling)
+    transfers = _cropped_planes(system, sampling)
     weight = 1e-3
     model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
     contrast = brightfield_contrast(intensity, per_plane=True)
@@ -594,7 +676,7 @@ def test_thin_with_equal_apertures_gives_the_wo40_transfer() -> None:
     system = ThinPhase2D(
         illumination, Detection(numerical_aperture=0.15, edge="sigmoid"), index_of_refraction_media=1.0
     ).double()
-    transfer = torch.view_as_complex(system.plane_transfers(sampling)[:, :, 0].contiguous())  # (Z, F, Y, X // 2 + 1)
+    transfer = torch.view_as_complex(system.plane_transfers(sampling)[0, :, :, 0].contiguous())  # (Z, F, Y, X')
     for (field, plane, y, x), expected in OLD_EQUAL_APERTURE.items():
         index = 1 - field  # 3.x lists absorption first, the system phase first
         assert float(transfer[plane, index, y, x].real) == pytest.approx(expected, rel=1e-5)

@@ -191,14 +191,14 @@ def plane_slabs(values: Tensor, plane_elements: int) -> tuple[Tensor, ...]:
 def crop_full_lateral(spectrum: Tensor, shape: ZYX[int]) -> Tensor:
     """Keep the lateral frequencies of a ``shape`` grid, both signs of x, from finer full spectra ``(..., Y', X', 2)``.
 
-    Along y and x it selects the lowest frequencies in FFT order, as :func:`crop_half_spectrum` does along z and y.
+    Along y and x it keeps the frequencies of wo-4.0's crop (:func:`cropped_frequencies`).
 
     Raises
     ------
     ShapeError
         If ``shape`` is finer than the spectrum's grid.
     """
-    return _keep_lowest(spectrum, ((-3, shape[1]), (-2, shape[2])))
+    return _crop(spectrum, ((-3, shape[1]), (-2, shape[2])))
 
 
 def axial_spectrum(slabs: Sequence[Tensor], shape: ZYX[int]) -> Tensor:
@@ -221,13 +221,25 @@ def axial_spectrum(slabs: Sequence[Tensor], shape: ZYX[int]) -> Tensor:
     stack = torch.cat([slab.movedim(-4, -2) for slab in slabs], dim=-2)
     spectrum = torch.view_as_real(torch.fft.fft(torch.view_as_complex(stack), dim=-1))
     del stack  # the transform's backward does not keep its input
-    return _keep_lowest(spectrum.movedim(-2, -4), ((-4, shape[0]),))
+    return _crop(spectrum.movedim(-2, -4), ((-4, shape[0]),))
+
+
+def _half_mirror(spectrum: Tensor, axes: int) -> Tensor:
+    """Return ``conj S(-k)`` on the half-spectrum columns of full spectra ``S`` stored ``(..., X, 2)``."""
+    nx = spectrum.shape[-2]
+    others = tuple(range(-1 - axes, -2))  # the transformed axes before x, in the stored view
+    columns = torch.arange(nx // 2 + 1, device=spectrum.device).neg().remainder(nx)  # -x on the grid
+    mirrored = spectrum.index_select(-2, columns)
+    if others:
+        mirrored = torch.roll(torch.flip(mirrored, dims=others), shifts=(1,) * len(others), dims=others)
+    real, imaginary = mirrored.unbind(-1)
+    return torch.stack((real, -imaginary), dim=-1)
 
 
 def half_of_hermitian_part(spectrum: Tensor, *, axes: int = 3) -> Tensor:
     """Return the half spectrum of ``0.5 (S(k) + conj S(-k))``, from full spectra ``S`` stored ``(..., X, 2)``.
 
-    On real ``f``, ``real(ifftn(S fftn(f)))`` (the operator 3.x applied with a cropped, non-Hermitian ``S``) equals
+    On real ``f``, ``real(ifftn(S fftn(f)))`` (the operator wo-4.0 applies with a cropped, non-Hermitian ``S``) equals
     ``irfftn`` of this half times ``rfftn(f)``. ``-k`` is taken on the grid of ``S``, where the Nyquist frequency of
     an even axis is its own negative.
 
@@ -244,14 +256,20 @@ def half_of_hermitian_part(spectrum: Tensor, *, axes: int = 3) -> Tensor:
         Half spectra stored real, ``(..., X // 2 + 1, 2)``, contiguous: already the Hermitian projection of
         :func:`hermitian_half`.
     """
-    nx = spectrum.shape[-2]
-    others = tuple(range(-1 - axes, -2))  # the transformed axes before x, in the stored view
-    columns = torch.arange(nx // 2 + 1, device=spectrum.device).neg().remainder(nx)  # -x on the grid
-    mirrored = spectrum.index_select(-2, columns)
-    if others:
-        mirrored = torch.roll(torch.flip(mirrored, dims=others), shifts=(1,) * len(others), dims=others)
-    real, imaginary = mirrored.unbind(-1)
-    return (0.5 * (spectrum.narrow(-2, 0, nx // 2 + 1) + torch.stack((real, -imaginary), dim=-1))).contiguous()
+    half = spectrum.narrow(-2, 0, spectrum.shape[-2] // 2 + 1)
+    return (0.5 * (half + _half_mirror(spectrum, axes))).contiguous()
+
+
+def half_hermitian_parts(spectrum: Tensor, *, axes: int = 3) -> tuple[Tensor, Tensor]:
+    """Return the half spectra of the Hermitian and anti-Hermitian parts ``0.5 (S(k) +- conj S(-k))`` of ``S``.
+
+    Their sum is ``S(k)`` and their difference ``conj S(-k)`` on the half-spectrum columns, which is what wo-4.0's
+    inverse filters of a cropped ``S`` need (:class:`~waveorder.nn.operators.FourierDiagonal`). Arguments as
+    :func:`half_of_hermitian_part`, which is the first part.
+    """
+    half = spectrum.narrow(-2, 0, spectrum.shape[-2] // 2 + 1)
+    mirrored = _half_mirror(spectrum, axes)
+    return (0.5 * (half + mirrored)).contiguous(), (0.5 * (half - mirrored)).contiguous()
 
 
 def defocused_intensity(pupil: Tensor, kz: Tensor, z: Tensor) -> Tensor:
@@ -267,9 +285,10 @@ def intensity_otf(
     """Return the transfer function of a real point-spread function built plane by plane, on a coarser grid.
 
     The planes are built, transformed laterally and cropped one slab at a time (:func:`plane_slabs`) to bound memory.
-    The result is normalized to 1 at zero frequency. The crop ``H_c`` of an oversampled grid need not be Hermitian on
-    the Nyquist frequencies of an even axis (an aberrated or shifted point-spread function); the half spectrum kept is
-    that of its Hermitian part (:func:`half_of_hermitian_part`), whose inverse transform is ``real(ifftn(H_c))``.
+    The result is normalized to 1 at zero frequency. The crop ``H_c`` of an oversampled grid (wo-4.0's,
+    :func:`cropped_frequencies`) need not be Hermitian: on the Nyquist frequencies of an even axis, or anywhere along an
+    odd axis cropped from an even one; the half spectrum kept is that of its Hermitian part
+    (:func:`half_of_hermitian_part`), whose inverse transform is ``real(ifftn(H_c))``, wo-4.0's point-spread function.
 
     Parameters
     ----------
@@ -321,29 +340,36 @@ def widefield_otf(pupil: Tensor, kz: Tensor, z: Tensor, *, shape: ZYX[int]) -> T
     return intensity_otf(lambda part: defocused_intensity(pupil, kz, part), z, lateral=lateral, shape=shape)
 
 
-def _low_frequencies(full: int, size: int, *, device: torch.device) -> Tensor:
-    """FFT-order indices of the ``size`` lowest of ``full`` frequencies: ``0 .. (size-1)//2`` then the negatives."""
-    return torch.cat(
-        [torch.arange((size + 1) // 2, device=device), torch.arange(full - size // 2, full, device=device)]
-    )
+def cropped_frequencies(full: int, size: int, *, device: torch.device) -> Tensor:
+    """Return the FFT-order indices of the ``size`` frequencies that wo-4.0 keeps from ``full``, in FFT order.
+
+    This reproduces wo-4.0's ``sampling.nd_fourier_central_cuboid`` (``fftshift``, the central slice starting at
+    ``(full - size) // 2``, ``ifftshift``), the one crop every transfer function here goes through, including its
+    one-bin shift: for an odd ``size`` from an even ``full`` the zero frequency lands at index 1, so the crop holds
+    frequencies ``-1 .. (size - 3) / 2`` then ``-(size + 1) / 2 .. -2`` and is not Hermitian. Every other parity
+    keeps the lowest frequencies, ``0 .. (size - 1) // 2`` then the negatives. Correct it here when wo-4.0 does.
+    """
+    positions = (torch.arange(size, device=device) + size // 2).remainder(size)  # ifftshift
+    return (positions + (full - size) // 2 - full // 2).remainder(full)  # the central slice of the fftshift
 
 
-def _keep_lowest(spectrum: Tensor, sizes: Sequence[tuple[int, int]]) -> Tensor:
-    """Select the ``size`` lowest frequencies along each ``(dim, size)``: a copy where the axis shrinks."""
+def _crop(spectrum: Tensor, sizes: Sequence[tuple[int, int]]) -> Tensor:
+    """Keep wo-4.0's ``size`` frequencies along each ``(dim, size)`` (:func:`cropped_frequencies`): a copy if cut."""
     for dim, size in sizes:
         full = spectrum.shape[dim]
         if size > full:
             raise ShapeError(f"cannot crop {full} frequencies to {size}")
         if size != full:
-            spectrum = spectrum.index_select(dim, _low_frequencies(full, size, device=spectrum.device))
+            spectrum = spectrum.index_select(dim, cropped_frequencies(full, size, device=spectrum.device))
     return spectrum
 
 
 def crop_half_spectrum(spectrum: Tensor, shape: ZYX[int]) -> Tensor:
     """Keep the frequencies of a ``shape`` grid from a finer half spectrum.
 
-    Along z and y it selects the lowest frequencies in FFT order (a copy); along x it keeps ``0 .. X // 2`` (a view).
-    With the grid unchanged it returns a view of ``spectrum`` without copying.
+    Along z and y it keeps wo-4.0's frequencies (:func:`cropped_frequencies`, a copy); along x it keeps
+    ``0 .. X // 2`` (a view), which is wo-4.0's crop unless an odd ``X`` comes from an even one. With the grid
+    unchanged it returns a view of ``spectrum`` without copying.
 
     Parameters
     ----------
@@ -358,7 +384,7 @@ def crop_half_spectrum(spectrum: Tensor, shape: ZYX[int]) -> Tensor:
         If ``shape`` is finer than the spectrum's grid.
     """
     nz, ny, nx = shape
-    spectrum = _keep_lowest(spectrum, ((-4, nz), (-3, ny)))
+    spectrum = _crop(spectrum, ((-4, nz), (-3, ny)))
     columns = spectrum.shape[-2]
     if nx // 2 + 1 > columns:
         raise ShapeError(f"cannot crop a half spectrum of {columns} columns to {nx // 2 + 1}")

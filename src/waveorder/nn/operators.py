@@ -110,6 +110,14 @@ class FourierDiagonal(LinearOperator):
     (:func:`~waveorder.nn.functional.hermitian_half`), as ``irfftn`` does anyway, so every method describes the same
     real operator.
 
+    A transfer function cropped from a finer grid, ``H_c``, need not be Hermitian; the operator it defines,
+    ``real(ifftn(H_c fftn(f)))``, has the Hermitian part of ``H_c`` as ``transfer``. wo-4.0 inverts with ``H_c``
+    itself: its Tikhonov filter ``W(H_c)`` is applied to the full spectrum and the real part kept, which is the
+    Hermitian part of the filter, ``0.5 (W(H_c(k)) + conj W(H_c(-k)))``. ``skew``, the anti-Hermitian part of
+    ``H_c``, keeps what that needs: ``transfer + skew`` is ``H_c(k)`` and ``transfer - skew`` is ``conj H_c(-k)``,
+    and the closed-form estimates average under the two (:meth:`~waveorder.nn.solvers.wiener.LinearGaussian.mean`).
+    Nothing else reads it.
+
     Parameters
     ----------
     transfer : Tensor
@@ -117,25 +125,33 @@ class FourierDiagonal(LinearOperator):
         ``(C, F, Z, Y, X // 2 + 1)`` for a real ``H`` (an even point-spread function).
     sampling : Sampling
         The grid of the transfer.
+    skew : Tensor, optional
+        The half spectrum of the anti-Hermitian part of ``H_c``, ``0.5 (H_c(k) - conj H_c(-k))``, in the layout of
+        ``transfer`` (:func:`~waveorder.nn.functional.half_hermitian_parts`); ``None`` for a Hermitian ``H_c``.
     hermitian : bool
         Whether the self-conjugate columns are Hermitian already, which skips the projection.
 
     Raises
     ------
     ShapeError
-        If the transfer is complex or does not match ``sampling``.
+        If the transfer is complex or does not match ``sampling``, or ``skew`` has another shape.
     """
 
-    def __init__(self, transfer: HalfTransfer, sampling: Sampling, *, hermitian: bool = False) -> None:
+    def __init__(
+        self, transfer: HalfTransfer, sampling: Sampling, *, skew: HalfTransfer | None = None, hermitian: bool = False
+    ) -> None:
         if transfer.is_complex():
             raise ShapeError(f"transfer must be stored real, got {transfer.dtype}; pass torch.view_as_real(transfer)")
         (nz, ny, nx), complex_valued = sampling.shape, is_complex_matrix(transfer)
         # Any other number of dimensions is reported here, against the real layout.
         expected = (*transfer.shape[:2], nz, ny, nx // 2 + 1, *((2,) if complex_valued else ()))
         expect_shape(transfer, expected, what="transfer")
+        if skew is not None:
+            expect_shape(skew, expected, what="skew")
         channels, fields = transfer.shape[:2]
         super().__init__(sampling, object_shape=(fields, *sampling.shape), data_shape=(channels, *sampling.shape))
         self.transfer = transfer if hermitian else hermitian_half(transfer, nx, real=not complex_valued)
+        self.skew = skew
 
     @property
     def real_transfer(self) -> bool:

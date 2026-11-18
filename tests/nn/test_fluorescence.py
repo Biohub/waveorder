@@ -56,7 +56,9 @@ def _system(*, offset: float = 0.0, edge: PupilEdge = "sigmoid", positions=None)
     ],
 )
 def test_thin_fluorescence_passes_the_system_suite(detection):
-    sampling = Sampling(shape=(4, 10, 9), pixel_size=(0.5, 0.15, 0.15))
+    # Even sizes, cropped from twice as fine: an odd size cropped from an even one is shifted one bin, as wo-4.0 crops,
+    # and its point-spread function is then not nonnegative.
+    sampling = Sampling(shape=(4, 10, 8), pixel_size=(0.5, 0.15, 0.15))
 
     def build() -> ThinFluorescence2D:
         arm = Detection(wavelength=WAVELENGTH, **detection)

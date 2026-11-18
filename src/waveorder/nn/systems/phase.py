@@ -20,7 +20,7 @@ from waveorder.nn.functional import (
     axial_spectrum,
     complex_multiply,
     crop_full_lateral,
-    half_of_hermitian_part,
+    half_hermitian_parts,
     lateral_frequencies,
     plane_slabs,
     transverse_nyquist,
@@ -175,12 +175,15 @@ class ThickPhase3D(ShiftInvariantSystem):
     on a grid oversampled along z, y and x for the largest reachable apertures, then cropped to the data's
     frequencies. ``z = k dz + z_focus_offset dz_data`` for plane ``k`` in FFT order, and ``w`` is a Hann window
     centred on ``k = 0``, as in 3.x. The oversampling ignores an illumination tilt, so a tilted transfer function
-    aliases, as in 3.x, and the crop ``H_c`` need not be Hermitian; the half spectrum kept is that of
-    ``0.5 (H_c(k) + conj H_c(-k))``, which defines 3.x's operator ``real(ifftn(H_c fftn(f)))``.
+    aliases, as in 3.x. The crop ``H_c`` is wo-4.0's (:func:`~waveorder.nn.functional.cropped_frequencies`) and need
+    not be Hermitian: the forward model is 3.x's ``real(ifftn(H_c fftn(f)))``, the half spectrum of
+    ``0.5 (H_c(k) + conj H_c(-k))``, and the transfer also keeps the anti-Hermitian part, with which the closed-form
+    inverse inverts ``H_c`` itself as wo-4.0 does (:attr:`skewed_transfer`).
     """
 
     illumination: Illumination
     detection: Detection
+    skewed_transfer = True
 
     def __init__(
         self,
@@ -257,13 +260,13 @@ class ThickPhase3D(ShiftInvariantSystem):
         )
 
     def potential_transfers(self, sampling: Sampling) -> Tensor:
-        """Return the 3.x real- and imaginary-potential transfer functions on ``sampling``, before projection.
+        """Return the 3.x real- and imaginary-potential transfer functions on ``sampling``, as two parts.
 
         Returns
         -------
         Tensor
-            Half spectra stored real, shape ``(2, Z, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]``, each the
-            half of the Hermitian part of 3.x's cropped transfer function (see Notes).
+            Half spectra stored real, shape ``(2, 2, Z, Y, X // 2 + 1, 2)``: the Hermitian and anti-Hermitian parts
+            of 3.x's cropped ``[H_phase, H_absorption]`` (see Notes).
         """
         reference = self.detection.numerical_aperture
         dtype, device = reference.dtype, reference.device
@@ -310,14 +313,14 @@ class ThickPhase3D(ShiftInvariantSystem):
         # pairs with itself, so its -k comes from the other side of the oversampled grid.
         plane = oblique.numel()
         slabs = zip(plane_slabs(z, plane), plane_slabs(window, plane), strict=True)
-        return half_of_hermitian_part(axial_spectrum([slab(part, weight) for part, weight in slabs], shape))
+        return torch.stack(half_hermitian_parts(axial_spectrum([slab(part, weight) for part, weight in slabs], shape)))
 
     @override
     def compute_transfer(self, sampling: Sampling) -> HalfTransfer:
-        phase, absorption = self.potential_transfers(sampling).unbind(0)
+        phase, absorption = self.potential_transfers(sampling).unbind(1)
         if "absorption" in self.fields:
-            return torch.stack((phase, absorption))[None]
-        return (phase + self.quantity("absorption_ratio") * absorption)[None, None]
+            return torch.stack((phase, absorption), dim=1)[:, None]
+        return (phase + self.quantity("absorption_ratio") * absorption)[:, None, None]
 
 
 def _upper(detection: Detection) -> float:
@@ -374,8 +377,9 @@ class ThinPhase2D(ImagingSystem):
         H_absorption(q; z) = (h1 + h2) / B_z
 
     and the plane at defocus ``z`` is ``FFT(contrast_z) = H_phase FFT(phase) + H_absorption FFT(absorption)``. Only y
-    and x are oversampled, as in 3.x. As in :class:`ThickPhase3D`, the half spectrum kept per plane is that of the
-    Hermitian part of the cropped transfer function, which defines 3.x's operator ``real(ifft2(H_c fft2(f)))``.
+    and x are oversampled, as in 3.x. As in :class:`ThickPhase3D`, the forward model applies per plane the Hermitian
+    part of wo-4.0's cropped transfer function, 3.x's operator ``real(ifft2(H_c fft2(f)))``, and the closed-form
+    inverse inverts ``H_c`` itself.
     """
 
     operator_type: type[LinearOperator] = ReshapedFourierDiagonal
@@ -459,13 +463,13 @@ class ThinPhase2D(ImagingSystem):
         return -z if self.invert_phase_contrast else z
 
     def plane_transfers(self, sampling: Sampling) -> Tensor:
-        """Return the 3.x transfer functions of every plane, before projection.
+        """Return the 3.x transfer functions of every plane, as two parts.
 
         Returns
         -------
         Tensor
-            Half spectra stored real, shape ``(Z, 2, 1, Y, X // 2 + 1, 2)``: ``[H_phase, H_absorption]`` per plane,
-            each the half of the Hermitian part of 3.x's cropped transfer function (see Notes).
+            Half spectra stored real, shape ``(2, Z, 2, 1, Y, X // 2 + 1, 2)``: the Hermitian and anti-Hermitian parts
+            of 3.x's cropped ``[H_phase, H_absorption]`` per plane (see Notes).
         """
         self.check_sampling(sampling)
         reference = self.detection.numerical_aperture
@@ -493,7 +497,7 @@ class ThinPhase2D(ImagingSystem):
         aperture_pupil = support[..., None] * pupil
 
         def slab(part: Tensor) -> Tensor:
-            """Return the transfers of the planes ``part``, cropped laterally: ``(P, 2, Y, X // 2 + 1, 2)``."""
+            """Return the parts of the planes ``part``, cropped laterally: ``(2, P, 2, Y, X // 2 + 1, 2)``."""
             detected = complex_multiply(aperture_pupil, _defocus(oblique, part))  # (P, Y', X', 2)
             illuminated = _fft(source[..., None] * detected, dim=lateral)
             transmitted = _fft(detected, dim=lateral)
@@ -504,17 +508,18 @@ class ThinPhase2D(ImagingSystem):
             second = _fft(complex_multiply(illuminated, _conjugate(transmitted)), dim=lateral, inverse=True)
             second = crop_full_lateral(second, sampling.shape)
             planes = torch.stack((_times_i(first - second) / direct, (first + second) / direct), dim=1)
-            return half_of_hermitian_part(planes, axes=2)
+            return torch.stack(half_hermitian_parts(planes, axes=2))
 
         # In slabs of planes, each cropped at once: the planes are independent.
         slabs = plane_slabs(self.plane_positions(sampling), oblique.numel())
-        return torch.cat([slab(part) for part in slabs]).unsqueeze(2)  # (Z, 2, 1, Y, X // 2 + 1, 2)
+        return torch.cat([slab(part) for part in slabs], dim=1).unsqueeze(3)  # (2, Z, 2, 1, Y, X // 2 + 1, 2)
 
     @override
     def compute_operator(self, sampling: Sampling) -> ReshapedFourierDiagonal:
         """Return ``H`` on the stack ``sampling``: the plane operator with one channel per focal plane, as a stack."""
         plane = Sampling(shape=(1, *sampling.shape[1:]), pixel_size=sampling.pixel_size)
-        planes = FourierDiagonal(self.plane_transfers(sampling), plane)
+        transfer, skew = self.plane_transfers(sampling)
+        planes = FourierDiagonal(transfer, plane, skew=skew)
         return ReshapedFourierDiagonal(planes, sampling, data_shape=self.data_shape(sampling))
 
 

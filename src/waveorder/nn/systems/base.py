@@ -201,10 +201,16 @@ class ShiftInvariantSystem(ImagingSystem):
     real_transfer : bool
         Whether ``H`` is real at every frequency; then the transfer is stored as ``(C, F, Z, Y, X // 2 + 1)`` with
         no imaginary part. Set from the configuration, never from parameter values; nothing checks it at run time.
+    skewed_transfer : bool
+        Whether the transfer is cropped from a finer grid as wo-4.0 crops it and so need not be Hermitian; then it
+        stacks two parts on a leading axis, ``(2, C, F, Z, Y, X // 2 + 1, ...)``: the Hermitian part the forward
+        model applies and the anti-Hermitian part only the closed-form inverse reads
+        (:func:`~waveorder.nn.functional.half_hermitian_parts`, :class:`~waveorder.nn.operators.FourierDiagonal`).
     """
 
     operator_type: type[LinearOperator] = FourierDiagonal
     real_transfer: bool = False
+    skewed_transfer: bool = False
 
     def __init__(self, *, fields: tuple[str, ...], channel_count: int, cache: CacheMode = "off") -> None:
         super().__init__(fields=fields, channel_count=channel_count)
@@ -219,7 +225,8 @@ class ShiftInvariantSystem(ImagingSystem):
         """Compute the transfer on ``sampling``, in FFT order along z and y.
 
         Return a complex ``(C, F, Z, Y, X // 2 + 1)`` half spectrum, or its real storage
-        ``(C, F, Z, Y, X // 2 + 1, 2)``; with :attr:`real_transfer`, a real ``(C, F, Z, Y, X // 2 + 1)`` tensor.
+        ``(C, F, Z, Y, X // 2 + 1, 2)``; with :attr:`real_transfer`, a real ``(C, F, Z, Y, X // 2 + 1)`` tensor; with
+        :attr:`skewed_transfer`, the two parts stacked on a new leading axis.
         :func:`~waveorder.nn.functional.half_spectrum_frequencies` gives the frequencies ``(fz, fy, fx)`` of that grid.
         """
 
@@ -253,7 +260,10 @@ class ShiftInvariantSystem(ImagingSystem):
     @final
     @override
     def compute_operator(self, sampling: Sampling) -> FourierDiagonal:
-        return FourierDiagonal(self.transfer(sampling), sampling, hermitian=True)
+        transfer = self.transfer(sampling)
+        if self.skewed_transfer:
+            return FourierDiagonal(transfer[0], sampling, skew=transfer[1], hermitian=True)
+        return FourierDiagonal(transfer, sampling, hermitian=True)
 
     def _computed(self, sampling: Sampling) -> HalfTransfer:
         transfer = self.compute_transfer(sampling)
@@ -261,12 +271,15 @@ class ShiftInvariantSystem(ImagingSystem):
             transfer = transfer.real if self.real_transfer else torch.view_as_real(transfer)
         nz, ny, nx = sampling.shape
         layout = () if self.real_transfer else (2,)
-        expected = (self.channel_count, len(self.fields), nz, ny, nx // 2 + 1, *layout)
+        parts = (2,) if self.skewed_transfer else ()
+        expected = (*parts, self.channel_count, len(self.fields), nz, ny, nx // 2 + 1, *layout)
         if tuple(transfer.shape) != expected:
             raise ShapeError(
                 f"{type(self).__name__}.compute_transfer returned a transfer of shape {tuple(transfer.shape)}, "
                 f"expected {expected}: {_transfer_rule(real=self.real_transfer)}"
             )
+        if self.skewed_transfer:  # the anti-Hermitian part is anti-Hermitian on the self-conjugate columns already
+            return torch.stack((hermitian_half(transfer[0], nx, real=self.real_transfer), transfer[1]))
         return hermitian_half(transfer, nx, real=self.real_transfer)
 
     @override

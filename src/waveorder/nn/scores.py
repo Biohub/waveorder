@@ -102,9 +102,11 @@ def _hat_statistics(gaussian: LinearGaussian, data: Tensor) -> tuple[Tensor, Ten
 class GCV(Score):
     """Generalized cross-validation of the closed-form reconstruction: ``n |g - S g|^2 / (n - tr S)^2``.
 
-    ``S`` is the hat matrix of the Wiener estimate, ``g -> H f_hat``, and ``n`` the number of data samples. GCV
-    estimates the prediction error without knowing the noise variance, so minimizing it over a free Tikhonov weight
-    picks the regularization from the data. Data units squared; not a likelihood.
+    ``S`` is the hat matrix of the posterior mean under the forward operator, ``g -> H f_hat``, and ``n`` the number of
+    data samples. GCV estimates the prediction error without knowing the noise variance, so minimizing it over a free
+    Tikhonov weight picks the regularization from the data. Data units squared; not a likelihood. Where a system's
+    cropped transfer is not Hermitian, :class:`~waveorder.nn.Wiener` inverts the cropped one as wo-4.0 does and its
+    estimate differs from that mean; wo-4.0 has GCV for fluorescence only, whose cropped 3D transfer is Hermitian.
     """
 
     has_covariance: ClassVar[bool] = True  # as wo-4.0, though only the evidence's curvature is a posterior width

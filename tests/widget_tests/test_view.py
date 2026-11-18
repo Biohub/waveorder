@@ -139,7 +139,7 @@ def test_a_3d_store_shows_its_transfer_function_on_the_centred_full_spectrum(tmp
     layers = _layers(opened[0])
     assert list(layers) == ["Re(transfer_function)", "Im(transfer_function)"]
     centred = _spectrum(layers, "transfer_function")
-    half = _half(path)[0, 0]
+    half = _half(path)[0, 0, 0]  # the Hermitian part of a brightfield phase store, which the forward model applies
     z, y, x = SHAPE
     assert centred.shape == SHAPE
     assert centred[z // 2, y // 2, x // 2] == half[0, 0, 0]  # the zero frequency lands at the centre

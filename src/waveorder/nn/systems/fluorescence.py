@@ -18,7 +18,7 @@ from waveorder.nn.functional import (
     crop_full_lateral,
     defocused_intensity,
     from_half_spectrum,
-    half_of_hermitian_part,
+    half_hermitian_parts,
     intensity_otf,
     irfftn,
     plane_slabs,
@@ -275,7 +275,9 @@ class ThinFluorescence2D(ImagingSystem):
 
     operator_type: type[LinearOperator] = ReshapedFourierDiagonal
     detection: Detection
-    preserves_nonnegativity = True  # each plane's PSF is an intensity
+    # Each plane's PSF is an intensity; on an odd axis cropped from an even one wo-4.0's crop shifts the transfer one
+    # bin, which modulates the PSF and takes it below zero, as in wo-4.0.
+    preserves_nonnegativity = True
 
     def __init__(
         self, detection: Detection, *, index_of_refraction_media: float, z_positions: tuple[float, ...] | None = None
@@ -332,14 +334,15 @@ class ThinFluorescence2D(ImagingSystem):
         return base + self.detection.z_focus_offset * dz
 
     def plane_transfers(self, sampling: Sampling) -> Tensor:
-        """Return the transfer function of every plane.
+        """Return the transfer function of every plane, as two parts.
 
         Returns
         -------
         Tensor
-            Half spectra, shape ``(Z, 1, 1, Y, X // 2 + 1)`` stored real when :attr:`real_transfer` is set, else
-            ``(Z, 1, 1, Y, X // 2 + 1, 2)``: per plane, the half of the Hermitian part of the cropped transfer
-            function (:func:`~waveorder.nn.functional.half_of_hermitian_part`).
+            Half spectra, shape ``(2, Z, 1, 1, Y, X // 2 + 1)`` stored real when :attr:`real_transfer` is set, else
+            ``(2, Z, 1, 1, Y, X // 2 + 1, 2)``: per plane, the Hermitian and anti-Hermitian parts of wo-4.0's cropped
+            transfer function (:func:`~waveorder.nn.functional.half_hermitian_parts`). The forward model applies the
+            first; the closed-form inverse inverts the cropped function itself, as wo-4.0 does.
         """
         self.check_sampling(sampling)
         reference = self.detection.numerical_aperture
@@ -354,16 +357,17 @@ class ThinFluorescence2D(ImagingSystem):
             intensity = defocused_intensity(pupil, kz, part)  # (P, Y', X')
             # The zero frequency of fft2(I) is sum(I): normalizing I first makes it 1 on every plane.
             spectrum = torch.view_as_real(torch.fft.fft2(intensity / intensity.sum(dim=(-2, -1), keepdim=True)))
-            return half_of_hermitian_part(crop_full_lateral(spectrum, sampling.shape), axes=2)
+            return torch.stack(half_hermitian_parts(crop_full_lateral(spectrum, sampling.shape), axes=2))
 
         # In slabs of planes, each cropped at once: the planes are independent.
         slabs = plane_slabs(self.plane_positions(sampling), kz.numel())
-        planes = torch.cat([spectra(part) for part in slabs])[:, None, None]  # (Z, 1, 1, Y, X // 2 + 1, 2)
+        planes = torch.cat([spectra(part) for part in slabs], dim=1)[:, :, None, None]  # (2, Z, 1, 1, Y, X', ...)
         return planes[..., 0] if self.real_transfer else planes
 
     @override
     def compute_operator(self, sampling: Sampling) -> ReshapedFourierDiagonal:
         """Return ``H`` on the stack ``sampling``: the plane operator with one channel per focal plane."""
         plane = Sampling(shape=(1, *sampling.shape[1:]), pixel_size=sampling.pixel_size)
-        planes = FourierDiagonal(self.plane_transfers(sampling), plane)
+        transfer, skew = self.plane_transfers(sampling)
+        planes = FourierDiagonal(transfer, plane, skew=skew)
         return ReshapedFourierDiagonal(planes, sampling, data_shape=self.data_shape(sampling))

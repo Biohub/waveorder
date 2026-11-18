@@ -396,7 +396,9 @@ class TileOperators:
             return operator
         operator = evaluate(lambda model, s: model.system.bind(s), self.model, self._row(index), sampling)
         fourier = operator.as_fourier()
-        size = fourier.transfer.nbytes if fourier is not None else self.budget + 1  # an unknown size is not kept
+        size = self.budget + 1  # an unknown size is not kept
+        if fourier is not None:
+            size = fourier.transfer.nbytes + (0 if fourier.skew is None else fourier.skew.nbytes)
         if not self._full and self.held + size <= self.budget:
             self._operators[key] = operator
             self.held += size

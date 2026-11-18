@@ -178,8 +178,15 @@ def _diff(old: object, new: object, *, prefix: str, found: list[str]) -> None:
 
 # --- the transfer functions a store holds ---------------------------------------------------------------------------
 
-_REUSED = ("pixel_size_zyx_um", "imaging_system_sha256", "parameters_sha256", "dtype", "device")
+_REUSED = ("pixel_size_zyx_um", "imaging_system_sha256", "parameters_sha256", "dtype", "device", "transfer_crop")
 """What a stored transfer function was computed for besides its grid (:func:`transfer_record`), all to match."""
+
+_CROP = "wo-4.0 nd_fourier_central_cuboid, [hermitian, anti-hermitian] parts"
+"""How the stored transfers are cropped and split (:func:`~waveorder.nn.functional.cropped_frequencies`).
+
+Stores written before carry none: their transfers are recomputed, as on an odd axis cropped from an even one they were
+cropped otherwise and a brightfield phase transfer had no anti-Hermitian part.
+"""
 
 _HASHED = {"imaging_system_sha256": "another imaging system", "parameters_sha256": "other parameter values"}
 
@@ -222,6 +229,7 @@ def transfer_record(model: ReconstructionModel, sampling: Sampling) -> dict[str,
         "imaging_system_sha256": system_sha256(model),
         "dtype": str(model.dtype).removeprefix("torch."),
         "device": model.device.type,
+        "transfer_crop": _CROP,
     }
 
 
@@ -580,15 +588,18 @@ def made_by(model: ReconstructionModel) -> dict[str, object]:
 def _transfer_at(model: ReconstructionModel, shape: ZYX, pixel_size: PixelSize) -> TransferArray | None:
     """Return the model's transfer on ``shape`` after z padding as reconstructions compute it; ``None`` for no such.
 
-    A thin (2D) system's transfer is its plane transfers, one per focal plane: shown by ``wo view``, never reused.
+    A thin (2D) system's transfer is its plane transfers, one per focal plane, the parts the forward model applies:
+    shown by ``wo view``, never reused. A system with a skewed transfer stores both its parts.
     """
     system = model.system
     slices = model.z_padding_for(shape, pixel_size=pixel_size)
     sampling = ZPadding(slices).sampling(Sampling(shape=shape, pixel_size=pixel_size))
     if isinstance(system, ShiftInvariantSystem):
         compute, real = system.transfer, system.real_transfer
-        layout = ["channel", "field", "z", "y", "x_half"]
+        layout = ["part"] * system.skewed_transfer + ["channel", "field", "z", "y", "x_half"]
         fft = "data = irfftn(sum over fields of H[c, f] * rfftn(object[f])) over (z, y, x); x keeps X // 2 + 1"
+        if system.skewed_transfer:
+            fft += "; H is part 0, the Hermitian part; part 0 + part 1 is the cropped H(k), part 0 - part 1 conj H(-k)"
     elif isinstance(system, ThinPhase2D | ThinFluorescence2D):
         compute, real = system.plane_transfers, isinstance(system, ThinFluorescence2D) and system.real_transfer
         layout = ["plane", "field", "z", "y", "x_half"]
@@ -598,6 +609,8 @@ def _transfer_at(model: ReconstructionModel, shape: ZYX, pixel_size: PixelSize) 
         return None
     with torch.no_grad():
         values = compute(sampling).detach().cpu()
+    if layout[0] == "plane":  # the Hermitian parts, which the forward model applies
+        values = values[0]
     attrs: dict[str, object] = {
         "layout": layout,
         "fft": fft,
