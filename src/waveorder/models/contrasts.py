@@ -60,8 +60,9 @@ class Phase3D(ReconstructionModel):
         Absorption per unit phase (3.x ``absorption_ratio``, default 0: a pure phase object), or ``"independent"``
         for a second object field.
     **parts
-        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
-        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``calibration_edge_steepness``, ``z_padding``,
+        ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device`` (see
+        :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -151,8 +152,9 @@ class Phase2D(ReconstructionModel):
         Defocus of each plane in um, in data order, for unevenly spaced stacks; by default the planes are evenly
         spaced around the centre slice.
     **parts
-        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
-        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``calibration_edge_steepness``, ``z_padding``,
+        ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device`` (see
+        :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -223,8 +225,9 @@ class Fluorescence3D(ReconstructionModel):
         ``detection.pinhole.diameter_um`` in a configuration); ``0`` is a point pinhole, ``None`` widefield. The
         pinhole factor is the 3.x squared jinc, so a hard pinhole of diameter ``D`` acts like ``D / sqrt(2)``.
     **parts
-        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
-        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``calibration_edge_steepness``, ``z_padding``,
+        ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device`` (see
+        :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------
@@ -278,8 +281,9 @@ class Fluorescence2D(ReconstructionModel):
         Defocus of each plane in um, in data order, for unevenly spaced stacks; by default the planes are evenly
         spaced around the centre slice.
     **parts
-        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``z_padding``, ``field_tiles``,
-        ``pixel_size``, ``apodization_rolloff`` and ``device`` (see :class:`~waveorder.models.ReconstructionModel`).
+        ``object_prior``, ``noise``, ``solver``, ``score``, ``search``, ``calibration_edge_steepness``, ``z_padding``,
+        ``field_tiles``, ``pixel_size``, ``apodization_rolloff`` and ``device`` (see
+        :class:`~waveorder.models.ReconstructionModel`).
 
     Raises
     ------

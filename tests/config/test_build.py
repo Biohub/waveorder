@@ -1,6 +1,8 @@
 """A configuration builds the registered parts it writes, with its arguments, and is refused at the config path."""
 
 import copy
+import importlib.util
+import warnings
 from typing import Any
 
 import pytest
@@ -117,6 +119,7 @@ DETECTION = {
     "numerical_aperture": 1.2,
     "z_focus_offset": 0.0,
     "edge": "ramp",
+    "edge_steepness": 1e4,
     "pupil_aberrations": None,
 }
 ILLUMINATION = {
@@ -382,7 +385,7 @@ def test_each_search_stage_builds_its_class_in_the_configured_order():
     search = [
         {"grid": {"points": 3}},
         {"random": {"samples": 4, "seed": 2}},
-        {"gradient": {"max_iter": 4, "optimizer": "nadam"}},
+        {"gradient": {"max_iter": 4, "optimizer": "nadam", "tolerance": 0.1, "patience": 2}},
         {"lbfgs": {"iterations": 5, "history": 4}},
         {"nelder_mead": {"iterations": 9, "tolerance": 1e-3}},
     ]
@@ -391,8 +394,8 @@ def test_each_search_stage_builds_its_class_in_the_configured_order():
     assert grid[1]["points"] == 3
     assert random == ("random", random[1] | {"samples": 4, "seed": 2})
     assert gradient[0] == "gradient"
-    assert (gradient[1]["iterations"], gradient[1]["optimizer"]) == (4, "nadam")
-    assert lbfgs == ("lbfgs", {"iterations": 5, "history": 4})
+    assert gradient[1] | {"tolerance": 0.1, "patience": 2, "iterations": 4, "optimizer": "nadam"} == gradient[1]
+    assert lbfgs == ("lbfgs", {"iterations": 5, "history": 4, "tolerance": None, "patience": 5})
     assert nelder_mead == ("nelder_mead", {"iterations": 9, "tolerance": 1e-3})
 
 
@@ -406,10 +409,16 @@ def test_each_search_stage_builds_its_class_in_the_configured_order():
             {"optimizer": "nadam", "learning_rates": {NA: 0.1}},
         ),
         ({"optimizer": "lbfgs"}, "lbfgs", {"iterations": 200}),
+        (
+            {"optimizer": "adam", "convergence_tol": 1e-4, "convergence_patience": 3},
+            "gradient",
+            {"tolerance": 1e-4, "patience": 3},
+        ),
+        ({"optimizer": "lbfgs", "convergence_tol": 1e-4}, "lbfgs", {"tolerance": 1e-4, "patience": 5}),
         ({"optimizer": "nelder_mead", "convergence_tol": 1e-3}, "nelder_mead", {"tolerance": 1e-3, "iterations": 200}),
         ({"optimizer": "grid_search", "grid_points": 5}, "grid", {"points": 5}),
     ],
-    ids=["adam", "nadam", "lbfgs", "nelder_mead", "grid_search"],
+    ids=["adam", "nadam", "lbfgs", "adam_stops", "lbfgs_stops_after_wo_40s_5", "nelder_mead", "grid_search"],
 )
 def test_a_3x_optimizer_is_the_one_stage_it_names(advanced, name, arguments):
     # Its budget is the max_iter of the default lone gradient stage, 200, as wo-4.0 read it.
@@ -529,7 +538,7 @@ SHARP = {"score": "sharpness"}
     [
         (_raw(solver={"padding": {"z": 2}}, object={"dimension": 2}), "solver.padding.z"),
         (
-            _free(solver={"calibration": SHARP | {"advanced": {"optimizer": "adam", "convergence_tol": 1e-3}}}),
+            _free(solver={"calibration": SHARP | {"advanced": {"optimizer": "grid_search", "convergence_tol": 1e-3}}}),
             "solver.calibration.advanced.convergence_tol",
         ),
         (
@@ -633,6 +642,46 @@ def test_use_gradients_false_under_a_wo_40_gradient_optimizer_keeps_the_nominal_
         parts = _parts(raw)
     assert (free_specs(parts["system"]), parts["search"]) == ({}, None)
     assert float(parts["system"].get_buffer("detection.numerical_aperture")) == pytest.approx(FREE_NA["nominal"])
+
+
+def _wo_rec(**advanced: object) -> dict:
+    """A free aperture with ``tolerance: free`` under a sharpness calibration with ``advanced``, as wo rec ran it."""
+    raw = _free(solver={"calibration": {"score": "sharpness", "advanced": advanced}})
+    raw["imaging_system"]["detection"]["numerical_aperture"] = FREE_NA | {"tolerance": "free"}
+    return raw
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "use_gradients"),
+    [
+        *((optimizer, given) for optimizer in ("adam", "nadam", "lbfgs") for given in (None, True)),
+        *((optimizer, given) for optimizer in ("nelder_mead", "grid_search") for given in (None, True, False)),
+    ],
+)
+def test_use_gradients_runs_the_stage_wo_40_resolved_it_to(optimizer, use_gradients):
+    # wo-4.0: null is true for adam, nadam, lbfgs and false for the others, which ignore it; only false under a
+    # gradient optimizer changes what runs (no step, above).
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        given = _parts(_wo_rec(optimizer=optimizer, use_gradients=use_gradients))["search"]
+    assert not [warning for warning in caught if "use_gradients" in str(getattr(warning.message, "location", ""))]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConfigurationWarning)
+        assert given == _parts(_wo_rec(optimizer=optimizer))["search"]
+
+
+def test_a_log_dir_is_warned_of_where_nothing_is_logged():
+    held = _no_effect(_wo_rec(optimizer="adam", use_gradients=False, log_dir="runs"))
+    assert "the calibration does not run, so there is nothing to log" in held["solver.calibration.advanced.log_dir"]
+    unread = _free(solver={"calibration": {"score": "evidence", "advanced": {"log_dir": "runs"}}})
+    assert "solver.calibration.advanced.log_dir" in _no_effect(unread)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("tensorboard") is not None, reason="tensorboard is installed")
+def test_a_log_dir_without_tensorboard_is_refused_with_the_install_hint():
+    refusal = _refusal(_wo_rec(optimizer="adam", log_dir="runs"))
+    assert refusal.startswith("solver.calibration.advanced.log_dir: writes a TensorBoard log")
+    assert refusal.endswith("pip install waveorder[tensorboard]")
 
 
 def test_a_bead_calibration_with_an_estimated_sigma_runs_one_gradient_search():

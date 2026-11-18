@@ -118,7 +118,10 @@ def test_nested_specs_and_values_are_rebuilt_before_the_part():
     assert registry.describe(prior)["tikhonov"]["weight"] == {
         "free": {"nominal": 0.01, "tolerance": None, "bounds": [1e-4, 1.0]}
     }
-    assert registry.describe(Wiener()) == {"wiener": {}}
+    assert registry.describe(Wiener()) == {"wiener": {"coupling": "joint"}}
+    per_field = registry.resolve(registry.describe(Wiener(coupling="per_field")), "solver")
+    assert isinstance(per_field, Wiener)
+    assert per_field.coupling == "per_field"
 
 
 def test_the_registry_imports_no_torch():

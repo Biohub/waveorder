@@ -4,7 +4,7 @@
 plane at several focal planes (3.x ``isotropic_thin_3d``). Both are first order in the object (first Born
 approximation), so they hold while the contrast ``|I / mean(I) - 1|`` is well below 1, and both measure one channel of
 that contrast (:func:`~waveorder.nn.preprocess.brightfield_contrast`). ``Detection(edge="sigmoid")`` reproduces 3.x
-transfer functions to rounding.
+transfer functions to rounding, and its ``edge_steepness`` is 3.x's ``pupil_steepness``.
 """
 
 import math

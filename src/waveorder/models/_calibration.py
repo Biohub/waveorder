@@ -4,6 +4,7 @@ The volume is calibrated whole, or each field tile on its own; the ``tf.zarr`` s
 their Laplace covariance where the calibration gives one (an evidence or GCV score, or a bead fit).
 """
 
+import itertools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from iohub.ngff import Position
 from torch import Tensor
 
 from waveorder.config import V4Config, dump
-from waveorder.config.schema import LegacyAutoWeight, WeightAuto
+from waveorder.config.schema import LegacyAutoWeight, WeightAuto, calibration_log_dir
 from waveorder.errors import ConfigurationError, Problems, Rejected, WaveorderError, named
 from waveorder.io.positions import channel_indices, read_position_meta, store_path
 from waveorder.io.sweep_report import save_sweep_montage, save_sweep_report
@@ -35,13 +36,31 @@ from waveorder.models._stores import (
 from waveorder.nn import Sampling, free_specs, load_parameters
 from waveorder.nn.parameters import placement, shortest_decimal
 from waveorder.nn.priors import Beads
-from waveorder.nn.search import BeadCalibration, SweepResult
+from waveorder.nn.search import (
+    BeadCalibration,
+    CalibrationResult,
+    GradientSearch,
+    GridSearch,
+    SearchStage,
+    SweepResult,
+    WeightSweep,
+)
 from waveorder.tiling import TilePlan
 
 log = logging.getLogger(__name__)
 
 _SIGMA = "noise.sigma"
 """The Gaussian noise level, which a bead fit estimates beside the system's quantities."""
+
+_WO40_TAGS = {
+    "system.detection.numerical_aperture": "numerical_aperture_detection",
+    "system.detection.z_focus_offset": "z_focus_offset",
+    "system.illumination.numerical_aperture": "numerical_aperture_illumination",
+    "system.illumination.tilt.zenith": "tilt_angle_zenith",
+    "system.illumination.tilt.azimuth": "tilt_angle_azimuth",
+}
+"""wo-4.0's names of the quantities its optimizer calibrated, the scalar tags of its TensorBoard log; another
+quantity is tagged with its dotted name."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -181,7 +200,9 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
     weight = None if config is None else config.object.weight
     auto = weight.auto if isinstance(weight, WeightAuto) else None
     written = auto is not None and (auto.report_path is not None or auto.plot_path is not None)
-    result = model.calibrate(volume, pixel_size=plan.pixel_size, prior=search.prior, history=bool(wanted) or written)
+    log_dir = None if config is None else calibration_log_dir(config)
+    history = bool(wanted) or written or log_dir is not None
+    result = model.calibrate(volume, pixel_size=plan.pixel_size, prior=search.prior, history=history)
     found = dict(result.parameters)
     scores: dict[str, Tensor] = {}
     columns = None
@@ -209,6 +230,7 @@ def _calibrate_whole(model: ReconstructionModel, volume: Tensor, plan: Plan) -> 
             scores["score_grid"], columns = result.grid.values, [*result.grid.names, "objective"]
         if auto is not None and result.sweep is not None:
             _write_sweep(result.sweep, auto, title=f"{plan.name}   t={plan.time}")
+        _write_log(result, model, log_dir)
     names = tuple(name for name in plan.names if name in found)
     parameters = float64(torch.stack([torch.as_tensor(found[name]).reshape(()) for name in names]))
     return _Estimates(
@@ -228,6 +250,41 @@ def _write_sweep(result: SweepResult, auto: LegacyAutoWeight, *, title: str) -> 
         log.info("wrote the weight sweep's report to %s", save_sweep_report(result, auto.report_path))
     if auto.plot_path is not None:
         log.info("wrote the weight sweep's montage to %s", save_sweep_montage(result, auto.plot_path, title=title))
+
+
+def _log_rows(result: CalibrationResult, stage: SearchStage) -> list[tuple[float, dict[str, float]]]:
+    """Return the iterations wo-4.0 logged for ``stage``: the loss and the values at each, by dotted name.
+
+    A gradient step logs the objective it started from beside the values it moved to, as wo-4.0 logged Adam; a grid
+    point, a Nelder-Mead or an L-BFGS evaluation logs the objective at its values.
+    """
+    if isinstance(stage, GridSearch):
+        if result.grid is None:
+            return []
+        names = result.grid.names
+        return [(row[-1], dict(zip(names, row[:-1], strict=True))) for row in result.grid.values.tolist()]
+    evaluations = list(zip(result.steps, result.step_points, strict=True))
+    if isinstance(stage, GradientSearch):
+        return [(loss, moved) for (loss, _), (_, moved) in itertools.pairwise(evaluations)]
+    return evaluations
+
+
+def _write_log(result: CalibrationResult, model: ReconstructionModel, directory: str | None) -> None:
+    """Write wo-4.0's TensorBoard log of the calibration to ``directory``, if any: the loss and each value per step."""
+    if directory is None:
+        return
+    from torch.utils.tensorboard import SummaryWriter  # waveorder[tensorboard], which building the model checked
+
+    stage = next(stage for stage in model.search or () if not isinstance(stage, WeightSweep))
+    writer = SummaryWriter(log_dir=directory)
+    try:
+        for step, (loss, values) in enumerate(_log_rows(result, stage)):
+            writer.add_scalar("loss", loss, step)
+            for name, value in values.items():
+                writer.add_scalar(_WO40_TAGS.get(name, name), value, step)
+    finally:
+        writer.close()
+    log.info("wrote the calibration's TensorBoard log to %s", directory)
 
 
 def _calibrate_field_tiles(model: ReconstructionModel, volume: Tensor, plan: Plan) -> _Estimates:

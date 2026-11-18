@@ -11,7 +11,7 @@ from typing import ClassVar
 
 import torch
 
-from waveorder.nn.search.base import CalibrationObjective, Estimate, _expect_count
+from waveorder.nn.search.base import CalibrationObjective, Estimate, _expect_count, record_step
 from waveorder.nn.search.descent import _expect_rate
 from waveorder.registry import register
 
@@ -67,8 +67,11 @@ class NelderMeadSearch:
             }
 
         def value(x: Sequence[float]) -> float:
+            at = tensors(x)
             with torch.no_grad():
-                return float(objective(tensors(x)))
+                found = objective(at)
+            record_step(found, at)  # each evaluation, for calibrate(..., history=True), as wo-4.0 logged them
+            return float(found)
 
         x0 = [float(start.point[name]) for name in names]
         bounds = [specs[name].bounds for name in names]

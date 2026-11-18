@@ -73,7 +73,8 @@ visual = [
     "dask>=2026.8",  # the lazy birefringence overlay
     "platformdirs>=4.14",  # where the sample data is downloaded
 ]
-all = ["waveorder[visual]"]
+tensorboard = ["tensorboard>=2.14"]  # wo-4.0's pin; the log of solver.calibration.advanced.log_dir
+all = ["waveorder[visual,tensorboard]"]
 
 [dependency-groups]
 test = [

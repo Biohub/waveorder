@@ -5,7 +5,8 @@ and the confocal pinhole's OTF, :func:`pinhole_otf`.
 """
 
 import math
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, Self, override
 
@@ -23,7 +24,7 @@ type PupilEdge = Literal["ramp", "sigmoid"]
 """How :class:`Detection` draws the aperture edge: ``"ramp"`` antialiased (default), ``"sigmoid"`` as in 3.x."""
 
 SIGMOID_EDGE_STEEPNESS = 1e4
-"""Slope of the ``"sigmoid"`` aperture edge, per cycle/um: 3.x ``generate_pupil``."""
+"""Default slope of the ``"sigmoid"`` aperture edge, in um (per cycle/um of radius): 3.x ``generate_pupil``."""
 
 _EDGE_STEPS = 4.0
 """Slope of the illumination cap's sigmoid edge, per frequency-grid step (3.x ``generate_tilted_pupil``)."""
@@ -110,7 +111,9 @@ class Detection(CalibratableModule):
 
     ``edge="ramp"`` (default) weights each frequency sample by the fraction of a one-sample ramp inside the cut-off,
     which gives the numerical aperture a gradient. ``edge="sigmoid"`` reproduces 3.x ``generate_pupil``,
-    ``sigmoid(1e4 (NA / wavelength - radius))``, a hard edge: use it for parity with 3.x, not to calibrate the NA.
+    ``sigmoid(edge_steepness (NA / wavelength - radius))``; at the default steepness, 1e4 um, the edge is hard: use it
+    for parity with 3.x, not to calibrate the NA. wo-4.0's optimizer fitted with steepness 100 (a soft edge) and
+    reconstructed with 1e4; :meth:`using_edge_steepness` switches it for a calibration.
 
     Parameters
     ----------
@@ -126,18 +129,22 @@ class Detection(CalibratableModule):
         object plane is in focus at slice ``Z // 2 + z_focus_offset``, and it can be calibrated.
     edge : {"ramp", "sigmoid"}
         Aperture edge (see above).
+    edge_steepness : float
+        Slope of the sigmoid edge in um, positive (3.x ``pupil_steepness``); the ramp edge takes only the default.
     pupil_aberrations : ZernikeAberration, optional
         Aberrations multiplied into the pupil, named ``detection.pupil_aberrations.<term>``; ``None`` for none.
 
     Raises
     ------
     ParameterError
-        For a ``wavelength`` that is not ``None`` or positive and finite, an unknown ``edge``, or an aperture that
-        is not positive; ``path`` is the argument.
+        For a ``wavelength`` that is not ``None`` or positive and finite, an unknown ``edge``, an ``edge_steepness``
+        that is not positive and finite or is given with the ramp edge, or an aperture that is not positive; ``path``
+        is the argument.
     """
 
     numerical_aperture: Tensor
     z_focus_offset: Tensor
+    _edge_steepness: Tensor
 
     def __init__(
         self,
@@ -146,6 +153,7 @@ class Detection(CalibratableModule):
         numerical_aperture: Quantity,
         z_focus_offset: Quantity = 0.0,
         edge: PupilEdge = "ramp",
+        edge_steepness: float = SIGMOID_EDGE_STEEPNESS,
         pupil_aberrations: ZernikeAberration | None = None,
     ) -> None:
         super().__init__()
@@ -155,11 +163,52 @@ class Detection(CalibratableModule):
         if edge not in ("ramp", "sigmoid"):
             raise ParameterError(f"Detection.edge must be 'ramp' or 'sigmoid', got {edge!r}", path="edge")
         self.edge: PupilEdge = edge
+        _expect_steepness(edge_steepness, edge=edge)
         self.register_quantity("numerical_aperture", numerical_aperture, positive=True)
         self.register_quantity("z_focus_offset", z_focus_offset)
         self.numerical_aperture_range = value_range(numerical_aperture)
         self.z_focus_offset_range = value_range(z_focus_offset)
         self.pupil_aberrations = pupil_aberrations
+        self._steepness = float(edge_steepness)
+        # A buffer, so that a cached transfer is keyed on it (ShiftInvariantSystem.state_key) and it moves with the
+        # module; not persistent, as it is a setting, not a quantity.
+        self.register_buffer("_edge_steepness", torch.tensor(self._steepness), persistent=False)
+
+    @property
+    def edge_steepness(self) -> float:
+        """The slope of the sigmoid edge in um now: the one built with, or that of :meth:`using_edge_steepness`."""
+        return self._steepness
+
+    @contextmanager
+    def using_edge_steepness(self, steepness: float) -> Generator[None]:
+        """Draw the sigmoid edge with ``steepness`` inside the block, then with the steepness it had before.
+
+        For a calibration on a softer edge than the reconstruction's, as wo-4.0's optimizer fitted at 100. The
+        description (:func:`waveorder.registry.describe`) keeps the steepness the detection was built with.
+
+        Raises
+        ------
+        ParameterError
+            As the constructor, for a ``steepness`` that is not positive and finite or a detection with the ramp edge
+            (``path="edge_steepness"``).
+        """
+        if self.edge != "sigmoid":
+            raise ParameterError(
+                f"Detection.edge_steepness is the slope of the sigmoid edge; this detection's edge is {self.edge!r}",
+                path="edge_steepness",
+            )
+        _expect_steepness(steepness, edge=self.edge)
+        held = self._steepness
+        self._set_steepness(float(steepness))
+        try:
+            yield
+        finally:
+            self._set_steepness(held)
+
+    def _set_steepness(self, steepness: float) -> None:
+        self._steepness = steepness
+        with torch.no_grad():  # an in-place write bumps the buffer's version, so no cached transfer outlives it
+            self._edge_steepness.fill_(steepness)
 
     @property
     def has_wavelength(self) -> bool:
@@ -205,9 +254,10 @@ class Detection(CalibratableModule):
 
     @override
     def extra_repr(self) -> str:
-        """Return the wavelength (``None`` until given or inherited), the quantities and the edge."""
+        """Return the wavelength (``None`` until given or inherited), the quantities, the edge and its steepness."""
         wavelength = "None" if self._wavelength is None else f"{self._wavelength:g}"
-        return repr_parts(f"wavelength={wavelength}", super().extra_repr(), f"edge={self.edge!r}")
+        steepness = "" if self._steepness == SIGMOID_EDGE_STEEPNESS else f"edge_steepness={self._steepness:g}"
+        return repr_parts(f"wavelength={wavelength}", super().extra_repr(), f"edge={self.edge!r}", steepness)
 
     @override
     def current_argument(self, name: str, given: object) -> object:
@@ -220,7 +270,7 @@ class Detection(CalibratableModule):
         """Return the complex detection pupil on ``grid``, stored as ``(Y, X, 2)`` real and imaginary parts."""
         cutoff = self.numerical_aperture / self.wavelength
         if self.edge == "sigmoid":
-            aperture = torch.sigmoid(SIGMOID_EDGE_STEEPNESS * (cutoff - grid.radius))
+            aperture = torch.sigmoid(self._edge_steepness * (cutoff - grid.radius))
         else:
             aperture = torch.clamp((cutoff - grid.radius) / grid.spacing + 0.5, min=0.0, max=1.0)
         pupil = torch.stack((aperture, torch.zeros_like(aperture)), dim=-1)
@@ -228,6 +278,21 @@ class Detection(CalibratableModule):
         if self.pupil_aberrations is not None:
             pupil = complex_multiply(pupil, self.pupil_aberrations.profile(coordinates))
         return pupil
+
+
+def _expect_steepness(steepness: object, *, edge: PupilEdge) -> None:
+    """Raise at ``edge_steepness`` unless it is a positive finite number, and the default for the ramp edge."""
+    number = isinstance(steepness, int | float) and not isinstance(steepness, bool)
+    if not (number and math.isfinite(steepness) and steepness > 0):
+        raise ParameterError(
+            f"Detection.edge_steepness must be a positive finite number (um), got {steepness!r}", path="edge_steepness"
+        )
+    if edge == "ramp" and steepness != SIGMOID_EDGE_STEEPNESS:
+        raise ParameterError(
+            f"Detection.edge_steepness is the slope of the sigmoid edge, and the ramp edge has none; got {steepness} "
+            "with edge='ramp': pass edge='sigmoid' or leave edge_steepness out",
+            path="edge_steepness",
+        )
 
 
 @register("illumination_tilt", kind="tilt")

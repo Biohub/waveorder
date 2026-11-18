@@ -1,7 +1,7 @@
 """Brightfield phase systems: units, first-order oracles, inverses and the module contracts."""
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 import torch
@@ -108,6 +108,109 @@ def test_thin_tilted_inverse_solves_the_normal_equations_per_frequency() -> None
     oracle = torch.fft.ifft2(solved[..., 0].permute(2, 0, 1)).real
     assert _relative(estimate, oracle) <= 1e-9
     assert _relative(estimate[0], obj[0, 0]) < 0.6
+
+
+def _thin_transfers(system: ThinPhase2D, sampling: Sampling) -> Tensor:
+    """Return the full-spectrum transfer of each field, ``(2, Z, Y, X)``: ``[H_phase, H_absorption]``."""
+    impulse = torch.zeros(2, 2, 1, *sampling.shape[1:], dtype=torch.float64)
+    impulse[0, 0, 0, 0, 0] = impulse[1, 1, 0, 0, 0] = 1
+    operator = system.bind(sampling)
+    return torch.stack([torch.fft.fft2(operator.apply(delta)[0]) for delta in impulse])
+
+
+@pytest.mark.parametrize("zenith", [0.0, 0.3], ids=["on-axis", "tilted"])
+def test_per_field_wiener_is_each_fields_tikhonov_inverse(zenith) -> None:
+    """``coupling="per_field"`` is 3.x's ``decomposition="per_channel"``: ``conj(H_f) . d / (||H_f||^2 + weight)`` over
+    the planes for each field; with the fields' transfers orthogonal over z (on axis) it is the joint solve."""
+    system, sampling, _, intensity = _thin_scene(zenith, edge="sigmoid")
+    transfers = _thin_transfers(system, sampling)
+    weight = 1e-3
+    model = ImagingModel(system, Tikhonov(weight), Gaussian(1.0)).double()
+    contrast = brightfield_contrast(intensity, per_plane=True)
+    estimate = Wiener(coupling="per_field")(contrast, model, sampling).estimate[:, 0]
+    spectrum = torch.fft.fft2(contrast[0])
+    filtered = (transfers.conj() * spectrum).sum(dim=1) / (transfers.abs().square().sum(dim=1) + weight)
+    assert _relative(estimate, torch.fft.ifft2(filtered).real) <= 1e-9
+    joint = Wiener()(contrast, model, sampling).estimate[:, 0]
+    cross = (transfers[0].conj() * transfers[1]).sum(dim=0).abs().max()
+    if zenith == 0.0:
+        assert cross < 1e-12
+        assert _relative(estimate, joint) <= 1e-9
+    else:
+        assert cross > 1e-2  # the tilt couples the fields, and the estimators differ
+        assert _relative(estimate, joint) > 1e-2
+
+
+def _tilted_phase_correlation(coupling: Literal["joint", "per_field"], azimuth: float) -> float:
+    """#600's ``test_tilted_round_trip`` scene: a phase-only stack imaged at azimuth 1.45, reconstructed at
+    ``azimuth``; the correlation with the phase in the 12.5-50% midband of the ``2 NA_det / wavelength`` cutoff."""
+    n, pixel, wavelength, na_det = 128, 1.3, 0.45, 0.15
+    sampling = Sampling(shape=(9, n, n), pixel_size=(25.0, pixel, pixel))
+
+    def system(at: float) -> ThinPhase2D:
+        tilt = IlluminationTilt(zenith=0.15, azimuth=at)
+        illumination = Illumination(wavelength=wavelength, numerical_aperture=0.1, tilt=tilt)
+        detection = Detection(numerical_aperture=na_det, edge="sigmoid")
+        return ThinPhase2D(illumination, detection, index_of_refraction_media=1.0).double()
+
+    yy, xx = torch.meshgrid(torch.arange(n, dtype=torch.float64), torch.arange(n, dtype=torch.float64), indexing="ij")
+    phase = torch.zeros(n, n, dtype=torch.float64)
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(30):
+        cy, cx, angle = (
+            torch.rand(3, generator=generator, dtype=torch.float64) * torch.tensor([n, n, math.pi])
+        ).tolist()
+        u = (xx - cx) * math.cos(angle) + (yy - cy) * math.sin(angle)
+        v = -(xx - cx) * math.sin(angle) + (yy - cy) * math.cos(angle)
+        phase += 0.5 * torch.exp(-((u / 8.0) ** 2 + (v / 5.0) ** 2))
+    data = system(1.45).forward(torch.stack((phase, torch.zeros_like(phase)))[:, None], sampling)
+    model = ImagingModel(system(azimuth), Tikhonov(1e-3), Gaussian(1.0)).double()
+    estimate = Wiener(coupling=coupling)(data, model, sampling).estimate[0, 0]
+    frequencies = torch.fft.fftfreq(n, d=pixel, dtype=torch.float64)
+    radius = torch.sqrt(frequencies[None] ** 2 + frequencies[:, None] ** 2) / (2 * na_det / wavelength)
+    band = (radius > 0.125) & (radius < 0.5)
+    return _correlation(*(torch.fft.ifft2(torch.fft.fft2(image) * band).real for image in (estimate, phase)))
+
+
+@pytest.mark.parametrize("coupling", ["joint", "per_field"])
+def test_a_tilted_phase_object_is_recovered_at_its_own_azimuth(coupling) -> None:
+    """3.x's unconjugated inverse closed only at azimuth + pi (#598); both estimators must close at the true one."""
+    at_truth = _tilted_phase_correlation(coupling, 1.45)
+    assert at_truth > 0.95
+    assert at_truth > _tilted_phase_correlation(coupling, 1.45 + math.pi) + 0.5
+
+
+def _per_field_estimate(model: ImagingModel, data: Tensor) -> Tensor:
+    return Wiener(coupling="per_field")(data, model, SMALL).estimate
+
+
+def test_per_field_wiener_is_differentiable_and_vmaps_in_the_tilt() -> None:
+    model = ImagingModel(ThinPhase2D(*_free_optics(), index_of_refraction_media=INDEX), Tikhonov(1e-2), Gaussian(1.0))
+    model = model.double()
+    generator = torch.Generator().manual_seed(9)
+    data = torch.randn(model.system.data_shape(SMALL), generator=generator, dtype=torch.float64)
+    weights = torch.randn(model.system.object_shape(SMALL), generator=generator, dtype=torch.float64)
+    assert_gradients_match_finite_differences(
+        lambda module: (_per_field_estimate(module, data) * weights).sum(), model, atol=1e-6
+    )
+    candidates = torch.tensor([-0.3, 0.0, 0.35], dtype=torch.float64)
+    assert_vmap_matches_loop(
+        lambda module: _per_field_estimate(module, data),
+        model,
+        name="system.illumination.tilt.zenith",
+        values=candidates,
+        atol=1e-10,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_per_field_wiener_runs_on_cuda_as_on_the_cpu() -> None:
+    system, sampling, _, intensity = _thin_scene(0.3)
+    model = ImagingModel(system, Tikhonov(1e-3), Gaussian(1.0)).double()
+    contrast = brightfield_contrast(intensity, per_plane=True)
+    on_cpu = Wiener(coupling="per_field")(contrast, model, sampling).estimate
+    on_cuda = Wiener(coupling="per_field")(contrast.cuda(), model.cuda(), sampling).estimate
+    assert _relative(on_cuda.cpu(), on_cpu) <= 1e-9
 
 
 # --- units: what the object fields are --------------------------------------------------------------------------------

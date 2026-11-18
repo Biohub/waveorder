@@ -229,9 +229,15 @@ class SearchStage(Protocol):
     ``objective.prior``'s bounds and its tensors on the device, so stages chain without a host sync.
     """
 
-    reads_back: ClassVar[bool]
-    """Whether :meth:`run` reads values back to the host (``True`` for a line search that decides there);
-    :func:`~waveorder.testing.check_search_stage` skips only its no-sync check for such a stage."""
+    @property
+    def reads_back(self) -> bool:
+        """Whether :meth:`run` reads values back to the host (``True`` for a line search that decides there).
+
+        A class attribute for most stages; a property where a setting decides it, as a ``GradientSearch`` tolerance.
+        Tiled calibration runs such a stage tile by tile, and :func:`~waveorder.testing.check_search_stage` skips
+        only its no-sync check for it.
+        """
+        ...
 
     quantity_keyed: ClassVar[tuple[str, ...]]
     """Names of the stage's fields keyed by dotted quantity name (``()`` for none), such as
@@ -266,14 +272,16 @@ def keep_record(item: object) -> None:
         kept.append(item)
 
 
-_steps: ContextVar[list[Tensor] | None] = ContextVar("waveorder.nn.search.steps", default=None)
+_steps: ContextVar[list[tuple[Tensor, dict[str, Tensor]]] | None] = ContextVar(
+    "waveorder.nn.search.steps", default=None
+)
 
 
-def record_step(objective: Tensor) -> None:
-    """Hand one evaluation's objective (detached, on the device) to ``calibrate(..., history=True)``."""
+def record_step(objective: Tensor, point: Mapping[str, Tensor]) -> None:
+    """Hand one evaluation's objective and point (detached, on the device) to ``calibrate(..., history=True)``."""
     collected = _steps.get()
     if collected is not None:
-        collected.append(objective.detach())
+        collected.append((objective.detach(), {name: value.detach() for name, value in point.items()}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,7 +366,7 @@ class CalibrationResult:
     trace : tuple[tuple[str, float], ...]
         The best objective after each stage, by stage type.
     steps : tuple[float, ...]
-        With ``history``: the objective at each evaluation of the gradient stages; empty otherwise.
+        With ``history``: the objective at each evaluation of the gradient and Nelder-Mead stages; empty otherwise.
     grid : ScoreGrid, optional
         With ``history``: the points and objectives of the last grid stage over every free quantity, float64 on the
         CPU; else ``None``.
@@ -371,6 +379,8 @@ class CalibrationResult:
         (:attr:`~waveorder.nn.scores.Score.has_covariance`) or no system quantity was searched.
     covariance_names : tuple[str, ...]
         The rows and columns of :attr:`covariance`, by dotted name.
+    step_points : tuple[dict[str, float], ...]
+        With ``history``: the point of each evaluation in :attr:`steps`, by dotted name; empty otherwise.
     """
 
     parameters: dict[str, Tensor]
@@ -382,6 +392,7 @@ class CalibrationResult:
     sweep: SweepResult | None = None
     covariance: Tensor | None = None
     covariance_names: tuple[str, ...] = ()
+    step_points: tuple[dict[str, float], ...] = ()
 
 
 def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and the quantities held; what to report)
@@ -462,7 +473,7 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     grid, sweep = _seen(kept, names)
     covered, covariance = laplace_covariance(objective, values) if score.has_covariance else ((), None)
     # The one read-back of calibrate, in float64 so every value survives: stage objectives and bound flags; then
-    # the step histories and the grid kept.
+    # the step histories (one row per evaluation: the objective, then the point) and the grid kept.
     report = [*reached, on_bounds(specs, values)]
     tail = [] if grid is None else [grid.values]
     parts = [part.reshape(-1).to(torch.float64) for part in [*report, *histories, *tail]]
@@ -470,12 +481,19 @@ def calibrate(  # noqa: PLR0913 (data, model and grid; score, search, prior and 
     cut = packed_tensor.shape[0] - (0 if grid is None else grid.values.numel())
     packed = packed_tensor[:cut].tolist()
     stages, quantities = len(search), len(names)
-    levels, flags, steps = packed[:stages], packed[stages : stages + quantities], packed[stages + quantities :]
+    levels, flags, rows = packed[:stages], packed[stages : stages + quantities], packed[stages + quantities :]
     trace = tuple((type(stage).__name__, level) for stage, level in zip(search, levels, strict=True))
     at_bound = tuple(name for name, flag in zip(names, flags, strict=True) if flag)
     if grid is not None:
         grid = ScoreGrid(grid.names, packed_tensor[cut:].reshape(grid.values.shape))
-    return CalibrationResult(values, value.detach(), at_bound, trace, tuple(steps), grid, sweep, covariance, covered)
+    width = 1 + quantities
+    steps = tuple(rows[::width])
+    points = tuple(
+        dict(zip(names, rows[first + 1 : first + width], strict=True)) for first in range(0, len(rows), width)
+    )
+    return CalibrationResult(
+        values, value.detach(), at_bound, trace, steps, grid, sweep, covariance, covered, step_points=points
+    )
 
 
 def laplace_covariance(
@@ -632,16 +650,18 @@ def _run_stages(
 ) -> tuple[Estimate, list[Tensor], list[Tensor], list[list[object]]]:
     """Run ``search`` in order from the model's point; return the best and each stage's objective, steps and records.
 
-    With ``keep``, the steps are the objective at each evaluation of the stages that report them, one tensor per
-    such stage, and the records what each stage handed to :func:`keep_record`; both are empty otherwise.
+    With ``keep``, the steps are the objective and point at each evaluation of the stages that report them, one
+    ``(S, 1 + quantities)`` tensor per such stage, and the records what each stage handed to :func:`keep_record`; both
+    are empty otherwise.
     """
+    names = list(objective.specs)
     best = objective.start()
     reached: list[Tensor] = []
     histories: list[Tensor] = []
     kept: list[list[object]] = []
     for index, stage in enumerate(search):
         items: list[object] = []
-        steps: list[Tensor] = []
+        steps: list[tuple[Tensor, dict[str, Tensor]]] = []
         records, collected = _records.set(items if keep else None), _steps.set(steps if keep else None)
         try:
             best = stage.run(objective, start=best)
@@ -650,7 +670,14 @@ def _run_stages(
             _steps.reset(collected)
         reached.append(best.objective.detach().reshape(()))
         if steps:
-            histories.append(torch.stack(steps))
+            histories.append(
+                torch.stack(
+                    [
+                        torch.stack([value.reshape(()), *(point[name].reshape(()).to(value.dtype) for name in names)])
+                        for value, point in steps
+                    ]
+                )
+            )
         kept.append(items)
         if callback is not None:
             callback(index, stage, best)

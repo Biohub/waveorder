@@ -8,6 +8,7 @@ from waveorder.config import V4Config
 from waveorder.errors import ConfigurationWarning, Rejected
 from waveorder.models import ReconstructionModel
 from waveorder.nn import Evidence, GridSearch, Sampling, ThickPhase3D, ThinPhase2D, Wiener, free_specs
+from waveorder.nn.scores import SharpnessScore
 
 PHASE = """
 version: 4
@@ -83,6 +84,27 @@ def test_a_2d_phase_config_builds_the_thin_system_with_a_closed_form():
     sampling = Sampling(shape=(5, 12, 12), pixel_size=PIXEL_SIZE)
     data = torch.randn(1, *sampling.shape, generator=torch.Generator().manual_seed(1))
     assert model.solver(data, model.imaging_model, sampling).estimate.shape == (2, 1, 12, 12)
+
+
+def test_a_sharpness_calibration_scores_with_its_own_reconstruction_and_reconstructs_with_the_solvers():
+    per_field = {"closed_form": {"coupling": "per_field"}}
+    calibration = {"score": "sharpness", "search": [{"gradient": {"max_iter": 2}}], "reconstruction": per_field}
+    model = ReconstructionModel.from_config(_config(object__dimension=2, solver__calibration=calibration))
+    assert isinstance(model.score, SharpnessScore)
+    assert isinstance(model.score.solver, Wiener)
+    assert model.score.solver.coupling == "per_field"
+    assert isinstance(model.solver, Wiener)
+    assert model.solver.coupling == "joint"
+    model = ReconstructionModel.from_config(_config(object__dimension=2, solver={"reconstruction": per_field}))
+    assert model.solver.coupling == "per_field"
+
+
+def test_a_reconstruction_to_score_under_a_likelihood_score_is_refused():
+    calibration = yaml.safe_load(PHASE)["solver"]["calibration"] | {"reconstruction": "closed_form"}
+    with pytest.raises(Rejected) as rejected:
+        ReconstructionModel.from_config(_raw(solver__calibration=calibration))
+    (problem,) = rejected.value.problems
+    assert problem.message.startswith("solver.calibration.reconstruction: ")
 
 
 def test_a_free_azimuth_is_the_system_parameter_under_its_yaml_path():

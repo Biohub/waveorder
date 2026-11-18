@@ -6,10 +6,12 @@ of this file, or, for the position methods (whose helpers import iohub), inside 
 
 import copy
 import dataclasses
+import math
 import operator
 import os
 import warnings
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import ClassVar, Literal, Self, Unpack, cast
 
@@ -43,6 +45,7 @@ from waveorder.models._parts import PREPARE_SCOPES, FieldTiles, Parts, PrepareSc
 from waveorder.nn import (
     FISTA,
     CalibrationResult,
+    Detection,
     Gaussian,
     GradientSearch,
     ImagingModel,
@@ -115,6 +118,10 @@ class ReconstructionModel:
         model's solver and cutoff.
     search : Sequence[SearchStage], optional
         The calibration stages, in order; by default those of :func:`~waveorder.nn.calibrate`.
+    calibration_edge_steepness : float, optional
+        The slope, in um, of the detection's sigmoid edge while :meth:`calibrate` and :meth:`calibrate_tiles` fit (a
+        weight sweep excepted); ``None`` for the detection's own (``Detection.edge_steepness``). wo-4.0's optimizer
+        fitted 3.x phase at 100 and reconstructed at the detection's 1e4.
     z_padding : int or "auto"
         Mirrored z slices added at each end before a solve and cropped after; ``"auto"`` pads by at least the axial
         extent of the point-spread function (:meth:`z_padding_for`).
@@ -181,6 +188,7 @@ class ReconstructionModel:
         solver: Solver | None = None,
         score: Score | None = None,
         search: Sequence[SearchStage] | None = None,
+        calibration_edge_steepness: float | None = None,
         z_padding: ZPaddingSetting = 0,
         field_tiles: FieldTiles | None = None,
         pixel_size: PixelSize | Literal["auto"] | None = None,
@@ -215,6 +223,7 @@ class ReconstructionModel:
         self.solver = solver
         self.score = score
         self.search = search
+        self.calibration_edge_steepness = calibration_edge_steepness
         self._config = None
         self.setup()
 
@@ -441,6 +450,43 @@ class ReconstructionModel:
             expect_instance(stage, SearchStage, where=where, name=f"search.{index}")
         self._search = None if search is None else tuple(search)
         self._config = None
+
+    @property
+    def calibration_edge_steepness(self) -> float | None:
+        """The slope of the detection's sigmoid edge while the model calibrates; ``None`` for the detection's own."""
+        return self._calibration_steepness
+
+    @calibration_edge_steepness.setter
+    def calibration_edge_steepness(self, steepness: float | None) -> None:
+        where = type(self).__name__
+        expect_instance(steepness, (float, int, type(None)), where=where, name="calibration_edge_steepness")
+        if steepness is not None:
+            if not (math.isfinite(steepness) and steepness > 0):
+                raise ParameterError(
+                    f"{where} calibration_edge_steepness must be positive and finite (um), got {steepness}",
+                    path="calibration_edge_steepness",
+                )
+            detection = getattr(self.system, "detection", None)
+            if not isinstance(detection, Detection) or detection.edge != "sigmoid":
+                edge = detection.edge if isinstance(detection, Detection) else None
+                raise ParameterError(
+                    f"{where} calibration_edge_steepness is the slope of the detection's sigmoid edge, but "
+                    f"{type(self.system).__name__}'s detection edge is {edge!r}; build it with "
+                    "Detection(edge='sigmoid')",
+                    path="calibration_edge_steepness",
+                )
+            steepness = float(steepness)
+        self._calibration_steepness = steepness
+        self._config = None
+
+    def _calibration_edge(self) -> AbstractContextManager[None]:
+        """Hold the detection's sigmoid edge at :attr:`calibration_edge_steepness` while a calibration fits."""
+        steepness = self._calibration_steepness
+        if steepness is None:
+            return nullcontext()
+        detection = getattr(self.system, "detection", None)
+        assert isinstance(detection, Detection)  # the setter checked it
+        return detection.using_edge_steepness(steepness)
 
     @property
     def field_tiles(self) -> FieldTiles | None:
@@ -751,10 +797,11 @@ class ReconstructionModel:
         (``Gaussian(sigma="estimate")``) set their start and bounds first. Before a
         :class:`~waveorder.nn.search.sweep.WeightSweep` stage the data is cropped to its most structured 256-pixel
         square, which is padded and prepared alone; stages before the sweep run first on the whole frame with the
-        swept weight held at its start, as wo-4.0 calibrated before it swept. A :class:`~waveorder.nn.priors.Beads`
-        object prior is fitted by
-        :func:`~waveorder.nn.search.beads.calibrate_beads`. A likelihood score (the evidence) needs the noise and the
-        object prior in the units of the data after :meth:`prepare`; a default part or z padding biases it and is
+        swept weight held at its start, as wo-4.0 calibrated before it swept. With :attr:`calibration_edge_steepness`
+        the stages before the sweep (all, without one) and a bead fit see the detection's sigmoid edge at that
+        steepness, and the sweep at the detection's own. A :class:`~waveorder.nn.priors.Beads` object prior is fitted
+        by :func:`~waveorder.nn.search.beads.calibrate_beads`. A likelihood score (the evidence) needs the noise and
+        the object prior in the units of the data after :meth:`prepare`; a default part or z padding biases it and is
         warned about (``CalibrationWarning``).
 
         Parameters
@@ -770,8 +817,8 @@ class ReconstructionModel:
         prepared : bool
             The data is already what the system measures, so :meth:`prepare` is skipped.
         history : bool
-            Also return the objective at each gradient step, the last grid over the free quantities, and a weight
-            sweep's result with its crop. A bead calibration always returns its trace.
+            Also return the objective and point at each gradient or Nelder-Mead evaluation, the last grid over the
+            free quantities, and a weight sweep's result with its crop. A bead calibration always returns its trace.
         callback : callable, optional
             Called as ``callback(index, stage, best)`` as each stage ends, as :func:`~waveorder.nn.calibrate` calls
             it; the stages before a weight sweep count first. A bead calibration has no stages and never calls it.
@@ -802,7 +849,8 @@ class ReconstructionModel:
             measured = self._measured(recorded, padding, prepared=prepared)
             padded = padding.sampling(sampling)
             self._start_from(measured)
-            return calibrate_beads(measured, self.imaging_model, padded, iterations=iterations, learning_rate=rate)
+            with self._calibration_edge():
+                return calibrate_beads(measured, self.imaging_model, padded, iterations=iterations, learning_rate=rate)
         self._expect_whole_field(where)
         score = calibration_score(self, where=where)
         padding = self._padding_for(sampling)
@@ -818,22 +866,24 @@ class ReconstructionModel:
             *,
             hold: Iterable[str] = (),
             counted: int = 0,
+            soft: bool = True,
         ) -> CalibrationResult:
             measured = self._measured(frame, padding, prepared=prepared)
-            bind(self, grid)
-            self._start_from(measured)
-            over = prior.to_prior(free_specs(self.imaging_model)) if isinstance(prior, TfStore) else prior
-            return calibrate(
-                measured,
-                self.imaging_model,
-                grid,
-                score=score,
-                search=stages,
-                prior=over,
-                hold=hold,
-                history=history,
-                callback=_shifted(callback, counted),
-            )
+            with self._calibration_edge() if soft else nullcontext():
+                bind(self, grid)
+                self._start_from(measured)
+                over = prior.to_prior(free_specs(self.imaging_model)) if isinstance(prior, TfStore) else prior
+                return calibrate(
+                    measured,
+                    self.imaging_model,
+                    grid,
+                    score=score,
+                    search=stages,
+                    prior=over,
+                    hold=hold,
+                    history=history,
+                    callback=_shifted(callback, counted),
+                )
 
         if first:  # the stages before the sweep calibrate on the whole frame, the swept weight held (wo-4.0)
             assert search is not None
@@ -849,12 +899,18 @@ class ReconstructionModel:
                     dataclasses.replace(stage, z_padding=padding.slices) if isinstance(stage, WeightSweep) else stage
                     for stage in search or ()
                 )
-        result = run(recorded, padded, search, counted=0 if before is None else len(before.trace))
+        # A weight sweep reconstructs at the detection's own edge, as wo-4.0's auto-regularization after its optimizer.
+        counted = 0 if before is None else len(before.trace)
+        result = run(recorded, padded, search, counted=counted, soft=first is None)
         if result.sweep is not None:
             result = dataclasses.replace(result, sweep=dataclasses.replace(result.sweep, region=region))
         if before is not None:
             result = dataclasses.replace(
-                result, trace=before.trace + result.trace, steps=before.steps + result.steps, grid=before.grid
+                result,
+                trace=before.trace + result.trace,
+                steps=before.steps + result.steps,
+                step_points=before.step_points + result.step_points,
+                grid=before.grid,
             )
         return result
 
@@ -1060,19 +1116,20 @@ class ReconstructionModel:
         # The model and the grid of a tile are judged before a tile is read or a transfer function computed.
         self.imaging_model.check(score, Sampling(shape=plan.read_shape, pixel_size=pixel_size))
         stack, sampling = stack_tiles(source, plan, pixel_size=pixel_size, device=self.device, dtype=self.dtype)
-        bind(self, sampling)
         if prior is not None and not isinstance(prior, ParameterPrior):
             prior = prior.to_prior(free_specs(self.imaging_model))
-        return calibrate_tile_stack(
-            stack,
-            self.imaging_model,
-            sampling,
-            score=score,
-            search=self.search,
-            start=start,
-            chunk_size=chunk_size,
-            prior=prior,
-        )
+        with self._calibration_edge():
+            bind(self, sampling)
+            return calibrate_tile_stack(
+                stack,
+                self.imaging_model,
+                sampling,
+                score=score,
+                search=self.search,
+                start=start,
+                chunk_size=chunk_size,
+                prior=prior,
+            )
 
     def reconstruct_tiles(
         self,

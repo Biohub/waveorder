@@ -323,6 +323,9 @@ class DetectionSettings(V4BaseModel):
     pupil_aberrations: PupilAberrations | None = None
     z_focus_offset: CalibratableFloat = Field(default=0.0, description="focal plane offset in slices")
     edge: Literal["ramp", "sigmoid"] = Field(default="ramp", description="pupil edge; sigmoid is the 3.x pupil")
+    edge_steepness: PositiveFiniteFloat = Field(
+        default=1e4, description="slope of the sigmoid edge in um (3.x pupil_steepness); the ramp edge has none"
+    )
 
 
 class Tilt(V4BaseModel):
@@ -590,6 +593,21 @@ class RichardsonLucyReconstruction(LoopOptions):
     )
 
 
+class ClosedFormReconstruction(V4BaseModel):
+    """The closed-form (Wiener) estimate."""
+
+    coupling: Literal["joint", "per_field"] = Field(
+        default="joint",
+        description="joint: every object field at once; per_field: each as if imaged alone (3.x per_channel)",
+    )
+
+
+class ReconstructionClosedForm(V4BaseModel):
+    """``reconstruction: {closed_form: ...}``; the bare ``closed_form`` is the joint estimate."""
+
+    closed_form: ClosedFormReconstruction
+
+
 class ReconstructionFista(V4BaseModel):
     """``reconstruction: {fista: ...}``."""
 
@@ -609,14 +627,15 @@ class ReconstructionRichardsonLucy(V4BaseModel):
 
 
 _RECONSTRUCTION = _Option(
+    "closed_form",
     "fista",
     "admm",
     "richardson_lucy",
-    bare_names=("closed_form",),
     parameterized=("fista", "admm", "richardson_lucy"),
 )
 type Reconstruction = Annotated[
     Annotated[Literal["closed_form"], Tag("name")]
+    | Annotated[ReconstructionClosedForm, Tag("closed_form")]
     | Annotated[ReconstructionFista, Tag("fista")]
     | Annotated[ReconstructionAdmm, Tag("admm")]
     | Annotated[ReconstructionRichardsonLucy, Tag("richardson_lucy")],
@@ -647,6 +666,11 @@ class GradientStage(V4BaseModel):
         default="split", description="wo-4.0's; only split runs, and the others have no effect"
     )
     optimizer: Literal["adam", "nadam", "adamw", "sgd"] = "adam"
+    tolerance: FiniteFloat | None = Field(
+        default=None,
+        description="stop once patience steps in a row do not lower the objective by it (wo-4.0's convergence_tol)",
+    )
+    patience: Count = Field(default=5, description="those steps (wo-4.0's convergence_patience)")
 
 
 class LBFGSStage(V4BaseModel):
@@ -654,6 +678,12 @@ class LBFGSStage(V4BaseModel):
 
     iterations: Count = 20
     history: Count = 10
+    tolerance: FiniteFloat | None = Field(
+        default=None,
+        description="stop once patience iterations in a row do not lower the objective by it (wo-4.0's "
+        "convergence_tol)",
+    )
+    patience: Count = Field(default=5, description="those iterations (wo-4.0's convergence_patience)")
 
 
 class NelderMeadStage(V4BaseModel):
@@ -716,16 +746,20 @@ class CalibrationAdvanced(V4BaseModel):
     learning_rates: dict[str, PositiveFiniteFloat] = Field(
         default_factory=dict, description="gradient step size per quantity path under imaging_system"
     )
-    convergence_tol: FiniteFloat | None = Field(default=None, description="3.x nelder_mead tolerance")
+    convergence_tol: FiniteFloat | None = Field(
+        default=None, description="3.x early stop: nelder_mead's tolerance; adam, nadam, lbfgs stop with patience"
+    )
     convergence_patience: Count | None = Field(
-        default=None, description="wo-4.0's early-stop patience; accepted and not executed"
+        default=None, description="steps without an improvement of convergence_tol before adam, nadam, lbfgs stop; 5"
     )
     use_gradients: bool | None = Field(
-        default=None, description="wo-4.0's; false under a gradient optimizer keeps the free values at nominal"
+        default=None, description="wo-4.0's; false under adam, nadam, lbfgs keeps the free values at nominal"
     )
     grid_points: Count | None = Field(default=None, description="3.x grid_search points")
     loss: dict[str, Any] | None = Field(default=None, description="3.x sharpness loss: type and parameters")
-    log_dir: str | None = Field(default=None, description="wo-4.0's TensorBoard folder; accepted and not written")
+    log_dir: str | None = Field(
+        default=None, description="TensorBoard log of a one-stage sharpness calibration; needs waveorder[tensorboard]"
+    )
 
 
 def _default_search() -> list[SearchStageSettings]:
@@ -741,6 +775,15 @@ class Calibration(V4BaseModel):
         default="best_H", description="wo-4.0's; only best_H runs, and average_near_best_H has no effect"
     )
     advanced: CalibrationAdvanced | None = None
+    reconstruction: Reconstruction | None = Field(
+        default=None,
+        description="the reconstruction score sharpness judges; null: solver.reconstruction's",
+    )
+    edge_steepness: PositiveFiniteFloat | None = Field(
+        default=None,
+        description="slope in um of the sigmoid detection edge while fitting (wo-4.0's wo rec fitted phase at 100); "
+        "null: imaging_system.detection.edge_steepness",
+    )
 
     @property
     def optimizer_drives(self) -> bool:
@@ -899,6 +942,42 @@ GRADIENT_OPTIMIZERS = ("adam", "nadam", "lbfgs")
 """The 3.x optimizers that step along the gradient, and read ``use_gradients`` and the early stop."""
 
 
+def stops_early(config: V4Config) -> bool:
+    """Whether ``advanced.convergence_tol`` stops the 3.x optimizer's gradient stage, with ``convergence_patience``.
+
+    As wo-4.0's ``optimize_reconstruction``: adam, nadam and lbfgs stop once ``convergence_patience`` (5 by default)
+    steps in a row do not lower the loss by ``convergence_tol``; nelder_mead reads the tolerance as its own, and
+    grid_search neither.
+    """
+    calibration = config.solver.calibration
+    if calibration is None or not calibration.optimizer_drives:
+        return False
+    advanced = calibration.advanced
+    assert advanced is not None
+    return advanced.optimizer in GRADIENT_OPTIMIZERS and advanced.convergence_tol is not None
+
+
+def calibration_log_dir(config: V4Config) -> str | None:
+    """Return the folder a calibration of ``config`` writes its TensorBoard log to, or ``None`` for none.
+
+    ``advanced.log_dir`` is read where wo-4.0's ``wo rec`` optimizer read it: a sharpness calibration of one search
+    stage (``advanced.optimizer``, or the one gradient, lbfgs, nelder_mead or grid stage ``wo config migrate`` writes
+    for it) of a shift-invariant system, without a bead prior, that runs (not :func:`frozen`).
+    """
+    calibration = config.solver.calibration
+    advanced = None if calibration is None else calibration.advanced
+    if calibration is None or advanced is None or advanced.log_dir is None or frozen(config):
+        return None
+    one = len(calibration.search) == 1 and not isinstance(calibration.search[0], SearchRandom)
+    if calibration.score != "sharpness" or not (calibration.optimizer_drives or one):
+        return None
+    if isinstance(config.imaging_system.field_dependence, FieldDependenceTiled):
+        return None
+    if isinstance(config.object.prior, PriorBeads) or not free_parameter_specs(config.imaging_system):
+        return None
+    return advanced.log_dir
+
+
 def wo_rec_optimizer(config: V4Config) -> str | None:
     """Return the 3.x optimizer wo-4.0's ``wo rec`` ran for ``config``'s calibration, or ``None``.
 
@@ -951,11 +1030,9 @@ def _check_advanced(config: V4Config) -> None:
             stacklevel=3,
         )
     patience = advanced.convergence_patience
-    if patience is not None:
-        stops = stepped and advanced.convergence_tol is not None
-        reason = f"wo-4.0's {method} stopped after this many steps without an improvement of convergence_tol"
-        stated = f"{reason}; this version runs every step; remove it"
-        no_effect(f"{at}.convergence_patience", patience, stated if stops else unread)
+    if patience is not None and not stops_early(config):
+        alone = f"wo-4.0's {method} read it only beside convergence_tol under adam, nadam or lbfgs; remove it"
+        no_effect(f"{at}.convergence_patience", patience, unread if method is None else alone)
     gradients = advanced.use_gradients
     if gradients is False and stepped:
         warnings.warn(
@@ -966,12 +1043,15 @@ def _check_advanced(config: V4Config) -> None:
             ),
             stacklevel=3,
         )
-    elif gradients is not None:
-        what = f"{method} takes {'gradient steps' if stepped else 'no gradient'} either way, in wo-4.0 too; remove it"
-        no_effect(f"{at}.use_gradients", gradients, unread if method is None else what)
-    if advanced.log_dir is not None:
-        wrote = "wo-4.0 wrote TensorBoard logs there, and this version writes none; remove it"
-        no_effect(f"{at}.log_dir", advanced.log_dir, unread if method is None else wrote)
+    elif gradients is not None and method is None:  # under wo rec's optimizer it resolves as wo-4.0 resolved it
+        no_effect(f"{at}.use_gradients", gradients, unread)
+    if advanced.log_dir is not None and calibration_log_dir(config) is None:
+        idle = "the calibration does not run, so there is nothing to log; remove it"
+        written = (
+            "a TensorBoard log is written only for a sharpness calibration of one search stage on a shift-invariant "
+            "system, where wo-4.0's wo rec optimizer wrote it; remove it"
+        )
+        no_effect(f"{at}.log_dir", advanced.log_dir, idle if frozen(config) else written)
 
 
 def _warn_unexecuted(config: V4Config) -> None:

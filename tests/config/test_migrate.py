@@ -11,6 +11,9 @@ from waveorder.config.migrate import _BLOCK_KEYS, TABLE, migrate, render, table_
 from waveorder.config.schema import FreeParameter, ReconstructionRichardsonLucy
 from waveorder.errors import ConfigurationWarning
 from waveorder.models import ReconstructionModel
+from waveorder.nn import GradientSearch, Wiener
+from waveorder.nn.scores import SharpnessScore
+from waveorder.nn.search import LBFGSSearch
 
 PREVIEW = """\
 version: 4
@@ -321,6 +324,7 @@ def test_learning_rate_frees_a_value():
         "score": "sharpness",
         "search": [{"gradient": {"max_iter": 10, "optimizer": "adam"}}],
         "advanced": {"learning_rates": {"illumination.numerical_aperture": 0.02}},
+        "edge_steepness": 100.0,
     }
     assert any("_optimized.yml" in note for note in result.notes)
     load(config)
@@ -436,6 +440,46 @@ def test_preview_free_tilt_gets_bounds():
     ReconstructionModel.from_config(load(config))
 
 
+def _estimators(result) -> tuple[str, str]:
+    """Build the migrated model; return the coupling of the Wiener its score reconstructs with, and of its own."""
+    config = copy.deepcopy(result.config)
+    config["solver"]["device"] = None
+    model = ReconstructionModel.from_config(load(config))
+    assert isinstance(model.score, SharpnessScore)
+    assert isinstance(model.score.solver, Wiener)
+    assert isinstance(model.solver, Wiener)
+    return model.score.solver.coupling, model.solver.coupling
+
+
+@pytest.mark.parametrize(
+    ("method", "scored"),
+    [("adam", "per_field"), ("nadam", "per_field"), ("lbfgs", "per_field"), ("nelder_mead", "joint")],
+)
+def test_a_3x_gradient_fit_of_2d_phase_scores_per_field_and_reconstructs_jointly(method, scored):
+    """3.x inverted per channel where the transfer carried gradients and jointly (svd) for the final reconstruction."""
+    raw: dict = free_tilt(lr=0.01, max_iterations=5, method=method) | {"reconstruction_dimension": 2}
+    raw["phase"]["transfer_function"]["z_focus_offset"] = {"init": 0.0, "lr": 0.05}
+    assert _estimators(converted(raw)) == (scored, "joint")
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "scored"),
+    [("adam", "per_field"), ("lbfgs", "per_field"), (None, "per_field"), ("grid_search", "joint")],
+    ids=["adam", "lbfgs", "wo-rec-default-adam", "grid_search"],
+)
+def test_a_wo40_gradient_fit_of_2d_phase_scores_per_field_and_reconstructs_jointly(optimizer, scored):
+    raw = preview()
+    raw["object"]["dimension"] = 2
+    advanced = raw["solver"]["calibration"]["advanced"]
+    if optimizer is None:
+        del advanced["optimizer"]
+    else:
+        advanced["optimizer"] = optimizer
+    result = converted(raw)
+    assert _estimators(result) == (scored, "joint")
+    assert ("reconstruction" in result.config["solver"]["calibration"]) == (scored == "per_field")
+
+
 OFFSET_NOTE = "imaging_system.detection.z_focus_offset: -1 written as 0: 3.x and wo-4.0 ignore the offset of a 3D"
 
 
@@ -492,23 +536,64 @@ def test_loss_is_carried():
     load(config)
 
 
-def test_settings_at_their_3x_default_are_dropped_with_a_note():
-    result = converted(free_phase(convergence_patience=5, grid_points=7, use_gradients=True))
-    assert any(
-        note.startswith("optimization.convergence_patience dropped: 3.x stopped after 5") for note in result.notes
+def test_settings_that_did_nothing_in_3x_are_dropped_with_a_note():
+    result = converted(free_phase(convergence_patience=3, grid_points=7, use_gradients=True))
+    assert (
+        "optimization.convergence_patience dropped: 3.x read it only beside convergence_tol under adam, nadam or lbfgs"
+        in result.notes
     )
     assert "optimization.grid_points dropped: read only by grid_search" in result.notes
-    assert "optimization.use_gradients dropped: it matches what adam does" in result.notes
+    assert "optimization.use_gradients dropped: adam steps along the gradient either way, as in 3.x" in result.notes
+    result = converted(free_phase(method="nelder_mead", use_gradients=True, convergence_patience=2))
+    assert "optimization.use_gradients dropped: nelder_mead ignores it, as in 3.x" in result.notes
+    assert any(note.startswith("optimization.convergence_patience dropped") for note in result.notes)
+
+
+@pytest.mark.parametrize(
+    ("optimization", "stage"),
+    [
+        (
+            {"max_iterations": 50, "convergence_tol": 1e-4, "convergence_patience": 3},
+            {"gradient": {"max_iter": 50, "optimizer": "adam", "tolerance": 1e-4, "patience": 3}},
+        ),
+        (
+            {"method": "lbfgs", "convergence_tol": 1e-4},
+            {"lbfgs": {"iterations": 10, "tolerance": 1e-4, "patience": 5}},
+        ),
+    ],
+    ids=["adam", "lbfgs_default_patience"],
+)
+def test_a_gradient_optimizers_early_stop_becomes_the_stages(optimization, stage):
+    result = converted(free_phase(**optimization))
+    assert result.config["solver"]["calibration"]["search"] == [stage]
+    assert not any("convergence" in note for note in result.notes)
+
+
+def test_use_gradients_false_under_a_gradient_optimizer_writes_the_init_and_no_calibration():
+    # 3.x took no step: the value stays at its init, and there is nothing to log either.
+    result = converted(free_phase(use_gradients=False, log_dir="runs"))
+    config = result.config
+    assert config["imaging_system"]["illumination"]["numerical_aperture"] == 0.8
+    assert "calibration" not in config["solver"]
+    assert any(note.startswith("optimization.use_gradients: false: 3.x's adam took no step") for note in result.notes)
+
+
+def test_log_dir_is_carried():
+    for raw in (free_phase(log_dir="runs/x"), preview()):
+        if "version" in raw:
+            raw["solver"]["calibration"]["advanced"]["log_dir"] = "runs/x"
+        result = migrate(raw)  # building the model needs tensorboard
+        assert result.rejections == ()
+        assert result.config is not None
+        assert result.config["solver"]["calibration"]["advanced"]["log_dir"] == "runs/x"
+        assert not any("log_dir" in note for note in result.notes)
 
 
 @pytest.mark.parametrize(
     ("optimization", "key"),
     [
-        ({"convergence_patience": 3}, "optimization.convergence_patience"),
-        ({"convergence_tol": 1e-3}, "optimization.convergence_tol"),
+        ({"method": "grid_search", "convergence_tol": 1e-3}, "optimization.convergence_tol"),
         ({"grid_points": 9}, "optimization.grid_points"),
-        ({"use_gradients": False}, "optimization.use_gradients"),
-        ({"log_dir": "logs"}, "optimization.log_dir"),
         ({"method": "sgd"}, "optimization.method"),
         ({"patience": 3}, "optimization.patience"),
     ],
@@ -621,7 +706,7 @@ TWO_STAGES = [{"grid": {"points": 3}}, {"gradient": {"max_iter": 4}}]
 @pytest.mark.parametrize(
     ("score", "advanced", "search", "key"),
     [
-        ("sharpness", {"log_dir": "logs"}, None, "solver.calibration.advanced.log_dir"),
+        ("evidence", {"log_dir": "logs"}, None, "solver.calibration.advanced.log_dir"),
         ("sharpness", {"use_gradients": False}, None, "solver.calibration.advanced.use_gradients"),
         ("evidence", {}, TWO_STAGES, "solver.calibration.advanced.optimizer"),
         ("sharpness", {"optimizer": "nadam"}, TWO_STAGES, "solver.calibration.search"),
@@ -640,6 +725,19 @@ def test_a_592_setting_check_warns_of_is_migrated_with_a_note_into_the_search_ch
     loaded, migrated, notes = _loaded_and_migrated(raw)
     assert any(note.startswith((f"{key}: ", f"{key} dropped")) for note in notes), notes
     assert migrated == loaded
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "lbfgs"])
+def test_a_592_early_stop_is_migrated_into_the_stage_check_runs(optimizer):
+    raw = preview()
+    raw["solver"]["calibration"]["advanced"] |= {"optimizer": optimizer, "convergence_tol": 1e-3}
+    loaded, migrated, notes = _loaded_and_migrated(raw)
+    assert migrated == loaded
+    assert isinstance(migrated, tuple)
+    (stage,) = migrated
+    assert isinstance(stage, GradientSearch | LBFGSSearch)
+    assert (stage.tolerance, stage.patience) == (1e-3, 5)
+    assert not any("convergence" in note for note in notes)
 
 
 def test_a_592_grid_search_spans_wo_40s_grid_and_a_calibration_without_an_optimizer_takes_its_10_steps():

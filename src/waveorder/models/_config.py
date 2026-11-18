@@ -234,6 +234,7 @@ def describe(model: ReconstructionModel) -> dict[str, Any]:
         else {"size_yx": list(tiles.size_yx), "overlap_yx": list(tiles.overlap_yx), "blend": tiles.blend},
         "pixel_size": None if model.pixel_size is None else list(model.pixel_size),
         "apodization_rolloff": model.apodization_rolloff,
+        "calibration_edge_steepness": model.calibration_edge_steepness,
     }
     return {"schema": SCHEMA, "class": type(model).__name__, "parts": parts, "settings": settings}
 
@@ -319,6 +320,7 @@ def load[M: ReconstructionModel](cls: type[M], source: str | Path | Mapping[str,
         field_tiles=None if tiles is None else FieldTiles(**tiles),
         pixel_size=settings.get("pixel_size"),
         apodization_rolloff=settings.get("apodization_rolloff", 0.0),
+        calibration_edge_steepness=settings.get("calibration_edge_steepness"),
     )
     model.tile_parameters = table
     return model

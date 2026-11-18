@@ -8,12 +8,12 @@ Spectra are orthonormal ``rfftn`` half spectra stored real.
 
 import math
 from dataclasses import dataclass
-from typing import Self, override
+from typing import Literal, Self, override
 
 import torch
 from torch import Tensor
 
-from waveorder.errors import IncompatibleModelError
+from waveorder.errors import IncompatibleModelError, ParameterError
 from waveorder.nn.functional import (
     HermitianFactor,
     abs2,
@@ -25,16 +25,21 @@ from waveorder.nn.functional import (
     from_half_spectrum,
     gram,
     half_spectrum_weights,
+    is_complex_matrix,
     matrix_vector,
     to_half_spectrum,
 )
 from waveorder.nn.model import ImagingModel
 from waveorder.nn.operators import FourierDiagonal, LinearOperator, ReshapedFourierDiagonal
+from waveorder.nn.parameters import repr_parts
 from waveorder.nn.priors import GaussianObjectPrior
 from waveorder.nn.sampling import ZYX, Data, Object
 from waveorder.nn.solvers.base import Solver, SolveResult
 from waveorder.nn.verbs import InverseProblem
 from waveorder.registry import register
+
+type Coupling = Literal["joint", "per_field"]
+"""How :class:`Wiener` solves for several object fields: jointly, or each as if it were the only one."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +178,18 @@ class LinearGaussian:
     def _precision(self) -> Tensor:
         return add_diagonal(gram(self.transfer) / self.noise_variance, 1 / self.spectrum)
 
+    def per_field_mean(self, data: Data) -> Object:
+        """Return each field's posterior mean as if the system imaged that field alone, shape ``(F, Z, Y, X)``.
+
+        Per frequency ``f_hat_f = (H_f^H g / s) / (||H_f||^2 / s + 1 / S_f)``: the precision without its
+        cross-field terms, so the fields' coupling in the data is ignored (3.x ``use_svd=False``). Equal to the
+        :meth:`posterior` mean where the fields' transfer columns are orthogonal.
+        """
+        information = matrix_vector(self.transfer, self._coefficients(data), adjoint=True) / self.noise_variance
+        power = abs2(self.transfer) if is_complex_matrix(self.transfer) else self.transfer.square()
+        precision = power.sum(dim=0) / self.noise_variance + 1 / self.spectrum  # (F, Z, Y, X')
+        return from_half_spectrum(information / precision[..., None], self.shape, norm="ortho")
+
     def neg_log_evidence(self, data: Data) -> Tensor:
         """Return ``-log p(data | H) = sum_k G_k^H V_k^-1 G_k / 2 + log det(2 pi V_k) / 2`` without the zero frequency.
 
@@ -218,7 +235,32 @@ class Wiener(Solver):
 
     Per frequency, ``f_hat = A^-1 H^H g / sigma^2`` with ``A = S^-1 + H^H H / sigma^2``. For one field and channel
     with :class:`~waveorder.nn.priors.Tikhonov` this is the Tikhonov inverse filter ``conj(H) / (|H|^2 + weight)``.
+
+    Parameters
+    ----------
+    coupling : {"joint", "per_field"}
+        ``"joint"`` solves for every field at once. ``"per_field"`` estimates each field as if the system imaged
+        it alone (:meth:`LinearGaussian.per_field_mean`), which for :class:`~waveorder.nn.ThinPhase2D` with
+        :class:`~waveorder.nn.priors.Tikhonov` is ``conj(H_f) . g / (||H_f||^2 + weight)`` over the planes: 3.x's
+        ``decomposition="per_channel"``, which its gradient fits of 2D phase scored with. The two agree for one
+        field.
+
+    Raises
+    ------
+    ParameterError
+        If ``coupling`` is neither (path ``coupling``).
     """
+
+    def __init__(self, *, coupling: Coupling = "joint") -> None:
+        super().__init__()
+        if coupling not in ("joint", "per_field"):
+            raise ParameterError(f"Wiener coupling must be 'joint' or 'per_field', got {coupling!r}", path="coupling")
+        self.coupling = coupling
+
+    @override
+    def extra_repr(self) -> str:
+        """Return the coupling when it is ``per_field``, then the quantities."""
+        return repr_parts("coupling='per_field'" if self.coupling == "per_field" else "", super().extra_repr())
 
     @override
     def check(self, model: ImagingModel) -> None:
@@ -227,5 +269,9 @@ class Wiener(Solver):
 
     @override
     def run(self, problem: InverseProblem) -> SolveResult:
-        estimate = LinearGaussian.of(problem.model, problem.operator).posterior(problem.data).mean()
+        system = LinearGaussian.of(problem.model, problem.operator)
+        if self.coupling == "per_field":
+            estimate = system.per_field_mean(problem.data)
+        else:
+            estimate = system.posterior(problem.data).mean()
         return SolveResult(estimate, problem.objective(estimate), 0, "direct")

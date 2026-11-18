@@ -21,6 +21,7 @@ from waveorder.models._arguments import shown_shape, zyx
 from waveorder.models._base import ReconstructionModel
 from waveorder.models._parts import FieldTiles
 from waveorder.nn import Free, ParameterPrior, Sampling, ThinFluorescence2D, ThinPhase2D, ZPadding, free_specs
+from waveorder.nn.optics import SIGMOID_EDGE_STEEPNESS
 from waveorder.nn.parameters import shortest_decimal
 from waveorder.nn.systems.base import ShiftInvariantSystem
 from waveorder.tiling import TilePlan
@@ -82,17 +83,20 @@ def read_store(source: StoreSource, argument: str) -> TfStore:
 def _system_block(model: ReconstructionModel) -> dict[str, object] | None:
     """Return the registry's description of the system (free quantities as ``free``) and its tiles, or ``None``.
 
-    ``cache`` is left out (it says how transfers are kept, not what they are), as is a ``pupil_aberrations`` of
-    ``None``, so stores written before that argument keep their hash. ``None`` for a system with no plain-data form.
+    ``cache`` is left out (it says how transfers are kept, not what they are), as are a ``pupil_aberrations`` of
+    ``None`` and an ``edge_steepness`` at its default, so stores written before those arguments keep their hash.
+    ``None`` for a system with no plain-data form.
     """
     from waveorder import registry
+
+    defaults = {"pupil_aberrations": None, "edge_steepness": SIGMOID_EDGE_STEEPNESS}
 
     def shown(node: object) -> object:
         if isinstance(node, dict):
             if set(node) == {"free"}:  # the registry's spec of a Free
                 return _FREE
             return {
-                key: shown(value) for key, value in node.items() if not (key == "pupil_aberrations" and value is None)
+                key: shown(value) for key, value in node.items() if not (key in defaults and value == defaults[key])
             }
         if isinstance(node, list):
             return [shown(value) for value in node]

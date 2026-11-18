@@ -7,6 +7,7 @@ class to choose. A constructor's own :class:`~waveorder.errors.ParameterError` i
 together is for the parts to say when the model is built.
 """
 
+import importlib.util
 import warnings
 from collections.abc import Mapping
 from typing import Any
@@ -25,7 +26,9 @@ from waveorder.config.schema import (
     Pinhole,
     PriorBeads,
     PriorDenoiser,
+    Reconstruction,
     ReconstructionAdmm,
+    ReconstructionClosedForm,
     ReconstructionFista,
     ReconstructionRichardsonLucy,
     SearchGradient,
@@ -35,12 +38,12 @@ from waveorder.config.schema import (
     SearchRandom,
     V4Config,
     WeightAuto,
+    calibration_log_dir,
     free_parameter_specs,
     frozen,
     no_effect,
     nominal_of,
     parameter_name,
-    wo_rec_optimizer,
 )
 from waveorder.errors import (
     ConfigurationError,
@@ -83,7 +86,8 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
     """Return the imaging system of ``config`` and the other keyword arguments of its model.
 
     The arguments are ``object_prior``, ``noise`` and ``solver`` (``None`` when the configuration does not write
-    them), ``score`` and ``search`` (``None`` unless ``solver.calibration`` is set and a quantity is free),
+    them), ``score``, ``search`` and ``calibration_edge_steepness`` (``None`` unless ``solver.calibration`` is set
+    and a quantity is free; the last also unless it writes ``edge_steepness``),
     ``z_padding``, ``field_tiles`` (``None``, or the ``size_yx``, ``overlap_yx`` and ``blend`` of tiled field
     dependence) and ``device``. A value wo-4.0 accepted that no part reads is warned of at its path
     (:class:`~waveorder.errors.ConfigurationWarning`), and an omitted wavelength or condenser aperture is the one
@@ -104,7 +108,8 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
     object_written = {"prior", "weight", "constraints"} & config.object.model_fields_set
     prior = _prior(config) if object_written else None
     noise = _noise(config) if "noise" in written else None
-    solver = _solver(config) if _builds_reconstruction(config) else None
+    reconstruction = config.solver.reconstruction
+    solver = _solver(reconstruction, at="solver.reconstruction") if _builds_reconstruction(config) else None
     parts = {"system": system, "object_prior": prior, "noise": noise}
     weight = config.object.weight
     swept = _AUTO_NAME if isinstance(weight, WeightAuto) else None  # the sweep sets it, after any calibration
@@ -150,6 +155,7 @@ def build(config: V4Config) -> tuple[ImagingSystem, dict[str, Any]]:
         # A bead calibration scores by the bead fit's own likelihood (calibrate_beads), not by solver.calibration.score.
         "score": _score(config) if calibrated and not isinstance(config.object.prior, PriorBeads) else None,
         "search": search,
+        "calibration_edge_steepness": _calibration_steepness(config) if calibrated else None,
         "z_padding": 0 if thin else config.solver.padding.z,
         "field_tiles": None
         if tiles is None
@@ -244,6 +250,7 @@ def _detection(settings: DetectionSettings, wavelength: float | None) -> object:
         "numerical_aperture": _quantity(settings.numerical_aperture, at=f"{at}.numerical_aperture"),
         "z_focus_offset": _quantity(settings.z_focus_offset, at=f"{at}.z_focus_offset"),
         "edge": settings.edge,
+        "edge_steepness": settings.edge_steepness,
     }
     aberrations = settings.pupil_aberrations
     if aberrations is not None:
@@ -259,6 +266,19 @@ def _detection(settings: DetectionSettings, wavelength: float | None) -> object:
         if terms:
             arguments["pupil_aberrations"] = _resolve("pupil_factor", "zernike", {"terms": terms}, at=field)
     return _resolve("detection", "detection", arguments, at=at)
+
+
+def _calibration_steepness(config: V4Config) -> float | None:
+    """Return ``solver.calibration.edge_steepness``, which only a sigmoid detection edge has."""
+    calibration = config.solver.calibration
+    steepness = None if calibration is None else calibration.edge_steepness
+    if steepness is not None and config.imaging_system.detection.edge != "sigmoid":
+        raise ConfigurationError(
+            "solver.calibration.edge_steepness",
+            "is the slope of the sigmoid detection edge, and imaging_system.detection.edge is ramp; write edge: "
+            "sigmoid, or remove it",
+        )
+    return steepness
 
 
 def _pinhole(settings: DetectionSettings, wavelength: float) -> object:
@@ -455,8 +475,8 @@ def _builds_reconstruction(config: V4Config) -> bool:
 # --- the solver, the score and the search ----------------------------------------------------------------------------
 
 
-def _solver(config: V4Config) -> Solver:
-    reconstruction, at = config.solver.reconstruction, "solver.reconstruction"
+def _solver(reconstruction: Reconstruction, *, at: str) -> Solver:
+    """Build the solver ``reconstruction`` names, written at ``at``."""
     loop = ("iterations", "tolerance", "check_every")
     if isinstance(reconstruction, ReconstructionFista):
         options = reconstruction.fista
@@ -470,6 +490,9 @@ def _solver(config: V4Config) -> Solver:
         names = (*loop, "background", "back_projector", "bp_alpha", "bp_beta", "gradient_consensus", "start")
         arguments = {name: getattr(options, name) for name in names}
         return _resolve("solver", "richardson_lucy", arguments, at=f"{at}.richardson_lucy")
+    if isinstance(reconstruction, ReconstructionClosedForm):
+        coupling = reconstruction.closed_form.coupling
+        return _resolve("solver", "wiener", {"coupling": coupling}, at=f"{at}.closed_form")
     return _resolve("solver", "wiener", {}, at=at)
 
 
@@ -482,6 +505,11 @@ def _score(config: V4Config) -> Score:
     if calibration.score != "sharpness":
         if loss is not None:
             no_effect(loss_at, loss, f"it is a sharpness setting, and score is {calibration.score}; remove it")
+        if calibration.reconstruction is not None:
+            raise ConfigurationError(
+                "solver.calibration.reconstruction",
+                f"is the reconstruction score sharpness judges; score {calibration.score} judges none, so remove it",
+            )
         return _resolve("score", calibration.score, {}, at=at)
     settings = dict(loss or {"type": "midband_power"})
     kind = settings.pop("type", "midband_power")
@@ -490,6 +518,8 @@ def _score(config: V4Config) -> Score:
             f"{loss_at}.type", f"{kind!r} is not a 3.x sharpness loss; use one of {list(_SHARPNESS)}"
         )
     arguments: dict[str, object] = {"fields": ("phase",) if config.imaging_system.contrast == "phase" else None}
+    if calibration.reconstruction is not None:
+        arguments["solver"] = _solver(calibration.reconstruction, at="solver.calibration.reconstruction")
     if kind in ("midband_power", "spectral_flatness"):
         arguments["fractions"] = tuple(settings.pop("midband_fractions", (0.125, 0.25)))
     if settings:
@@ -535,17 +565,33 @@ def _optimizer_stage(advanced: CalibrationAdvanced, rates: object, *, iterations
     """Return the one stage a 3.x ``advanced.optimizer`` names, with the 3.x settings it reads.
 
     ``iterations`` is the 3.x ``max_iterations`` (``None``: the stage's default), which ``grid_search`` ignores.
+    ``use_gradients`` resolves as in wo-4.0: adam, nadam and lbfgs step along the gradient unless it is false (then
+    :func:`build` holds the free values at nominal and runs no stage), and nelder_mead and grid_search ignore it.
+    With ``convergence_tol`` adam, nadam and lbfgs stop after ``convergence_patience`` (5 by default) steps without
+    that improvement, as wo-4.0's ``optimize_reconstruction``.
     """
     at = "solver.calibration.advanced"
     optimizer = advanced.optimizer
     budget = {} if iterations is None else {"iterations": iterations}
     steps = {"iterations": "solver.calibration.search.0.gradient.max_iter"}
+    stop = {}
+    if optimizer in GRADIENT_OPTIMIZERS and advanced.convergence_tol is not None:
+        patience = advanced.convergence_patience
+        stop = {"tolerance": advanced.convergence_tol, "patience": 5 if patience is None else patience}
+    stopping = {"tolerance": f"{at}.convergence_tol", "patience": f"{at}.convergence_patience"}
     if optimizer in ("adam", "nadam"):
-        arguments = {"learning_rates": rates, "optimizer": optimizer, "learning_rate": _STEP, "last": True, **budget}
-        keys = {"learning_rates": f"{at}.learning_rates", **steps}
+        arguments = {
+            "learning_rates": rates,
+            "optimizer": optimizer,
+            "learning_rate": _STEP,
+            "last": True,
+            **budget,
+            **stop,
+        }
+        keys = {"learning_rates": f"{at}.learning_rates", **steps, **stopping}
         return _resolve("search", "gradient", arguments, at=f"{at}.optimizer", keys=keys)
     if optimizer == "lbfgs":
-        return _resolve("search", "lbfgs", budget, at=f"{at}.optimizer", keys=steps)
+        return _resolve("search", "lbfgs", budget | stop, at=f"{at}.optimizer", keys=steps | stopping)
     if optimizer == "nelder_mead":
         arguments = budget if advanced.convergence_tol is None else {"tolerance": advanced.convergence_tol, **budget}
         keys = {"tolerance": f"{at}.convergence_tol", **steps}
@@ -561,7 +607,7 @@ def _search(config: V4Config, *, profile: tuple[str, ...], free: list[str]) -> t
     (in log units on a geometric span), unless ``advanced.learning_rates`` gives it one, and end at their last point
     (``last=True``); grids span wo-4.0's width of two tolerances, so a migrated file calibrates as wo-4.0 did. Under
     score sharpness ``advanced.optimizer`` is the one stage, for the ``max_iter`` of a lone gradient stage, as wo-4.0
-    ran it.
+    ran it. A TensorBoard log (``advanced.log_dir``) needs the ``tensorboard`` package.
     """
     calibration = config.solver.calibration
     assert calibration is not None
@@ -582,20 +628,16 @@ def _search(config: V4Config, *, profile: tuple[str, ...], free: list[str]) -> t
     assert isinstance(configured, Mapping)
     rates = dict.fromkeys(free, _STEP) | dict(configured)
     drives = calibration.optimizer_drives
-    method = wo_rec_optimizer(config)
-    reads = {"nelder_mead": "convergence_tol", "grid_search": "grid_points"}
-    for name in ("convergence_tol", "grid_points"):
+    reads = {"convergence_tol": ("nelder_mead", *GRADIENT_OPTIMIZERS), "grid_points": ("grid_search",)}
+    for name, readers in reads.items():
         value = getattr(advanced, name)
-        if value is None or (drives and reads.get(advanced.optimizer or "") == name):
-            continue
-        if name == "convergence_tol" and method in GRADIENT_OPTIMIZERS:
-            reason = (
-                f"wo-4.0's {method} stopped early once the loss had not improved by it for convergence_patience "
-                "steps (5 by default); this version runs every step; remove it"
-            )
-        else:
-            reason = "no stage of this calibration reads it, nor did wo-4.0; remove it"
-        no_effect(f"{at}.{name}", value, reason)
+        if value is not None and not (drives and advanced.optimizer in readers):
+            no_effect(f"{at}.{name}", value, "no stage of this calibration reads it, nor did wo-4.0; remove it")
+    if calibration_log_dir(config) is not None and importlib.util.find_spec("tensorboard") is None:
+        raise ConfigurationError(
+            f"{at}.log_dir",
+            "writes a TensorBoard log, which needs the tensorboard package: pip install waveorder[tensorboard]",
+        )
     if drives:
         return (_optimizer_stage(advanced, rates, iterations=calibration.budget),)
     grid = None
@@ -622,6 +664,8 @@ def _stage(stage: object, *, at: str, rates: object, config: V4Config) -> Search
             "optimizer": options.optimizer,
             "learning_rate": _STEP,
             "last": True,
+            "tolerance": options.tolerance,
+            "patience": options.patience,
         }
         keys = {"iterations": f"{at}.gradient.max_iter", "learning_rates": "solver.calibration.advanced.learning_rates"}
         return _resolve("search", "gradient", arguments, at=f"{at}.gradient", keys=keys)

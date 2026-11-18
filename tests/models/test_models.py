@@ -467,6 +467,7 @@ def test_a_python_built_model_is_written_as_its_description():
         "field_tiles": None,
         "pixel_size": None,
         "apodization_rolloff": 0.0,
+        "calibration_edge_steepness": None,
     }
     assert described["data"] == {"input_channel_names": ["GFP"]}
 

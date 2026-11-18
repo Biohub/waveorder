@@ -6,9 +6,9 @@ import math
 import re
 import warnings
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import ClassVar, override
+from typing import ClassVar, cast, override
 
 import pytest
 import torch
@@ -197,6 +197,9 @@ def test_the_history_holds_every_gradient_step_and_the_last_full_grid():
     result = calibrate(data, model, SAMPLING, score=Evidence(), search=stages, history=True)
     assert len(result.steps) == 7 + 3  # every evaluation, the last one after the final step included
     assert min(result.steps) == pytest.approx(result.trace[-1][1], rel=1e-6)
+    assert len(result.step_points) == len(result.steps)
+    assert {name for point in result.step_points for name in point} == {NA}
+    assert all(0.8 <= point[NA] <= 1.2 for point in result.step_points)
     assert result.grid is not None
     assert result.grid.names == (NA,)
     assert result.grid.values.dtype == torch.float64
@@ -205,8 +208,84 @@ def test_the_history_holds_every_gradient_step_and_the_last_full_grid():
     assert result.grid.values[:, 1].min().item() == pytest.approx(result.trace[0][1], rel=1e-6)
     assert result.sweep is None
     plain = calibrate(data, _model(FREE_NA), SAMPLING, score=Evidence(), search=stages)
-    assert (plain.steps, plain.grid) == ((), None)
+    assert (plain.steps, plain.step_points, plain.grid) == ((), (), None)
     assert plain.parameters[NA].item() == pytest.approx(result.parameters[NA].item())
+
+
+def test_the_history_holds_every_nelder_mead_evaluation():
+    # wo-4.0 logged each evaluation of its Nelder-Mead; the history keeps them for that log.
+    stage = NelderMeadSearch(iterations=6)
+    result = calibrate(_data(), _model(FREE_NA), SAMPLING, score=Evidence(), search=[stage], history=True)
+    assert len(result.steps) == len(result.step_points) == 6
+    assert min(result.steps) == pytest.approx(result.trace[-1][1], rel=1e-6)
+
+
+class _Ramp:
+    """``max(x, 5)`` of one quantity ``x``: Adam at a step of 1 from 10 lowers it by 1 a step to 5, then it is flat."""
+
+    def __init__(self) -> None:
+        self.specs = {"x": Free(10.0, bounds=(-100.0, 100.0))}
+        self.prior = ParameterPrior(self.specs)
+        self.calls = 0
+
+    def __call__(self, point: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        self.calls += 1
+        return torch.clamp(point["x"], min=5.0)
+
+
+def _ramp(*, tolerance: float | None = None, patience: int = 5, check_every: int = 10) -> tuple[_Ramp, Estimate]:
+    ramp = _Ramp()
+    stage = GradientSearch(
+        iterations=50,
+        learning_rates={"x": 1.0},
+        last=True,
+        tolerance=tolerance,
+        patience=patience,
+        check_every=check_every,
+    )
+    start = Estimate({"x": torch.tensor(10.0)}, torch.tensor(10.0))
+    return ramp, stage.run(cast(CalibrationObjective, ramp), start=start)
+
+
+@pytest.mark.parametrize("patience", [1, 3, 5])
+def test_patience_stops_a_gradient_stage_on_a_plateau_and_not_before(patience):
+    # The steps from 10 down to 5 each improve by 1, more than the tolerance; the steps on the plateau improve by
+    # nothing, and wo-4.0's rule stops after `patience` of them.
+    ramp, _ = _ramp(tolerance=0.5, patience=patience, check_every=1)
+    assert ramp.calls == 6 + patience + 1  # the steps run, and the evaluation after the last
+    ramp, _ = _ramp()
+    assert ramp.calls == 50 + 1
+
+
+def test_the_steps_run_after_a_stop_until_it_is_read_back_change_nothing():
+    _, read_every_step = _ramp(tolerance=0.5, patience=2, check_every=1)
+    ramp, read_late = _ramp(tolerance=0.5, patience=2, check_every=10)
+    assert ramp.calls == 10 + 1  # stopped after step 8, read back after step 10
+    assert read_late.point["x"].item() == read_every_step.point["x"].item()
+    assert read_late.objective.item() == read_every_step.objective.item()
+
+
+def _wo_40_steps(losses: Sequence[float], *, tolerance: float, patience: int = 5) -> int:
+    """Return how many of these steps wo-4.0's ``optimize_reconstruction`` ran, ``losses[k]`` the loss of step k."""
+    lowest, stalled = math.inf, 0
+    for step, loss in enumerate(losses):
+        lowest, stalled = (loss, 0) if loss < lowest - tolerance else (lowest, stalled + 1)
+        if stalled >= patience:
+            return step + 1
+    return len(losses)
+
+
+def test_the_default_patience_stops_where_wo_40s_rule_does():
+    data, iterations, tolerance = _data(), 40, 1e-3
+    full = GradientSearch(iterations=iterations)
+    every = calibrate(data, _model(FREE_NA), SAMPLING, score=Evidence(), search=[full], history=True)
+    ran = _wo_40_steps(every.steps[:-1], tolerance=tolerance)
+    assert ran < iterations  # the case stops early
+    stopping = GradientSearch(iterations=iterations, tolerance=tolerance)  # patience 5, read back every 10 steps
+    stopped = calibrate(data, _model(FREE_NA), SAMPLING, score=Evidence(), search=[stopping], history=True)
+    assert len(stopped.steps) == ran + 1  # the steps run, and the evaluation after the last
+    assert stopped.steps[:ran] == pytest.approx(every.steps[:ran])
+    assert stopped.step_points[-1] == pytest.approx(every.step_points[ran])
 
 
 def test_calibrate_calls_back_as_each_stage_ends_with_the_best_so_far():

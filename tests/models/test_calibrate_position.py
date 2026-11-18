@@ -168,6 +168,25 @@ def test_a_quantity_that_ends_on_a_bound_warns(position):
     assert store.transfers == ()
 
 
+def test_a_wo_40_log_dir_writes_its_tensorboard_scalars_per_step_of_an_early_stopped_adam(position, tmp_path):
+    accumulator = pytest.importorskip("tensorboard.backend.event_processing.event_accumulator")
+
+    raw = raw_config()
+    advanced = {"optimizer": "adam", "convergence_tol": 1e-4, "convergence_patience": 3, "log_dir": str(tmp_path)}
+    search = [{"gradient": {"max_iter": 50}}]
+    raw["solver"]["calibration"] = {"score": "sharpness", "search": search, "advanced": advanced}
+    model_of(raw).calibrate_position(position, channels=["BF"])
+    events = accumulator.EventAccumulator(str(tmp_path))
+    events.Reload()
+    assert set(events.Tags()["scalars"]) == {"loss", "numerical_aperture_illumination"}  # wo-4.0's tags
+    losses = [event.value for event in events.Scalars("loss")]
+    assert [event.step for event in events.Scalars("loss")] == list(range(len(losses)))
+    assert 3 < len(losses) < 50  # stopped early, by wo-4.0's rule: 3 steps without an improvement of 1e-4
+    lowest = [min(losses[: step + 1]) for step in range(len(losses))]
+    assert all(lowest[-4] - loss < 1e-4 for loss in losses[-3:])
+    assert len(events.Scalars("numerical_aperture_illumination")) == len(losses)
+
+
 def test_channel_and_time_problems_are_reported_together_and_another_voxel_size_is_warned_of(position, tmp_path):
     model = model_of()
     with pytest.raises(Rejected) as error, pytest.warns(PositionWarning, match=r"\(0\.5, 0\.15, 0\.15\) um, but"):

@@ -120,6 +120,8 @@ _TILE_STITCH_MESSAGE = (
     "(the output becomes a plate)"
 )
 _METHODS = ("adam", "nadam", "lbfgs", "nelder_mead", "grid_search")
+_STEPPED = _METHODS[:3]
+"""The 3.x optimizers that step along the gradient: they read ``use_gradients`` and stop on ``convergence_tol``."""
 _RL_FIELDS = ("iterations", "background", "back_projector")
 
 TABLE: tuple[Row, ...] = (
@@ -224,14 +226,41 @@ TABLE: tuple[Row, ...] = (
         "over init +- (grid_points // 2) * lr",
     ),
     Row(f"{_OPT}.max_iterations", 10, "the stage's iterations (grid_search ignores it, as in 3.x)"),
-    Row(f"{_OPT}.convergence_tol", None, "nelder_mead.tolerance; rejected for other methods (4.x runs the budget)"),
-    Row(f"{_OPT}.convergence_patience", 5, "not executed: dropped with a note at 5, rejected otherwise"),
-    Row(f"{_OPT}.use_gradients", None, "not executed: dropped with a note when it matches the method, else rejected"),
+    Row(
+        f"{_OPT}.convergence_tol",
+        None,
+        "adam, nadam: gradient.tolerance; lbfgs: lbfgs.tolerance; nelder_mead: nelder_mead.tolerance; rejected for "
+        "grid_search",
+    ),
+    Row(
+        f"{_OPT}.convergence_patience",
+        5,
+        "gradient.patience or lbfgs.patience beside convergence_tol; otherwise dropped with a note (3.x read it only "
+        "there)",
+    ),
+    Row(
+        f"{_OPT}.use_gradients",
+        None,
+        "false under adam, nadam, lbfgs: the free values at their init and no calibration (3.x took no step); "
+        "otherwise dropped with a note (3.x resolved it to what the method does)",
+    ),
     Row(
         f"{_OPT}.grid_points", 7, "grid.points for grid_search; otherwise dropped with a note at 7, rejected otherwise"
     ),
     Row(f"{_OPT}.loss", {"type": "midband_power"}, "solver.calibration.advanced.loss"),
-    Row(f"{_OPT}.log_dir", None, "not executed: rejected when set"),
+    Row(f"{_OPT}.log_dir", None, "solver.calibration.advanced.log_dir (needs the tensorboard extra)"),
+    Row(
+        "(2D phase gradient fit)",
+        NO_DEFAULT,
+        "adam, nadam, lbfgs on 2D Tikhonov phase: solver.calibration.reconstruction: {closed_form: {coupling: "
+        "per_field}}, the per-channel estimate 3.x scored them with; the final reconstruction stays joint",
+    ),
+    Row(
+        "(phase fit pupil edge)",
+        NO_DEFAULT,
+        "any 3.x phase optimizer: solver.calibration.edge_steepness: 100, the soft sigmoid edge 3.x fitted on; the "
+        "final reconstruction keeps imaging_system.detection.edge_steepness 1e4",
+    ),
     Row("version: 4 with data.pixel_size.yx (#592)", NO_DEFAULT, "pixel_size.yx -> y and x, the rest above"),
 )
 """Every 3.x key and what :func:`migrate` makes of it; :func:`table_help` renders it."""
@@ -315,6 +344,8 @@ class _Migration:
         self.contrast = "phase"
         # A #592 file: a setting wo config check warns of and does not execute is dropped with a note, not rejected.
         self.preview = False
+        # A 3.x gradient optimizer with use_gradients: false took no step: the free values stay at their init.
+        self.frozen = False
 
     def reject(self, key: str, message: str) -> None:
         self.rejections.append(Rejection(key, message))
@@ -381,38 +412,33 @@ class _Migration:
         return self._stage(options)
 
     def _check_stopping(self, options: Mapping[str, Any], *, given: set[str], prefix: str) -> None:
-        """Reject the 3.x early-stopping settings 4.x does not execute; note them at their 3.x default."""
-        if options["convergence_tol"] is not None and options["method"] != "nelder_mead":
-            self.unread(
-                f"{prefix}.convergence_tol",
-                "3.x stopped early once the loss stalled; 4.x does not execute this setting and runs the full "
-                "max_iterations",
-            )
-        if options["convergence_patience"] not in (None, _OPTIMIZER_DEFAULTS["convergence_patience"]):
-            self.unread(f"{prefix}.convergence_patience", "a 3.x setting 4.x does not execute (4.x runs its budget)")
-        elif "convergence_patience" in given:
+        """Reject ``convergence_tol`` where 3.x did not read it; note ``convergence_patience`` where it did nothing."""
+        method, tolerance = options["method"], options["convergence_tol"]
+        if tolerance is not None and method == "grid_search":
+            self.unread(f"{prefix}.convergence_tol", "grid_search does not read it, nor did 3.x")
+        stops = tolerance is not None and method in _STEPPED
+        if not stops and "convergence_patience" in given and options["convergence_patience"] is not None:
             self.note(
-                f"{prefix}.convergence_patience dropped: 3.x stopped after 5 stalled iterations; 4.x runs its "
-                "full budget"
+                f"{prefix}.convergence_patience dropped: 3.x read it only beside convergence_tol under adam, nadam "
+                "or lbfgs"
             )
 
     def _check_unread(self, options: Mapping[str, Any], *, given: set[str], prefix: str) -> None:
-        """Reject ``use_gradients``, ``grid_points`` and ``log_dir`` where 4.x would not read them."""
+        """Resolve ``use_gradients`` as 3.x did; reject ``grid_points`` where 4.x would not read it."""
         method = options["method"]
         gradients = options["use_gradients"]
-        if gradients is not None and gradients != (method in ("adam", "nadam", "lbfgs")):
-            self.unread(
-                f"{prefix}.use_gradients",
-                f"a 3.x setting 4.x does not execute; {method} uses gradients only if it is a gradient method",
-            )
+        if gradients is False and method in _STEPPED:
+            if self.preview:  # wo rec's optimizer is held at nominal before (_hold_nominal); calibrate-tf ignored it
+                self.unread(f"{prefix}.use_gradients", "wo-4.0's calibrate-tf did not read it")
+            else:
+                self.frozen = True
         elif "use_gradients" in given and gradients is not None:
-            self.note(f"{prefix}.use_gradients dropped: it matches what {method} does")
+            what = "steps along the gradient either way" if method in _STEPPED else "ignores it"
+            self.note(f"{prefix}.use_gradients dropped: {method} {what}, as in 3.x")
         if method != "grid_search" and options["grid_points"] != _OPTIMIZER_DEFAULTS["grid_points"]:
             self.unread(f"{prefix}.grid_points", f"is read only by grid_search, not {method}")
         elif method != "grid_search" and "grid_points" in given:
             self.note(f"{prefix}.grid_points dropped: read only by grid_search")
-        if options.get("log_dir") is not None:
-            self.unread(f"{prefix}.log_dir", "4.x does not write TensorBoard logs")
 
     def _stage(self, options: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return the search stage the 3.x method stands for, and the ``advanced`` block it needs.
@@ -422,20 +448,25 @@ class _Migration:
         """
         method, iterations = options["method"], options["max_iterations"]
         budget = {} if iterations is None else {"iterations": iterations}
+        tolerance = options["convergence_tol"]
+        stop = {}
+        if tolerance is not None and method in _STEPPED:
+            patience = options["convergence_patience"]
+            default = _OPTIMIZER_DEFAULTS["convergence_patience"]
+            stop = {"tolerance": tolerance, "patience": default if patience is None else patience}
         advanced: dict[str, Any] = {}
         if method in ("adam", "nadam"):
             gradient = {"optimizer": method} if iterations is None else {"max_iter": iterations, "optimizer": method}
-            stage: dict[str, Any] = {"gradient": gradient}
+            stage: dict[str, Any] = {"gradient": gradient | stop}
             steps = _GRADIENT_STEPS if iterations is None else iterations
             advanced["learning_rates"] = {path: rate for path, (_, rate, _) in self.free.items()}
             self.reach = {path: steps * rate for path, (_, rate, _) in self.free.items()}
         elif method == "lbfgs":
-            stage = {"lbfgs": budget}
+            stage = {"lbfgs": budget | stop}
             self.note(
                 "lbfgs: 4.x L-BFGS uses a strong-Wolfe line search within bounds; 3.x took unit steps without one"
             )
         elif method == "nelder_mead":
-            tolerance = options["convergence_tol"]
             stage = {"nelder_mead": {**budget, "tolerance": 1e-4 if tolerance is None else tolerance}}
         else:
             points = options["grid_points"]
@@ -445,6 +476,8 @@ class _Migration:
         loss = options.get("loss")
         if loss is not None:
             advanced["loss"] = dict(loss)
+        if options.get("log_dir") is not None:
+            advanced["log_dir"] = options["log_dir"]
         return stage, advanced
 
 
@@ -706,6 +739,14 @@ def _calibration(migration: _Migration) -> dict[str, Any] | None:
     if translated is None:
         return None
     stage, advanced = translated
+    if migration.frozen:
+        log = " (and its log_dir: 4.x logs no calibration that does not run)" if options.get("log_dir") else ""
+        migration.note(
+            f"{_OPT}.use_gradients: false: 3.x's {options['method']} took no step with it, so "
+            f"{', '.join(f'imaging_system.{path}' for path in migration.free)} are written at their init and the "
+            f"optimization is dropped{log}"
+        )
+        return None
     migration.note(
         "solver.calibration: 3.x optimized before reconstructing and wrote <config>_optimized.yml; 4.x stores the "
         "calibrated values in the transfer-function store (wo config show FILE -t STORE prints them)"
@@ -716,6 +757,16 @@ def _calibration(migration: _Migration) -> dict[str, Any] | None:
     return calibration
 
 
+def _hold_init(migration: _Migration, system: dict[str, Any]) -> None:
+    """Write each free value of ``system`` as its 3.x init, which an optimizer that took no step left it at."""
+    for path, (start, _, _) in migration.free.items():
+        parent, _, key = path.rpartition(".")
+        holder = _lookup(system, parent) if parent else system
+        assert isinstance(holder, dict)
+        holder[key] = start
+    migration.free, migration.reach = {}, {}
+
+
 def _translate(migration: _Migration) -> dict[str, Any] | None:
     channels = _value(migration, "input_channel_names")
     if not isinstance(channels, list) or len(channels) != 1:
@@ -724,6 +775,8 @@ def _translate(migration: _Migration) -> dict[str, Any] | None:
     system = _imaging_system(migration)
     inverse = _inverse(migration)
     calibration = _calibration(migration)
+    if migration.frozen:
+        _hold_init(migration, system)
     _bound_apertures(
         migration, system, thin=_value(migration, "reconstruction_dimension") == 2, low=_LINEAR_LOW_APERTURE
     )
@@ -731,6 +784,12 @@ def _translate(migration: _Migration) -> dict[str, Any] | None:
     if inverse is None or migration.rejections:
         return None
     object_block, noise, reconstruction = inverse
+    thin_phase = migration.contrast == "phase" and object_block["dimension"] == 2
+    gradient = calibration is not None and next(iter(calibration["search"][0])) in ("gradient", "lbfgs")
+    if gradient and thin_phase and reconstruction == "closed_form":
+        _score_per_field(migration, calibration)
+    if calibration is not None and migration.contrast == "phase":
+        _fit_soft_edge(migration, calibration)
     solver: dict[str, Any] = {
         "padding": {"z": _value(migration, f"{_TF}.z_padding")},
         "reconstruction": reconstruction,
@@ -778,7 +837,15 @@ def _from_preview(migration: _Migration) -> MigrationResult:
             _preview_offset(migration, config, detection)
     solver = config.get("solver")
     if isinstance(solver, dict):
+        per_field = _scored_per_field(config)  # read from the file as written, before its optimizer is translated
+        soft = _lookup(config, "imaging_system.contrast") == "phase" and bool(_wo_rec_free(config))
         _preview_solver(migration, solver, system if isinstance(system, dict) else {})
+        calibration = solver.get("calibration")
+        if per_field and isinstance(calibration, dict):
+            _score_per_field(migration, calibration)
+        sigmoid = _lookup(config, "imaging_system.detection.edge") == "sigmoid"
+        if soft and sigmoid and isinstance(calibration, dict):
+            _fit_soft_edge(migration, calibration)
     if isinstance(system, dict):
         _bound_apertures(migration, system, thin=_lookup(config, "object.dimension") == 2, low=_LINEAR_LOW_APERTURE)
         _bound_zenith(migration, system)
@@ -951,6 +1018,8 @@ def wo40_differences(raw: Mapping[str, Any]) -> tuple[tuple[str, ...], tuple[str
     rl = _lookup(raw, "solver.reconstruction.richardson_lucy")
     if isinstance(rl, Mapping) and "start" not in rl:
         defaults.append("Richardson-Lucy started from ones")
+    if _lookup(raw, "imaging_system.contrast") == "phase" and _wo_rec_free(raw):
+        defaults.append("a phase fit at pupil edge steepness 100")
     notes = []
     if _wo_rec_steps(raw) is not None:
         search = _lookup(raw, "solver.calibration.search")
@@ -1017,6 +1086,48 @@ def _wo_rec_free(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     if pupil or any(value["tolerance"] != "free" for value in free.values()):
         return {}
     return free
+
+
+def _scored_per_field(config: Mapping[str, Any]) -> bool:
+    """Whether wo-4.0's ``wo rec`` scored the calibration of ``config`` on per-channel estimates.
+
+    It did for a gradient fit (adam by default, nadam, lbfgs) of 2D phase under Tikhonov, where 3.x's
+    ``isotropic_thin_3d.reconstruct`` chose the per-channel inverse because the transfer function carried gradients.
+    """
+    advanced = _lookup(config, "solver.calibration.advanced")
+    method = advanced.get("optimizer") if isinstance(advanced, Mapping) else None
+    return (
+        _lookup(config, "imaging_system.contrast") == "phase"
+        and _lookup(config, "object.dimension") == 2
+        and _lookup(config, "object.prior") in (_MISSING, "tikhonov")
+        and _lookup(config, "solver.reconstruction") in (_MISSING, "closed_form")
+        and method in (None, "adam", "nadam", "lbfgs")
+        and bool(_wo_rec_free(config))
+    )
+
+
+def _score_per_field(migration: _Migration, calibration: dict[str, Any]) -> None:
+    """Score a gradient fit of 2D phase on each field's own estimate, as 3.x did; the final estimate stays joint."""
+    calibration["reconstruction"] = {"closed_form": {"coupling": "per_field"}}
+    migration.note(
+        "solver.calibration.reconstruction: {closed_form: {coupling: per_field}}: 3.x scored a gradient fit of 2D "
+        "phase on per-channel estimates (decomposition per_channel) and wrote the final reconstruction with the "
+        "joint one (svd); this keeps both"
+    )
+
+
+_FIT_STEEPNESS = 100.0
+"""The sigmoid pupil edge steepness wo-4.0's (and 3.x's) phase optimizer fitted with (``optim_steepness``)."""
+
+
+def _fit_soft_edge(migration: _Migration, calibration: dict[str, Any]) -> None:
+    """Fit phase on the soft pupil edge wo-4.0's optimizer fitted on; the reconstruction keeps the detection's 1e4."""
+    calibration["edge_steepness"] = _FIT_STEEPNESS
+    migration.note(
+        "solver.calibration.edge_steepness: 100: the 3.x phase optimizer (wo-4.0's wo rec) fitted on a sigmoid pupil "
+        "edge of steepness 100 and wrote the final reconstruction at 1e4 (imaging_system.detection.edge_steepness); "
+        "this keeps both"
+    )
 
 
 def _grid_span(migration: _Migration, config: dict[str, Any]) -> None:

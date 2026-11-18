@@ -93,6 +93,7 @@ class Parts(TypedDict, total=False):
     solver: Solver | None
     score: Score | None
     search: Sequence[SearchStage] | None
+    calibration_edge_steepness: float | None
     z_padding: ZPaddingSetting
     field_tiles: FieldTiles | None
     pixel_size: PixelSize | Literal["auto"] | None
