@@ -213,6 +213,7 @@ def migrate_3x_settings(settings: ReconstructionSettings) -> schema.V4Config:
             "calibration": calibration,
             "apodization_rolloff": ai.apodization_rolloff,
             "device": settings.device,
+            "transfer_function_dtype": settings.transfer_function_dtype,
         },
     )
 
@@ -402,6 +403,7 @@ def v4_to_legacy(cfg: schema.V4Config) -> ReconstructionSettings:
         time_indices=cfg.data.time_indices,
         reconstruction_dimension=cfg.object.dimension,
         device=cfg.solver.device,
+        transfer_function_dtype=cfg.solver.transfer_function_dtype,
         optimization=optimization,
         **{system.contrast: contrast_settings},
     )

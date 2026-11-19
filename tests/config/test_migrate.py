@@ -188,6 +188,22 @@ def test_rl_maps_to_richardson_lucy_with_poisson():
     assert round_tripped.model_dump() == ReconstructionSettings(**raw).model_dump()
 
 
+def test_transfer_function_dtype_maps_to_solver():
+    raw = {
+        "input_channel_names": ["GFP"],
+        "transfer_function_dtype": "float16",
+        "fluorescence": {
+            "transfer_function": {},
+            "apply_inverse": {},
+        },
+    }
+    cfg = migrate_3x_dict(raw)
+    assert cfg.solver.transfer_function_dtype == "float16"
+    round_tripped = v4_to_legacy(cfg)
+    assert round_tripped.transfer_function_dtype == "float16"
+    assert round_tripped.model_dump() == ReconstructionSettings(**raw).model_dump()
+
+
 def test_confocal_pinhole_maps_to_detection():
     raw = {
         "input_channel_names": ["GFP"],
