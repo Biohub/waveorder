@@ -53,6 +53,9 @@ S_YS, S_XS = slice(640, 1152), slice(1280, 1792)  # defocus-stack crop
 PX_UM = 0.325  # yx pixel size in micrometers
 N_WIDE, N_FOCUS = 512, 320  # source pixels across the wide and focus crops
 
+# Frame colors for the failure-mode panels: red = failed result, green = good result.
+FAIL, GOOD = "#d62728", "#2ca02c"
+
 
 def refresh_from_hpc(raw_path=RAW_PATH, recons=RECONS):
     """Rebuild the crops in ./data/ from the raw data and reconstructions.
@@ -201,11 +204,19 @@ def add_scalebar(ax, n_px, n_src, length_um=25):
     )
 
 
-def panel(ax, name, title, n_src=N_WIDE, scalebar=False):
-    """Render one grayscale image panel from a crop in ./data/."""
+def panel(ax, name, title, n_src=N_WIDE, scalebar=False, outline=None):
+    """Render one grayscale image panel from a crop in ./data/.
+
+    ``outline`` colors the panel frame (``FAIL`` red / ``GOOD`` green in
+    the failure-mode figures).
+    """
     img = load(name)
     show(ax, img)
     ax.set_title(title, fontsize=8)
+    if outline is not None:
+        for spine in ax.spines.values():
+            spine.set_color(outline)
+            spine.set_linewidth(1.2)
     if scalebar:
         add_scalebar(ax, img.shape[-1], n_src)
 
@@ -420,28 +431,30 @@ def make_failure_modes():
 
     # contrast flip
     fig, axs = plt.subplots(1, 2, figsize=two)
-    panel(axs[0], "nominal", "correct\n(nucleoli bright)", scalebar=True)
-    panel(axs[1], "flipped", "flipped z axis\n(nucleoli dark)")
+    panel(axs[0], "nominal", "correct\n(nucleoli bright)", scalebar=True, outline=GOOD)
+    panel(axs[1], "flipped", "flipped z axis\n(nucleoli dark)", outline=FAIL)
     save(fig, "fig_flip")
 
     # regularization sweep
     fig, axs = plt.subplots(1, 3, figsize=three)
     for ax, reg, note in zip(axs, ["1e-5", "1e-3", "1e-1"], ["too noisy", "chosen", "too smooth"]):
         name = "nominal" if reg == "1e-3" else f"reg_{reg}"
-        panel(ax, name, f"reg {reg}\n({note})", scalebar=(reg == "1e-5"))
+        outline = GOOD if reg == "1e-3" else FAIL
+        panel(ax, name, f"reg {reg}\n({note})", scalebar=(reg == "1e-5"), outline=outline)
     save(fig, "fig_reg")
 
     # focus offset
     fig, axs = plt.subplots(1, 3, figsize=three)
     for ax, off in zip(axs, ["-2", "0", "+2"]):
         note = "(chosen)" if off == "0" else ""
-        panel(ax, f"focus_{off}", f"{off} slices\n{note}", n_src=N_FOCUS, scalebar=(off == "-2"))
+        outline = GOOD if off == "0" else FAIL
+        panel(ax, f"focus_{off}", f"{off} slices\n{note}", n_src=N_FOCUS, scalebar=(off == "-2"), outline=outline)
     save(fig, "fig_focus")
 
     # illumination tilt on an edge FOV
     fig, axs = plt.subplots(1, 2, figsize=two)
-    panel(axs[0], "edge_baseline", "tilt not modeled\n", scalebar=True)
-    panel(axs[1], "edge_tilt", "tilt fitted\n(0.49 rad zenith)")
+    panel(axs[0], "edge_baseline", "tilt not modeled\n", scalebar=True, outline=FAIL)
+    panel(axs[1], "edge_tilt", "tilt fitted\n(0.49 rad zenith)", outline=GOOD)
     save(fig, "fig_tilt")
 
 
