@@ -431,8 +431,8 @@ def make_failure_modes():
 
     # contrast flip
     fig, axs = plt.subplots(1, 2, figsize=two)
-    panel(axs[0], "nominal", "correct\n(nucleoli bright)", scalebar=True, outline=GOOD)
-    panel(axs[1], "flipped", "flipped z axis\n(nucleoli dark)", outline=FAIL)
+    panel(axs[0], "flipped", "flipped z axis\n(nucleoli dark)", scalebar=True, outline=FAIL)
+    panel(axs[1], "nominal", "correct\n(nucleoli bright)", outline=GOOD)
     save(fig, "fig_flip")
 
     # regularization sweep
