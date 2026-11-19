@@ -289,7 +289,7 @@ def apply_inverse_transfer_function(
     # Key computation
     U, S, Vh = singular_system
     S_reg = tikhonov_regularized_inverse_filter(S, regularization_strength, apodization_rolloff=apodization_rolloff)
-    sfzyx_inverse_filter = torch.einsum("sjzyx,jzyx,jfzyx->sfzyx", U, S_reg, Vh)
+    sfzyx_inverse_filter = torch.einsum("sjzyx,jzyx,jfzyx->sfzyx", torch.conj(U), S_reg, torch.conj(Vh))
 
     fzyx_recon = apply_filter_bank(sfzyx_inverse_filter, szyx_data)
 
