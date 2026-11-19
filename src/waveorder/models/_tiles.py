@@ -72,7 +72,7 @@ def z_padded(
     depth = z + 2 * slices
     _, oy, ox = plan.overlap
     padded = dataclasses.replace(
-        plan, shape=(depth, y, x), tile=(depth, plan.tile[1], plan.tile[2]), overlap=(0, oy, ox)
+        plan, shape=(depth, y, x), tile=(depth, plan.tile[1], plan.tile[2]), overlap=(0, oy, ox), z_padding=slices
     )
     padding = ZPadding(slices)
     cropped = tuple((_ZPadded(source, padding), _ZCropped(sink, slices)) for source, sink in pairs)

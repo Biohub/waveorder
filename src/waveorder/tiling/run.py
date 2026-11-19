@@ -375,7 +375,8 @@ class TileLoader:
             tic = time.perf_counter()
             for (volume, region), (data,) in tiles:
                 self.stats.add("wait_s", time.perf_counter() - tic)
-                yield volume, Tile(data, Sampling(shape=region.read_shape, pixel_size=self.pixel_size), region)
+                sampling = Sampling(shape=region.read_shape, pixel_size=self.pixel_size, z_padding=self.plan.z_padding)
+                yield volume, Tile(data, sampling, region)
                 tic = time.perf_counter()
         finally:
             tiles.close()  # stops the reader threads
@@ -406,7 +407,8 @@ def stack_tiles(
         dtype=dtype,
         options=options or TileOptions(),
     )
-    return torch.stack([tile.data for _, tile in loader]), Sampling(shape=plan.read_shape, pixel_size=pixel_size)
+    sampling = Sampling(shape=plan.read_shape, pixel_size=pixel_size, z_padding=plan.z_padding)
+    return torch.stack([tile.data for _, tile in loader]), sampling
 
 
 @final

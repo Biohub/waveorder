@@ -280,9 +280,11 @@ class ZPadding:
         return torch.cat((data[..., :p, :, :].flip(-3), data, data[..., -p:, :, :].flip(-3)), dim=-3)
 
     def sampling(self, sampling: Sampling) -> Sampling:
-        """Return ``sampling`` with ``2p`` more slices along z, the grid :meth:`pad` puts the data on."""
+        """Return ``sampling`` padded by ``p`` slices at each end of z (its ``z_padding``), the grid of :meth:`pad`."""
         nz, ny, nx = sampling.shape
-        return dataclasses.replace(sampling, shape=(nz + 2 * self.slices, ny, nx))
+        return dataclasses.replace(
+            sampling, shape=(nz + 2 * self.slices, ny, nx), z_padding=sampling.z_padding + self.slices
+        )
 
     def crop(self, result: SolveResult) -> SolveResult:
         """Return ``result`` with the central ``Z`` slices of its estimate, ``(F, Z + 2p, Y, X)`` to ``(F, Z, Y, X)``.

@@ -1179,7 +1179,7 @@ class ReconstructionModel:
         if parameters is None:
             parameters = _tiles.field_tile_parameters(self, plan=plan, where=where)
         plan, pairs = _tiles.z_padded(self, plan, pairs, pixel_size=pixel_size)
-        sampling = Sampling(shape=plan.read_shape, pixel_size=pixel_size)
+        sampling = Sampling(shape=plan.read_shape, pixel_size=pixel_size, z_padding=plan.z_padding)
         if not prepared:
             pairs = tuple((_tiles.as_measured(self, source, plan=plan, where=where), sink) for source, sink in pairs)
         self.imaging_model.check(self.solver, sampling)  # before the bind computes a transfer function

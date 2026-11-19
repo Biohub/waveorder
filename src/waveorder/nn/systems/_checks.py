@@ -85,7 +85,7 @@ def expect_feasible_grid(sampling: Sampling, factors: ZYX[int], *, where: str) -
         The system's class name, which starts the message.
     """
     sizes = " x ".join(f"{size:g}" for size in sampling.pixel_size)
-    fine = tuple(count * factor for count, factor in zip(sampling.shape, factors, strict=True))
+    fine = sampling.upsampled(factors).shape
     grid = " x ".join(map(str, fine))
     worst = max(range(3), key=lambda axis: factors[axis])
     if factors[worst] > MAX_UPSAMPLING:

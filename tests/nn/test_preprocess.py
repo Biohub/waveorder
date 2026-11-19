@@ -171,7 +171,8 @@ def test_pad_mirrors_the_edge_slices_while_shorter_than_the_stack_and_pads_zeros
     assert torch.equal(padded, torch.cat((edges[0], data, edges[1]), dim=1))
     assert torch.equal(padding.crop(SolveResult(padded, torch.tensor(0.0), 0, "direct")).estimate, data)
     sampling = Sampling(shape=(6, 5, 4), pixel_size=(0.4, 0.1, 0.2))
-    assert padding.sampling(sampling) == Sampling(shape=(6 + 2 * slices, 5, 4), pixel_size=(0.4, 0.1, 0.2))
+    expected = Sampling(shape=(6 + 2 * slices, 5, 4), pixel_size=(0.4, 0.1, 0.2), z_padding=slices)
+    assert padding.sampling(sampling) == expected
 
 
 def test_pad_is_differentiable() -> None:

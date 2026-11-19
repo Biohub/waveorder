@@ -25,7 +25,7 @@ from waveorder.nn import (
 )
 from waveorder.nn.functional import lateral_frequencies
 from waveorder.nn.optics import Illumination, IlluminationTilt, PupilEdge, PupilGrid
-from waveorder.nn.preprocess import brightfield_contrast
+from waveorder.nn.preprocess import ZPadding, brightfield_contrast
 from waveorder.nn.solvers.wiener import LinearGaussian
 from waveorder.nn.systems import phase as phase_module
 from waveorder.nn.systems.phase import ThickPhase3D, ThinPhase2D
@@ -680,6 +680,30 @@ def test_thin_with_equal_apertures_gives_the_wo40_transfer() -> None:
     for (field, plane, y, x), expected in OLD_EQUAL_APERTURE.items():
         index = 1 - field  # 3.x lists absorption first, the system phase first
         assert float(transfer[plane, index, y, x].real) == pytest.approx(expected, rel=1e-5)
+
+
+# wo-4.0 (85282ce) phase_thick_3d.calculate_transfer_function((3, 16, 16), 1.3, 25.0, 0.45, z_padding=2, 1.0,
+# numerical_aperture_illumination=0.15, numerical_aperture_detection=0.15), run in its own environment (float32):
+# real_potential_transfer_function at [z, y, x]. It refines z by 2 but keeps the padding at 2 fine slices.
+OLD_PADDED_THICK = {
+    (0, 0, 3): 0.007907921448349953 - 0.08574631065130234j,
+    (0, 1, 3): 0.00861314870417118 - 0.08509814739227295j,
+    (1, 1, 0): 0.014904090203344822,
+    (2, 0, 1): -0.0009279455407522619 + 0.035263724625110626j,
+}
+
+
+def test_thick_on_a_z_padded_grid_gives_the_wo40_transfer() -> None:
+    """ops_track_phase_3d pads a 25 um stack that the transfer function refines 2 times along z, as wo-4.0 does."""
+    sampling = ZPadding(2).sampling(Sampling(shape=(3, 16, 16), pixel_size=(25.0, 1.3, 1.3)))
+    illumination = Illumination(wavelength=0.45, numerical_aperture=0.15)
+    system = ThickPhase3D(
+        illumination, Detection(numerical_aperture=0.15, edge="sigmoid"), index_of_refraction_media=1.0
+    ).double()
+    assert system.upsampling(sampling)[0] == 2
+    transfer = torch.view_as_complex(system.potential_transfers(sampling).sum(0)[0].contiguous())  # H_c, (Z, Y, X')
+    for index, expected in OLD_PADDED_THICK.items():
+        assert complex(transfer[index]) == pytest.approx(expected, rel=1e-5)
 
 
 def test_thin_plane_count_must_match_its_positions() -> None:

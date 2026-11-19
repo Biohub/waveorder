@@ -172,9 +172,10 @@ class ThickPhase3D(ShiftInvariantSystem):
         H_phase(q, q_z)      = (dz / B) FFT_z[w(z) (c1 + c2)]
         H_absorption(q, q_z) = (dz / B) FFT_z[w(z) i (c1 - c2)]
 
-    on a grid oversampled along z, y and x for the largest reachable apertures, then cropped to the data's
-    frequencies. ``z = k dz + z_focus_offset dz_data`` for plane ``k`` in FFT order, and ``w`` is a Hann window
-    centred on ``k = 0``, as in 3.x. The oversampling ignores an illumination tilt, so a tilted transfer function
+    on a grid oversampled along z, y and x for the largest reachable apertures (the z padding of the sampling at the
+    fine step, as wo-4.0: :meth:`~waveorder.nn.Sampling.upsampled`), then cropped to the data's frequencies.
+    ``z = k dz + z_focus_offset dz_data`` for plane ``k`` in FFT order, and ``w`` is a Hann window centred on
+    ``k = 0``, as in 3.x. The oversampling ignores an illumination tilt, so a tilted transfer function
     aliases, as in 3.x. The crop ``H_c`` is wo-4.0's (:func:`~waveorder.nn.functional.cropped_frequencies`) and need
     not be Hermitian: the forward model is 3.x's ``real(ifftn(H_c fftn(f)))``, the half spectrum of
     ``0.5 (H_c(k) + conj H_c(-k))``, and the transfer also keeps the anti-Hermitian part, with which the closed-form

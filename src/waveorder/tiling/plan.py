@@ -177,11 +177,14 @@ class TilePlan:
         Source chunk shape along z, y, x; read regions are aligned outward to it. ``None`` for an unchunked source.
     blend : {"linear", "cosine"}
         Cross-fade across overlaps; weights sum to 1 at every voxel.
+    z_padding : int
+        Slices at each end of z that pad the volume (a z-padded model's plan); the tiles then span z, and their
+        sampling records the padding (:class:`~waveorder.nn.Sampling`). 0 by default.
 
     Raises
     ------
     ParameterError
-        If a field is invalid; ``path`` is the argument and axis, e.g. ``tile.y``, ``overlap.x``.
+        If a field is invalid; ``path`` is the argument and axis, e.g. ``tile.y``, ``overlap.x``, or ``z_padding``.
     """
 
     shape: ZYX[int]
@@ -189,6 +192,7 @@ class TilePlan:
     overlap: ZYX[int] = (0, 0, 0)
     chunks: ZYX[int] | None = None
     blend: Blend = "cosine"
+    z_padding: int = 0
     _axes: tuple[_Axis, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -201,6 +205,12 @@ class TilePlan:
             object.__setattr__(self, name, value)
         if self.blend not in ("linear", "cosine"):
             raise ParameterError(f"TilePlan blend must be 'linear' or 'cosine', got {self.blend!r}", path="blend")
+        if not isinstance(self.z_padding, int) or self.z_padding < 0 or (self.z_padding and tile[0] < shape[0]):
+            raise ParameterError(
+                f"TilePlan z_padding must be an int >= 0, and the tiles must span z when it is not 0; got "
+                f"{self.z_padding!r} with tile.z = {tile[0]} of {shape[0]} slices",
+                path="z_padding",
+            )
         for name, n, t, o in zip(_AXES, shape, tile, overlap, strict=True):
             if t < n and 2 * o > t:
                 raise ParameterError(

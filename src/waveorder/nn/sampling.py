@@ -59,17 +59,22 @@ class Sampling:
         Voxel counts along z, y, x: positive Python ints; any sequence is stored as a tuple.
     pixel_size : tuple[float, float, float]
         Voxel size along z, y, x in um: positive finite Python numbers, stored as a tuple.
+    z_padding : int
+        Slices at each end of z that pad the data (:class:`~waveorder.nn.ZPadding`), included in ``shape``; 0 by
+        default. :meth:`upsampled` refines the other slices only, as wo-4.0 computed its transfer functions.
 
     Raises
     ------
     ShapeError
-        If ``shape`` or ``pixel_size`` does not hold three values, or ``shape`` holds a count below 1.
+        If ``shape`` or ``pixel_size`` does not hold three values, ``shape`` holds a count below 1, or
+        ``z_padding`` is not an int from 0 to below half of ``shape[0]``.
     ParameterError
         If ``pixel_size`` holds anything but positive finite numbers.
     """
 
     shape: ZYX[int]
     pixel_size: ZYX[float]
+    z_padding: int = 0
 
     def __post_init__(self) -> None:
         for name in ("shape", "pixel_size"):
@@ -84,11 +89,22 @@ class Sampling:
             raise ParameterError(
                 f"Sampling.pixel_size must be three positive finite numbers in um (z, y, x), got {self.pixel_size}"
             )
+        if not isinstance(self.z_padding, int) or not 0 <= 2 * self.z_padding < self.shape[0]:
+            raise ShapeError(
+                f"Sampling.z_padding must be an int from 0 to below half of the {self.shape[0]} slices, got "
+                f"{self.z_padding!r}"
+            )
 
     def upsampled(self, factors: ZYX[int]) -> Self:
-        """Return the same field of view sampled ``factors`` times more finely along each axis."""
+        """Return the grid sampled ``factors`` times more finely along each axis.
+
+        The measured slices keep their field of view; the ``z_padding`` slices at each end stay as many slices of the
+        finer step, as wo-4.0 oversampled a padded stack: ``(Z - 2p) kz + 2p`` slices along z.
+        """
         (nz, ny, nx), (dz, dy, dx), (kz, ky, kx) = self.shape, self.pixel_size, factors
-        return dataclasses.replace(self, shape=(nz * kz, ny * ky, nx * kx), pixel_size=(dz / kz, dy / ky, dx / kx))
+        p = self.z_padding
+        shape = ((nz - 2 * p) * kz + 2 * p, ny * ky, nx * kx)
+        return dataclasses.replace(self, shape=shape, pixel_size=(dz / kz, dy / ky, dx / kx))
 
 
 def voxel_size(value: Sequence[float], *, where: str) -> ZYX[float]:

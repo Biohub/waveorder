@@ -178,14 +178,24 @@ def _diff(old: object, new: object, *, prefix: str, found: list[str]) -> None:
 
 # --- the transfer functions a store holds ---------------------------------------------------------------------------
 
-_REUSED = ("pixel_size_zyx_um", "imaging_system_sha256", "parameters_sha256", "dtype", "device", "transfer_crop")
+_REUSED = (
+    "z_padding",
+    "pixel_size_zyx_um",
+    "imaging_system_sha256",
+    "parameters_sha256",
+    "dtype",
+    "device",
+    "transfer_crop",
+)
 """What a stored transfer function was computed for besides its grid (:func:`transfer_record`), all to match."""
 
-_CROP = "wo-4.0 nd_fourier_central_cuboid, [hermitian, anti-hermitian] parts"
-"""How the stored transfers are cropped and split (:func:`~waveorder.nn.functional.cropped_frequencies`).
+_CROP = "wo-4.0 nd_fourier_central_cuboid, [hermitian, anti-hermitian] parts, z padding unrefined"
+"""How the stored transfers are computed, cropped and split (:func:`~waveorder.nn.functional.cropped_frequencies`,
+:meth:`~waveorder.nn.Sampling.upsampled`).
 
-Stores written before carry none: their transfers are recomputed, as on an odd axis cropped from an even one they were
-cropped otherwise and a brightfield phase transfer had no anti-Hermitian part.
+Stores written before carry another: their transfers are recomputed, as on an odd axis cropped from an even one they
+were cropped otherwise, a brightfield phase transfer had no anti-Hermitian part, and the z padding was refined with the
+measured slices.
 """
 
 _HASHED = {"imaging_system_sha256": "another imaging system", "parameters_sha256": "other parameter values"}
@@ -217,13 +227,11 @@ def current_values(model: ReconstructionModel) -> tuple[tuple[str, ...], Tensor,
 
 
 def transfer_record(model: ReconstructionModel, sampling: Sampling) -> dict[str, object]:
-    """Return what the model's transfer function on ``sampling`` is computed for, as a store records it.
-
-    ``sampling`` is the padded grid; :func:`_transfer_at` adds the ``z_padding`` it was padded by.
-    """
+    """Return what the model's transfer on ``sampling`` (the padded grid) is computed for, as a store records it."""
     names, values, _ = current_values(model)
     return {
         "shape_zyx": list(sampling.shape),
+        "z_padding": sampling.z_padding,
         "pixel_size_zyx_um": list(sampling.pixel_size),
         "parameters_sha256": parameters_sha256(names, values),
         "imaging_system_sha256": system_sha256(model),
@@ -616,7 +624,6 @@ def _transfer_at(model: ReconstructionModel, shape: ZYX, pixel_size: PixelSize) 
         "fft": fft,
         "real": real,
         **transfer_record(model, sampling),
-        "z_padding": slices,
     }
     transfer = values if real else torch.view_as_complex(values.contiguous())
     return TransferArray(shape=sampling.shape, attrs=attrs, transfer=transfer)
