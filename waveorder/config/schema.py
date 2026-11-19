@@ -561,6 +561,10 @@ class SolverSettings(V4BaseModel):
         description="raised-cosine roll-off of the inverse filter at the transverse Nyquist edge",
     )
     device: Optional[str] = Field(default=None, description="compute device: null=cpu, auto, cuda:0, mps, ...")
+    transfer_function_dtype: Literal["float32", "float16"] = Field(
+        default="float32",
+        description="precision of the stored transfer function; float16 halves storage and is upcast when loaded",
+    )
 
 
 # --- outputs ---------------------------------------------------------------
