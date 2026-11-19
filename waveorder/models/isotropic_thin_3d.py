@@ -431,7 +431,7 @@ def apply_inverse_transfer_function(
 
         if not batched_ss:
             # Shared singular system: compute inverse filter once
-            sfyx_inverse_filter = torch.einsum("sj...,j...,jf...->fs...", U, S_reg, Vh)
+            sfyx_inverse_filter = torch.einsum("sj...,j...,jf...->fs...", torch.conj(U), S_reg, torch.conj(Vh))
             results = []
             for b in range(zyx.shape[0]):
                 results.append(apply_filter_bank(sfyx_inverse_filter, zyx[b]))
@@ -440,7 +440,7 @@ def apply_inverse_transfer_function(
             # Per-tile singular system: compute inverse filter per tile
             results = []
             for b in range(zyx.shape[0]):
-                filt_b = torch.einsum("sj...,j...,jf...->fs...", U[b], S_reg[b], Vh[b])
+                filt_b = torch.einsum("sj...,j...,jf...->fs...", torch.conj(U[b]), S_reg[b], torch.conj(Vh[b]))
                 results.append(apply_filter_bank(filt_b, zyx[b]))
             output = torch.stack(results, dim=0)  # (B, 2, Y, X)
 
@@ -480,6 +480,7 @@ def reconstruct(
     tilt_angle_azimuth: Union[float, Tensor] = 0.0,
     pupil_steepness: float = 10000.0,
     apodization_rolloff: float = 0.0,
+    decomposition: Literal["auto", "svd", "per_channel"] = "auto",
 ) -> Tuple[Tensor, Tensor]:
     """Reconstruct 2D absorption and phase from a brightfield defocus stack.
 
@@ -528,6 +529,25 @@ def reconstruct(
         between 0 and 1; if you see checkerboarding artifacts, start
         with 0.25. See
         ``apply_inverse_transfer_function``.
+    decomposition : {"auto", "svd", "per_channel"}, optional
+        Singular system used to invert the joint absorption-phase
+        transfer function, by default "auto".
+
+        - "svd": exact joint SVD. Couples absorption and phase; most
+          accurate when the transfer function matches the data, but
+          sensitive to model mismatch under strong illumination tilt,
+          and its backward pass can fail for complex tensors on some
+          GPU types.
+        - "per_channel": invert each channel independently (each
+          channel's Tikhonov least-squares solution, ignoring
+          absorption-phase coupling). Robust to model mismatch under
+          strong tilt and differentiable on all devices.
+        - "auto": "svd" when the tilt/NA parameters do not require
+          gradients, "per_channel" when they do (previous behavior).
+
+        A gradient-based parameter fit and the final reconstruction
+        should use the SAME decomposition; with "auto" they can
+        differ, which disagrees badly under strong tilt.
 
     Returns
     -------
@@ -547,10 +567,16 @@ def reconstruct(
         tilt_angle_azimuth=tilt_angle_azimuth,
         pupil_steepness=pupil_steepness,
     )
-    # Use norm-based decomposition when gradients are needed (optimization),
-    # full SVD otherwise (better accuracy for final reconstruction)
-    needs_grad = absorption_tf.requires_grad or phase_tf.requires_grad
-    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=not needs_grad)
+    if decomposition == "auto":
+        # Norm-based decomposition when gradients are needed (complex SVD
+        # backward fails on some GPU types), full SVD otherwise
+        needs_grad = absorption_tf.requires_grad or phase_tf.requires_grad
+        use_svd = not needs_grad
+    elif decomposition in ("svd", "per_channel"):
+        use_svd = decomposition == "svd"
+    else:
+        raise ValueError(f"Unknown decomposition {decomposition!r}; choose 'auto', 'svd', or 'per_channel'")
+    singular_system = calculate_singular_system(absorption_tf, phase_tf, use_svd=use_svd)
     return apply_inverse_transfer_function(
         zyx_data,
         singular_system,
