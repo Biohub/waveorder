@@ -130,18 +130,6 @@ cases:
     reference:
       image_quality.midband_power: {min: 4.5e4}
 
-  # --- Birefringence (kazansky polarization target, mantis) ---
-  # Joint birefringence + phase settings; metrics optics come from the
-  # phase block, and channel 0 (Retardance) is scored.
-
-  kazansky_birefringence_3d:
-    type: hpc
-    input: /hpc/projects/waveorder/kazansky-mantis/0-zarr/pm_kazansky_test_1.zarr
-    position: 0/0/0
-    config: ../configs/kazansky_birefringence_3d.yml
-    reference:
-      image_quality.midband_power: {min: 7.0e2}
-
   # --- Curated phase/fluorescence variety (/hpc/projects/waveorder/) ---
 
   a549_phase_2d:
@@ -201,8 +189,8 @@ cases:
   # --- Neuromast straight/oblique comparison (mantis, 52 hpf) ---
   # Position 0/1/0 has the best-centered rosette of the three FOVs.
   # Same registered 4-channel input: straight epi-illumination vs
-  # oblique light-sheet brightfield phase, plus a tiled (wo tile-stitch)
-  # variant of the oblique case covering the tiled reconstruction path.
+  # oblique light-sheet brightfield phase, plus a tiled variant of the
+  # oblique case covering the tiled reconstruction path.
 
   neuromast_epi_phase_3d:
     type: hpc
@@ -225,11 +213,20 @@ cases:
       image_quality.midband_power: {min: 5.5e2}
 
   neuromast_tile_phase_3d:
+    # wo-4.0 ran this with wo tile-stitch: tiles of 384 x 384 pixels
+    # sharing 64 with their neighbours, the full 63 slices, Gaussian blend
+    # (sigma 48). In wo rec a tile is the core each tile writes and the
+    # overlap widens it on each side: cores of 384 - 64 = 320 widened by
+    # 32, so neighbouring tiles cross-fade over 64 pixels, with the
+    # default cosine blend.
     type: hpc
-    cli: tile-stitch
     input: /hpc/projects/waveorder/neuromast-mantis/2025_07_21_straight_oblique_comparison/2-register/register.zarr
     position: 0/1/0
-    config: ../configs/neuromast_tile_phase_3d.yml
+    config: ../configs/neuromast_ls_phase_3d.yml
+    overrides:
+      time_indices: 0
+    tile: [63, 320, 320]
+    tile_overlap: [0, 32, 32]
     reference:
       image_quality.midband_power: {min: 6.0e2}
 

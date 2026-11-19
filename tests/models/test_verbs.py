@@ -1,0 +1,254 @@
+"""The verbs of a model on small synthetic data: simulate, and the compliance paths of calibrate."""
+
+from typing import Any
+
+import pytest
+import torch
+import yaml
+
+from waveorder.config import V4Config
+from waveorder.errors import ConfigurationError, IncompatibleModelError, ParameterError
+from waveorder.models import Fluorescence2D, Fluorescence3D, Phase3D, ReconstructionModel
+from waveorder.nn import (
+    FISTA,
+    Detection,
+    Free,
+    Gaussian,
+    GradientSearch,
+    GridSearch,
+    Illumination,
+    MidbandPowerScore,
+    Sampling,
+    Tikhonov,
+    ZernikeAberration,
+)
+from waveorder.nn.preprocess import apodize, most_structured_crop
+from waveorder.nn.priors import Beads
+from waveorder.nn.search.base import CalibrationResult
+from waveorder.nn.search.beads import BeadCalibration
+from waveorder.nn.search.sweep import WeightSweep
+from waveorder.tiling import TilePlan
+
+PIXEL_SIZE = (0.25, 0.1, 0.1)
+APERTURE = "system.detection.numerical_aperture"
+
+
+def _fluorescence(numerical_aperture: float | Free = 1.2, **parts: object) -> Fluorescence3D:
+    detection = Detection(wavelength=0.532, numerical_aperture=numerical_aperture, edge="sigmoid")
+    settings: dict[str, Any] = {
+        "object_prior": Tikhonov(1e-3),
+        "noise": Gaussian(0.01),
+        "pixel_size": PIXEL_SIZE,
+        **parts,
+    }
+    return Fluorescence3D(detection, index_of_refraction_media=1.3, **settings)
+
+
+# --- simulate ---
+
+
+def test_simulate_images_an_object_with_the_models_noise_and_repeats_for_a_seed():
+    model = _fluorescence()
+    data, obj = model.simulate(shape=(8, 32, 32), seed=3)
+    assert (data.shape, obj.shape) == ((1, 8, 32, 32), (1, 8, 32, 32))
+    assert float(obj.mean()) == pytest.approx(0.0, abs=1e-5)
+    assert float(obj.std()) == pytest.approx(1.0, rel=1e-5)  # the power-law field: zero mean, unit deviation
+    again, _ = model.simulate(shape=(8, 32, 32), seed=3)
+    assert torch.equal(data, again)
+    clean, same = model.simulate(obj, noise=False)
+    assert torch.equal(same, obj)
+    with torch.no_grad():
+        assert torch.equal(clean, model.imaging_model(obj, Sampling(shape=(8, 32, 32), pixel_size=PIXEL_SIZE)))
+    assert float((data - clean).std()) == pytest.approx(0.01, rel=0.1)  # Gaussian(0.01)
+    with pytest.raises(ParameterError, match="needs an object or the shape"):
+        model.simulate()
+
+
+def test_a_simulation_configuration_gives_the_shape_the_seed_and_the_signal_to_noise():
+    text = """
+version: 4
+data: {pixel_size: {z: 0.25, y: 0.1, x: 0.1}}
+imaging_system:
+  contrast: fluorescence
+  index_of_refraction_media: 1.3
+  detection: {wavelength: 0.532, numerical_aperture: 1.2}
+object: {source: {gaussian_spectrum: {exponent: 3.0}}}
+noise: {gaussian: {snr_db: 20}}
+simulate: {seed: 5, shape: [8, 32, 32]}
+"""
+    model = ReconstructionModel.from_config(V4Config(**yaml.safe_load(text)))
+    assert model.pixel_size == PIXEL_SIZE
+    data, obj = model.simulate()
+    assert data.shape == (1, 8, 32, 32)
+    clean, _ = model.simulate(obj, noise=False)
+    assert float((data - clean).std() / clean.std()) == pytest.approx(0.1, rel=0.1)  # 20 dB
+    assert torch.equal(model.simulate()[0], data)  # the configuration's seed
+
+
+# --- apodization ---
+
+
+def test_the_apodization_rolloff_filters_a_wiener_estimate_and_is_refused_elsewhere():
+    data, _ = _fluorescence().simulate(shape=(8, 32, 32), seed=0)
+    plain = _fluorescence().reconstruct(data, prepared=True).estimate
+    rolled = _fluorescence(apodization_rolloff=0.3).reconstruct(data, prepared=True).estimate
+    torch.testing.assert_close(rolled, apodize(plain, 0.3))
+    with pytest.raises(ConfigurationError, match="applies to a Wiener estimate"):
+        _fluorescence(apodization_rolloff=0.3, solver=FISTA()).reconstruct(data, prepared=True)
+
+
+# --- the rule-based weight ---
+
+
+def test_a_weight_sweep_picks_the_weight_on_the_most_structured_crop():
+    sweep = WeightSweep(rule="otsu_cnr", samples=5)
+    weight = Tikhonov(Free(1e-3, bounds=(1e-12, 1e12)))
+    model = _fluorescence(object_prior=weight, search=[sweep], score=None)
+    data, _ = model.simulate(shape=(4, 300, 300), seed=1)
+    model.calibrate(data, prepared=True)
+    y, x, side = most_structured_crop(data, size=256)
+    crop = data[..., y : y + side, x : x + side]
+    reference = _fluorescence()
+    expected = sweep.sweep(crop, reference.imaging_model, Sampling(shape=(4, side, side), pixel_size=PIXEL_SIZE))
+    picked = float(model.imaging_model.get_parameter("object_prior.weight").detach())
+    assert picked == pytest.approx(expected.weight, rel=1e-6)
+
+
+def test_a_weight_sweep_after_a_calibration_runs_it_at_the_held_weight_on_the_whole_frame():
+    # wo-4.0's wo rec: adam at regularization_strength 1e-3 on the full frame, then the sweep with the values found.
+    def model(weight: float | Free, *search: object) -> Fluorescence3D:
+        aperture = Free(1.1, bounds=(0.9, 1.25))
+        stages = [GradientSearch(iterations=3, learning_rates={APERTURE: 0.01}, last=True), *search]
+        return _fluorescence(aperture, object_prior=Tikhonov(weight), score=MidbandPowerScore(), search=stages)
+
+    data, _ = _fluorescence().simulate(shape=(4, 32, 32), seed=0)
+    swept = model(Free(1e-3, bounds=(1e-12, 1e12)), WeightSweep(rule="l_curve", samples=5))
+    result = swept.calibrate(data, history=True)
+    fixed = model(1e-3).calibrate(data)
+    assert isinstance(result, CalibrationResult)
+    assert result.sweep is not None
+    assert [stage for stage, _ in result.trace] == ["GradientSearch", "WeightSweep"]
+    assert float(result.parameters[APERTURE]) == float(fixed.parameters[APERTURE])
+    assert float(result.parameters["object_prior.weight"]) == pytest.approx(result.sweep.weight, rel=1e-6)
+
+
+def test_a_weight_sweep_normalizes_its_crop_by_the_crops_own_mean_as_wo40():
+    # An illumination ramp: the dim crop's mean is not the stack's, which offsets the data and moves the L-curve.
+    def phase(**parts: Any) -> Phase3D:
+        illumination = Illumination(wavelength=0.532, numerical_aperture=0.5)
+        detection = Detection(wavelength=0.532, numerical_aperture=1.2, edge="sigmoid")
+        return Phase3D(illumination, detection, index_of_refraction_media=1.33, pixel_size=PIXEL_SIZE, **parts)
+
+    contrast, _ = phase(object_prior=Tikhonov(1e-3), noise=Gaussian(0.01)).simulate(shape=(6, 64, 320), seed=0)
+    recorded = (1 + contrast) * torch.linspace(0.9, 1.1, 320)
+    recorded[..., :64] += 0.3 * contrast[..., :64]  # the most structured crop is on the dim left side
+    sweep = WeightSweep(rule="l_curve", search_min=-4, samples=9)  # picks index 6; normalized whole, it picks 7
+    model = phase(object_prior=Tikhonov(Free(1e-3, bounds=(1e-12, 1e12))), noise=Gaussian(0.01), search=[sweep])
+    result = model.calibrate(recorded, history=True)
+    assert isinstance(result, CalibrationResult)
+    assert result.sweep is not None
+    assert result.sweep.region == most_structured_crop(recorded, size=256) == (0, 0, 64)
+    crop = recorded[..., :64]
+    reference = phase()
+    sampling = Sampling(shape=(6, 64, 64), pixel_size=PIXEL_SIZE)
+    expected = sweep.sweep(reference.prepare(crop), reference.imaging_model, sampling)
+    assert result.sweep.residual_norms == pytest.approx(expected.residual_norms, rel=1e-5)
+    assert result.sweep.index == expected.index == 6
+    assert result.sweep.weight == pytest.approx(expected.weight, rel=1e-6)
+
+
+# --- sigma estimated from the data ---
+
+
+def test_an_estimated_sigma_starts_from_the_data_before_a_store_becomes_the_prior():
+    truth = _fluorescence(1.2)
+    data, _ = truth.simulate(shape=(8, 32, 32), seed=2)
+    model = _fluorescence(Free(1.1, bounds=(1.0, 1.3)), noise=Gaussian("estimate"), search=[GridSearch(points=7)])
+    result = model.calibrate(data, prepared=True, prior=model.to_tf_store())
+    sigma = float(result.parameters["noise.sigma"])
+    spread = float(data.std())
+    assert 1e-3 * spread <= sigma <= spread  # within the bounds start_from set from the data
+    assert float(result.parameters[APERTURE]) == pytest.approx(1.2, abs=0.05)
+
+
+def test_a_tiled_calibration_estimates_the_noise_level_as_the_whole_field_does():
+    data = 100 * torch.randn(1, 8, 32, 32, generator=torch.Generator().manual_seed(0)) + 500
+
+    def model() -> Fluorescence3D:
+        aperture = Free(1.1, bounds=(1.0, 1.3))
+        return _fluorescence(aperture, noise=Gaussian("estimate"), search=[GridSearch(points=5)])
+
+    whole = float(model().calibrate(data, prepared=True).parameters["noise.sigma"])
+    tiled = model()
+    plan = tiled.tile_plan((8, 32, 32), tile=(8, 16, 16))
+    sigma = tiled.calibrate_tiles(data, plan=plan, prepared=True).parameters["noise.sigma"]
+    assert sigma.shape == (len(plan.regions),)
+    assert whole == pytest.approx(100, rel=0.1)
+    assert sigma.tolist() == pytest.approx([whole] * len(plan.regions), rel=0.1)
+
+
+# --- beads ---
+
+
+def _bead_model(astigmatism: float | Free, **parts: object) -> Fluorescence3D:
+    aberration = ZernikeAberration({"astigmatism_0": astigmatism})
+    detection = Detection(wavelength=0.532, numerical_aperture=1.2, edge="sigmoid", pupil_aberrations=aberration)
+    settings: dict[str, Any] = {"object_prior": Beads(0.3), "noise": Gaussian(1.0), "pixel_size": PIXEL_SIZE, **parts}
+    return Fluorescence3D(detection, index_of_refraction_media=1.3, **settings).to(dtype=torch.float64)
+
+
+def test_a_beads_prior_calibrates_through_the_bead_fit_with_wo40s_refusals():
+    sampling = Sampling(shape=(16, 32, 32), pixel_size=PIXEL_SIZE)
+    positions = torch.tensor([(8, 8, 8), (8, 8, 24), (8, 24, 16)], dtype=torch.float64)
+    obj = Beads(0.3).render(positions, torch.full((3,), 3000.0, dtype=torch.float64), sampling)
+    clean, _ = _bead_model(0.15).simulate(obj[None], noise=False)
+    data = clean + 10.0 + torch.randn(clean.shape, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    model = _bead_model(Free(0.0), search=[GradientSearch(iterations=150, learning_rate=0.01)])
+    result = model.calibrate(data, prepared=True)
+    assert isinstance(result, BeadCalibration)
+    assert float(result.parameters["system.detection.pupil_aberrations.astigmatism_0"]) == pytest.approx(0.15, abs=0.01)
+    assert result.trace.shape == (150,)
+    with pytest.raises(ConfigurationError, match="bead calibration runs one gradient search"):
+        _bead_model(Free(0.0), search=[GridSearch(points=3)]).calibrate(data, prepared=True)
+    with pytest.raises(ParameterError, match="prior with prior: beads is not supported yet"):
+        model.calibrate(data, prepared=True, prior=model.to_tf_store())
+    phase = Phase3D(
+        Illumination(wavelength=0.532, numerical_aperture=Free(0.5, bounds=(0.3, 0.7))),
+        Detection(wavelength=0.532, numerical_aperture=1.2),
+        index_of_refraction_media=1.3,
+        object_prior=Beads(0.3),
+        noise=Gaussian(1.0),
+        pixel_size=PIXEL_SIZE,
+    )
+    with pytest.raises(ConfigurationError, match="bead calibration supports fluorescence contrast"):
+        phase.calibrate(data, prepared=True)
+    thin = Fluorescence2D(
+        Detection(wavelength=0.532, numerical_aperture=Free(1.2, bounds=(1.0, 1.3))),
+        index_of_refraction_media=1.3,
+        object_prior=Beads(0.2),
+        noise=Gaussian(1.0),
+        pixel_size=PIXEL_SIZE,
+    )
+    with pytest.raises(ConfigurationError, match="it fits a 3D bead volume, which a ThinFluorescence2D does not"):
+        thin.check((8, 32, 32), calibration=True)
+
+
+def test_a_beads_prior_calibrates_and_does_not_reconstruct():
+    with pytest.raises(IncompatibleModelError, match="a Beads object prior calibrates the system"):
+        _bead_model(Free(0.0), solver=FISTA())  # refused when the model is built
+    model = _bead_model(Free(0.0))
+    model.check((8, 32, 32), calibration=True)
+    data = torch.rand(1, 8, 32, 32, dtype=torch.float64)
+    for refused in (
+        lambda: model.check((8, 32, 32)),
+        lambda: model.reconstruct(data),
+        lambda: model.reconstruct_tiles(
+            [(data, torch.zeros_like(data))], plan=TilePlan(shape=(8, 32, 32), tile=(8, 32, 32))
+        ),
+    ):
+        with pytest.raises(IncompatibleModelError, match="it does not reconstruct"):
+            refused()
+    tikhonov = _fluorescence(solver=FISTA())
+    with pytest.raises(IncompatibleModelError, match="it does not reconstruct"):
+        tikhonov.object_prior = Beads(0.3)  # the solver it was given cannot run with it
+    assert isinstance(tikhonov.object_prior, Tikhonov)

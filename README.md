@@ -52,6 +52,8 @@ https://github.com/user-attachments/assets/4f9969e5-94ce-4e08-9f30-68314a905db6
 
 ### Quantitative label-free imaging with phase and polarization (QLIPP)
 
+Not in this version yet: the birefringence (polarization) reconstruction of QLIPP. Use a 3.x release for it.
+
 Acquisition, calibration, background correction, reconstruction, and applications of QLIPP are described in the following [E-Life Paper](https://elifesciences.org/articles/55502):
 
 [![Unveiling the invisible](https://github.com/mehta-lab/recOrder/blob/main/docs/images/comms_video_screenshot.png?raw=true)](https://www.youtube.com/watch?v=JEZAaPeZhck)
@@ -72,6 +74,8 @@ Acquisition, calibration, background correction, reconstruction, and application
 </details>
 
 ### Permittivity tensor imaging (PTI)
+
+Not in this version yet: PTI reconstruction. Use a 3.x release for it.
 
 PTI provides volumetric reconstructions of mean permittivity ($\propto$ material density), differential permittivity ($\propto$ material anisotropy), 3D orientation, and optic sign. The following figure summarizes PTI acquisition and reconstruction with a small optical section of the mouse brain tissue:
 
@@ -230,7 +234,34 @@ The [examples](https://github.com/mehta-lab/waveorder/tree/main/docs/examples) i
 git clone https://github.com/mehta-lab/waveorder.git
 cd waveorder
 pip install -e .[all]
-python ./docs/examples/models/phase_thick_3d.py
+```
+
+The scripts under `docs/examples` are still written for 3.x and are updated in a later PR. In this version, 3D phase from brightfield is simulated and reconstructed with:
+
+```python
+import torch
+
+from waveorder.models import Phase3D
+from waveorder.nn import Detection, Gaussian, Illumination, Tikhonov
+
+# All lengths in um.
+model = Phase3D(
+    Illumination(wavelength=0.532, numerical_aperture=0.9),
+    Detection(wavelength=0.532, numerical_aperture=1.2),
+    index_of_refraction_media=1.3,
+    pixel_size=(0.25, 0.1),  # (z, yx)
+    object_prior=Tikhonov(weight=1e-3),
+    noise=Gaussian(sigma=1e-3),  # a fraction of the mean intensity
+)
+
+# A phantom: a sphere of radius 2 um, as a scattering potential in um^-2, (F, Z, Y, X).
+z, y, x = torch.meshgrid(*(torch.arange(n) - n // 2 for n in (32, 96, 96)), indexing="ij")
+phantom = ((0.25 * z) ** 2 + (0.1 * y) ** 2 + (0.1 * x) ** 2 < 2**2)[None].float()
+
+data, _ = model.simulate(phantom, seed=0)  # simulate the contrast I / mean(I) - 1 the model reconstructs from
+recon = model.reconstruct(data, prepared=True).estimate  # reconstruct; recorded intensities go in without prepared
+print(f"data = {tuple(data.shape)}, reconstruction = {tuple(recon.shape)}")
+print(f"correlation = {torch.corrcoef(torch.stack([phantom.flatten(), recon.flatten()]))[0, 1]:.2f}")
 ```
 
 ## Community
