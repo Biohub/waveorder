@@ -215,7 +215,6 @@ def test_a_bug_prints_its_stack_and_a_waveorder_error_one_line(config, monkeypat
     assert bug.exit_code == 1
     assert "Traceback (most recent call last)" in bug.stderr
     assert "wo config check: error: KeyError: 'lost'" in bug.stderr
-    assert "this is a bug in waveorder" in bug.stderr
 
     def refused(*_: object, **__: object) -> None:
         raise ShapeError("too small")

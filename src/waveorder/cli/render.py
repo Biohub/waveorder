@@ -344,7 +344,7 @@ def _failure(error: Exception) -> Failure:
     if isinstance(error, WaveorderError | OSError) and not isinstance(error, PlacementError):
         return Failure(1, line)
     stack = "".join(traceback.format_exception(error))
-    return Failure(1, line, stack=stack, hint="this is a bug in waveorder; please report it with the stack")
+    return Failure(1, line, stack=stack)
 
 
 def _message(problem: Problem) -> str:
